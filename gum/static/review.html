@@ -100,6 +100,7 @@
   .btn-false { color: var(--false); border-color: var(--false); }
   .btn-false:hover { background: var(--false-bg); }
   .btn-skip { color: var(--skip); flex: 0 0 auto; padding-left: 18px; padding-right: 18px; }
+  .submit-error { margin-top: 8px; font-size: 13px; color: var(--false); }
 
   .center { text-align: center; padding: 80px 20px; color: var(--muted); }
   .center h2 { color: var(--text); font-size: 22px; }
@@ -134,6 +135,7 @@
       <button class="btn-false"   onclick="submit('inaccurate')">✕ Inaccurate <kbd>F</kbd></button>
       <button class="btn-skip"    onclick="skip()">Skip <kbd>K</kbd></button>
     </div>
+    <div class="submit-error" id="submitError" style="display:none"></div>
   </div>
 </div>
 
@@ -164,6 +166,8 @@
     main.innerHTML = '<div class="center"><div class="spinner"></div>Loading…</div>';
     showActions(false);
     resetNote();
+    const errEl = document.getElementById('submitError');
+    if (errEl) errEl.style.display = 'none';
     try {
       const q = skipped.length ? ('?skip=' + skipped.join(',')) : '';
       const r = await fetch('/review/next' + q);
@@ -222,14 +226,27 @@
   async function submit(rating) {
     if (busy || !current) return;
     busy = true;
+    const errEl = document.getElementById('submitError');
+    if (errEl) errEl.style.display = 'none';
     const noteEl = document.getElementById('note');
     const note = noteEl ? noteEl.value.trim() : '';
     try {
-      await fetch('/review', {
+      const r = await fetch('/review', {
         method: 'POST', headers: {'Content-Type': 'application/json'},
         body: JSON.stringify({ proposition_id: current.id, rating, note })
       });
-    } catch (_) {}
+      const data = await r.json().catch(() => ({}));
+      if (!r.ok || !data.ok) {
+        throw new Error(data.error || `Save failed (HTTP ${r.status})`);
+      }
+    } catch (e) {
+      busy = false;
+      if (errEl) {
+        errEl.textContent = `Couldn't save your judgment — ${e.message}. Please try again.`;
+        errEl.style.display = 'block';
+      }
+      return;
+    }
     await loadNext();
   }
 

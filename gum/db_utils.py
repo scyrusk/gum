@@ -291,16 +291,6 @@ async def get_recent_propositions(
     return result.scalars().all()
 
 
-async def get_reviewed_proposition_ids(session: AsyncSession) -> set[int]:
-    """Return the set of proposition ids that already have a feedback judgment."""
-    rows = await session.execute(
-        select(PropositionFeedback.proposition_id).where(
-            PropositionFeedback.proposition_id.isnot(None)
-        )
-    )
-    return {r[0] for r in rows.all()}
-
-
 async def get_next_unreviewed_proposition(
     session: AsyncSession,
     *,
@@ -311,12 +301,18 @@ async def get_next_unreviewed_proposition(
     ``exclude_ids`` additionally skips propositions the user deferred this
     session. Eager-loads observations so the review UI can show the evidence.
     """
-    skip = await get_reviewed_proposition_ids(session)
+    already_reviewed = (
+        select(PropositionFeedback.proposition_id)
+        .where(PropositionFeedback.proposition_id == Proposition.id)
+        .exists()
+    )
+    stmt = (
+        select(Proposition)
+        .where(~already_reviewed)
+        .order_by(Proposition.created_at.desc())
+    )
     if exclude_ids:
-        skip |= exclude_ids
-    stmt = select(Proposition).order_by(Proposition.created_at.desc())
-    if skip:
-        stmt = stmt.where(Proposition.id.notin_(skip))
+        stmt = stmt.where(Proposition.id.notin_(exclude_ids))
     stmt = stmt.options(selectinload(Proposition.observations)).limit(1)
     result = await session.execute(stmt)
     return result.scalars().first()
@@ -421,7 +417,13 @@ def select_relevant_balanced_feedback(
 async def count_review_progress(session: AsyncSession) -> tuple[int, int]:
     """Return (total_propositions, reviewed_count)."""
     total = (await session.execute(select(func.count(Proposition.id)))).scalar() or 0
-    reviewed = len(await get_reviewed_proposition_ids(session))
+    reviewed = (
+        await session.execute(
+            select(func.count(func.distinct(PropositionFeedback.proposition_id))).where(
+                PropositionFeedback.proposition_id.isnot(None)
+            )
+        )
+    ).scalar() or 0
     return total, reviewed
 
 
