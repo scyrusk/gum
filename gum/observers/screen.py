@@ -252,6 +252,12 @@ class Screen(Observer):
         self._history: deque[str] = deque(maxlen=max(0, history_k))
         self._pending_event: Optional[dict] = None
         self._debounce_handle: Optional[asyncio.TimerHandle] = None
+        # Monotonic timestamp of the most recent mouse event. Drives the
+        # capture loop's adaptive backoff (see _capture_interval): the loop only
+        # needs to keep a fresh "before" frame while the mouse is active, since
+        # observations are only ever produced from mouse events. Seed it as
+        # "just active" so startup captures at full rate.
+        self._last_input: float = time.monotonic()
         # Local-first inference client (defaults to Ollama; refuses non-local
         # endpoints unless GUM_ALLOW_REMOTE=1). See gum/llm.py.
         self.client = make_client("screen", api_base=api_base, api_key=api_key)
@@ -260,6 +266,32 @@ class Screen(Observer):
         super().__init__()
 
     # ─────────────────────────────── tiny sync helpers
+    @staticmethod
+    def _capture_interval(
+        now: float,
+        last_input: float,
+        active_fps: float,
+        idle_fps: float,
+        idle_after: float,
+    ) -> float:
+        """Seconds to wait before the next before-frame grab.
+
+        The capture loop's sole job is to keep a sub-second-fresh "before" frame
+        ready for the next mouse event — and the screen observer only ever
+        produces an observation from a mouse event. So while the mouse has been
+        active within the last ``idle_after`` seconds, grab at the full
+        ``active_fps`` rate. Once input has been idle beyond that grace period,
+        back off to ``idle_fps``: with no mouse events there is no interaction to
+        transcribe, a stale before-frame costs nothing (the change-gate drops it
+        if the screen really moved), and the continuous full-framebuffer grab
+        otherwise just steals CPU/memory bandwidth from co-resident local
+        inference. Passing ``idle_fps <= 0`` or ``idle_after <= 0`` disables the
+        backoff (always full rate).
+        """
+        active = idle_fps <= 0 or idle_after <= 0 or (now - last_input) < idle_after
+        fps = active_fps if active else idle_fps
+        return 1.0 / fps if fps > 0 else 1.0 / active_fps
+
     @staticmethod
     def _mon_for(x: float, y: float, mons: list[dict]) -> Optional[int]:
         """Find which monitor contains the given coordinates.
@@ -505,6 +537,18 @@ class Screen(Observer):
             CAP_FPS = max(1, int(os.getenv("GUM_CAPTURE_FPS", str(self._CAPTURE_FPS))))
         except ValueError:
             CAP_FPS = self._CAPTURE_FPS
+        # Adaptive idle backoff for the capture loop. While the mouse is active
+        # we grab at CAP_FPS; after IDLE_AFTER seconds of no mouse input we drop
+        # to IDLE_FPS, since a fresh before-frame is only needed to serve a mouse
+        # event. Set GUM_CAPTURE_IDLE_FPS=0 to disable the backoff.
+        try:
+            IDLE_FPS = float(os.getenv("GUM_CAPTURE_IDLE_FPS", "0.2"))
+        except ValueError:
+            IDLE_FPS = 0.2
+        try:
+            IDLE_AFTER = float(os.getenv("GUM_CAPTURE_IDLE_AFTER", "3.0"))
+        except ValueError:
+            IDLE_AFTER = 3.0
         DEBOUNCE = self._DEBOUNCE_SEC
 
         loop = asyncio.get_running_loop()
@@ -567,6 +611,12 @@ class Screen(Observer):
                     y (float): Y coordinate.
                     typ (str): Event type ("move", "click", or "scroll").
                 """
+                # Record input activity so the capture loop stays at full rate
+                # while the mouse is in use (see _capture_interval). Stamped for
+                # every mouse event, even guarded/off-screen ones, so the loop is
+                # already warmed up by the time a real interaction lands.
+                self._last_input = time.monotonic()
+
                 idx = self._mon_for(x, y, mons)
                 log.info(
                     f"{typ:<6} @({x:7.1f},{y:7.1f}) → mon={idx}   {'(guarded)' if self._skip() else ''}"
@@ -590,18 +640,35 @@ class Screen(Observer):
             # ---- main capture loop ----
             log.info(f"Screen observer started — guarding {self._guard or '∅'}")
 
+            # Cap on how long the loop may sleep between wake-ups. Keeps renewed
+            # mouse activity (which pulls the interval back to full rate) and
+            # shutdown responsive even when the idle interval is several seconds.
+            _POLL_MAX = 0.5
+            last_grab = 0.0
+
             while self._running:                         # flag from base class
-                t0 = time.time()
+                now = time.monotonic()
+                interval = self._capture_interval(
+                    now, self._last_input, CAP_FPS, IDLE_FPS, IDLE_AFTER
+                )
 
-                # refresh 'before' buffers
-                for idx, m in enumerate(mons, 1):
-                    frame = await asyncio.to_thread(sct.grab, m)
-                    async with self._frame_lock:
-                        self._frames[idx] = frame
+                # refresh 'before' buffers when the next grab is due — full rate
+                # while the mouse is active, backing off to the idle rate once
+                # input has been quiet (see _capture_interval) so idle background
+                # grabbing stops competing with local inference for CPU/memory
+                # bandwidth.
+                if (now - last_grab) >= interval:
+                    last_grab = now
+                    for idx, m in enumerate(mons, 1):
+                        frame = await asyncio.to_thread(sct.grab, m)
+                        async with self._frame_lock:
+                            self._frames[idx] = frame
 
-                # fps throttle
-                dt = time.time() - t0
-                await asyncio.sleep(max(0, (1 / CAP_FPS) - dt))
+                # Sleep until the next grab is due, capped at _POLL_MAX so
+                # renewed activity resumes full-rate capture within a fraction of
+                # a second instead of sleeping through a multi-second idle gap.
+                remaining = interval - (time.monotonic() - last_grab)
+                await asyncio.sleep(max(0.0, min(remaining, _POLL_MAX)))
 
             # shutdown
             listener.stop()
