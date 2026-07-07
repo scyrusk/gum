@@ -389,8 +389,10 @@ class gum:
             if batched_observations:
                 self.logger.error(f"First observation type: {type(batched_observations[0])}")
                 self.logger.error(f"First observation: {batched_observations[0]}")
-            # Return the failed items to the queue for retry (same items, no dup IDs).
-            self.batcher.nack_batch(batched_observations)
+            # Bounded retry (same items, no dup IDs): retries with idle-flush
+            # backoff, then sets a persistently-failing poison batch aside as
+            # 'failed' so it can't hot-loop and starve newer observations.
+            self.batcher.fail_batch(batched_observations)
 
     async def _construct_propositions(self, update: Update) -> list[PropositionItem]:
         """Generate propositions from an update.

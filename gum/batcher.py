@@ -32,6 +32,19 @@ class ObservationBatcher:
             batch_timeout = float(os.getenv("GUM_BATCH_TIMEOUT", "30"))
         self.batch_timeout = batch_timeout
 
+        # A batch that keeps failing to process must not hot-loop at the head of
+        # the queue forever, starving newer observations. After this many failed
+        # attempts its items are set aside as 'failed' (retained for inspection,
+        # not re-delivered). Override with GUM_MAX_BATCH_ATTEMPTS.
+        try:
+            self.max_batch_attempts = int(os.getenv("GUM_MAX_BATCH_ATTEMPTS", "3"))
+        except ValueError:
+            self.max_batch_attempts = 3
+
+        # Failed-attempt counter keyed by the stable observation id (obs['id']),
+        # not Python object identity, so retries across restarts still count.
+        self._batch_attempts: Dict[str, int] = {}
+
         self.logger = logging.getLogger("gum.batcher")
 
         # Persistent, *acknowledged* queue backed by SQLite. Items are only
@@ -216,6 +229,55 @@ class ObservationBatcher:
         good (they will not be re-delivered after a restart)."""
         for item in items:
             self._queue.ack(item)
+            self._batch_attempts.pop(item.get('id'), None)
+
+        # ack() only flags rows status='acked'; they linger in the SQLite table
+        # forever otherwise, so a long-running daemon's DB would grow without
+        # bound. Purge acked rows here (keeping a recent window), never letting a
+        # purge error break processing. clear_ack_failed stays False so 'failed'
+        # rows from fail_batch are retained for inspection.
+        try:
+            self._queue.clear_acked_data(keep_latest=1000, max_delete=1000)
+        except Exception as exc:
+            self.logger.warning(f"Failed to purge acked queue rows: {exc}")
+
+    def fail_batch(self, items: List[Dict[str, Any]]) -> None:
+        """Handle a batch that failed to process. Retry it a bounded number of
+        times, then set it aside as 'failed' so a poison batch can't hot-loop at
+        the head of the queue and starve newer observations.
+
+        Attempts are counted by the stable observation id (obs['id']) so retries
+        that span restarts still converge on the cap.
+        """
+        attempts = 0
+        for item in items:
+            obs_id = item['id']
+            self._batch_attempts[obs_id] = self._batch_attempts.get(obs_id, 0) + 1
+            attempts = max(attempts, self._batch_attempts[obs_id])
+
+        if attempts >= self.max_batch_attempts:
+            failed_ids = [item.get('id') for item in items]
+            for item in items:
+                self._queue.ack_failed(item)
+                self._batch_attempts.pop(item.get('id'), None)
+            self.logger.error(
+                f"Batch permanently failed after {attempts} attempts; setting "
+                f"aside {len(items)} observation(s) as failed: {failed_ids}"
+            )
+            return
+
+        # Retry: return items to 'ready', but back off. Reset the idle-flush
+        # clock and let the normal idle-flush / next arrival re-wake the
+        # processor instead of immediately re-setting _batch_ready_event, so the
+        # retry doesn't hot-loop.
+        for item in items:
+            self._queue.nack(item)
+        self.logger.warning(
+            f"Batch failed (attempt {attempts}/{self.max_batch_attempts}); "
+            f"will retry {len(items)} observation(s) after idle-flush"
+        )
+        if self._oldest_pending is None and self._queue.qsize() > 0:
+            self._oldest_pending = time.monotonic()
 
     def nack_batch(self, items: List[Dict[str, Any]]) -> None:
         """Return an unprocessed batch (failed or interrupted by shutdown) to the
