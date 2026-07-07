@@ -21,7 +21,15 @@ from .db_utils import (
     get_recent_propositions,
     get_recent_observations,
 )
-from .llm import make_client, structured_completion
+from .llm import (
+    make_client,
+    structured_completion,
+    resolve_api_base,
+    keep_models_warm,
+    keep_warm_enabled,
+    resolve_keep_alive,
+    resolve_keep_warm_interval,
+)
 from .models import Observation, Proposition, init_db
 from .observers import Observer
 from .schemas import (
@@ -111,6 +119,7 @@ class gum:
 
         # Local-first inference client (defaults to Ollama; refuses non-local
         # endpoints unless GUM_ALLOW_REMOTE=1). See gum/llm.py.
+        self._api_base = resolve_api_base("gum", api_base)
         self.client = make_client("gum", api_base=api_base, api_key=api_key)
 
         self.engine = None
@@ -128,6 +137,7 @@ class gum:
 
         self._loop_task: asyncio.Task | None = None
         self._batch_task: asyncio.Task | None = None
+        self._warm_task: asyncio.Task | None = None
         self._batch_processing_lock = asyncio.Lock()
         self.update_handlers: list[Callable[[Observer, Update], None]] = [self._default_handler]
 
@@ -139,6 +149,23 @@ class gum:
         # Start batch processing if enabled
         if self._batch_task is None:
             self._batch_task = asyncio.create_task(self._batch_processing_loop())
+
+        # Keep the local models resident so an idle pause doesn't unload them
+        # and stall the next observation on a cold reload (see keep_models_warm).
+        # Pins this GUM's text model plus every observer's model (e.g. the
+        # screen observer's vision model).
+        if self._warm_task is None and keep_warm_enabled():
+            targets = [(self._api_base, self.model)]
+            for obs in self.observers:
+                targets.extend(obs.warm_targets)
+            self._warm_task = asyncio.create_task(
+                keep_models_warm(
+                    targets,
+                    keep_alive=resolve_keep_alive(),
+                    interval=resolve_keep_warm_interval(),
+                    logger=self.logger,
+                )
+            )
 
     async def stop_update_loop(self):
         """Stop the asynchronous update loop and clean up resources."""
@@ -158,7 +185,17 @@ class gum:
             except asyncio.CancelledError:
                 pass
             self._batch_task = None
-            
+
+        # Stop the keep-alive pinger; the models then unload on their own once
+        # their finite keep_alive window lapses.
+        if self._warm_task:
+            self._warm_task.cancel()
+            try:
+                await self._warm_task
+            except asyncio.CancelledError:
+                pass
+            self._warm_task = None
+
         if self.batcher:
             await self.batcher.stop()
 

@@ -177,6 +177,149 @@ def ensure_capped_model(base_model: str, num_ctx: int, *, logger: logging.Logger
         return base_model
 
 
+# --------------------------------------------------------------------------- #
+# Keeping models resident (Ollama keep-alive)                                 #
+# --------------------------------------------------------------------------- #
+# The GUM talks to Ollama through its OpenAI-compatible ``/v1`` endpoint, which
+# silently *ignores* the ``keep_alive`` option. So models fall back to Ollama's
+# default 5-minute idle window and unload from VRAM once no request arrives for
+# that long — after which the next observation/proposition pays a full cold
+# reload (tens of GB from disk into VRAM, i.e. many seconds of stall). The
+# earlier efficiency work makes this worse, not better: the unchanged-frame gate
+# and the capture-loop idle backoff both deliberately stop issuing inference
+# while the user is reading, so a normal reading pause reliably crosses the
+# 5-minute line and the next click is slow — exactly the "models are loaded yet
+# still slow" symptom.
+#
+# Ollama's *native* ``/api/generate`` endpoint DOES honor ``keep_alive``. A
+# periodic empty-prompt ping there (``done_reason:"load"``, no generation, ~0.1s)
+# resets each model's residency timer. We ping on a cadence shorter than the
+# keep_alive window so the text and vision models stay pinned while the GUM runs,
+# using a *finite* keep_alive (refreshed every tick) rather than ``-1`` so the
+# models unload on their own once the GUM stops — no VRAM left pinned forever
+# after shutdown.
+
+
+def ollama_native_base(api_base: str) -> str | None:
+    """Map an Ollama OpenAI-compat base (``…/v1``) to its native ``…/api`` base.
+
+    Returns ``None`` when the URL doesn't end in ``/v1`` (i.e. it doesn't look
+    like an Ollama endpoint), so keep-alive pinning — an Ollama-specific
+    feature — is simply skipped for custom/non-Ollama servers.
+    """
+    base = (api_base or "").rstrip("/")
+    if base.endswith("/v1"):
+        return base[: -len("/v1")].rstrip("/") + "/api"
+    return None
+
+
+def keep_warm_enabled() -> bool:
+    """Whether the periodic keep-alive pinger should run (GUM_KEEP_WARM)."""
+    return os.getenv("GUM_KEEP_WARM", "1") != "0"
+
+
+def resolve_keep_alive() -> int | str:
+    """Ollama ``keep_alive`` value (GUM_KEEP_ALIVE, default '15m').
+
+    Integer-like values (e.g. ``-1`` for "never unload", or a second count) are
+    passed as ints; duration strings like ``15m`` are passed through verbatim.
+    """
+    v = os.getenv("GUM_KEEP_ALIVE", "15m")
+    try:
+        return int(v)
+    except ValueError:
+        return v
+
+
+def resolve_keep_warm_interval() -> float:
+    """Seconds between keep-alive pings (GUM_KEEP_WARM_INTERVAL, default 240).
+
+    Floored at 30s so a misconfiguration can't turn this into a busy loop. Keep
+    it comfortably below the keep_alive window so a single missed ping never lets
+    a model lapse.
+    """
+    try:
+        return max(30.0, float(os.getenv("GUM_KEEP_WARM_INTERVAL", "240")))
+    except ValueError:
+        return 240.0
+
+
+def _native_generate_ping(url: str, model: str, keep_alive: int | str) -> None:
+    """Fire a single empty-prompt native ``/api/generate`` load request.
+
+    An empty prompt makes Ollama load (or refresh the residency timer of) the
+    model and return immediately without generating any tokens. Uses stdlib
+    urllib so no HTTP dependency beyond what's already installed; called from a
+    worker thread via ``to_thread``.
+    """
+    import urllib.request
+
+    payload = json.dumps(
+        {"model": model, "prompt": "", "stream": False, "keep_alive": keep_alive}
+    ).encode()
+    req = urllib.request.Request(
+        url, data=payload, headers={"Content-Type": "application/json"}
+    )
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        resp.read()
+
+
+def resolve_warm_targets(targets: list[tuple[str, str]]) -> list[tuple[str, str]]:
+    """Resolve ``(openai_api_base, model)`` pairs to unique ``(native_url, model)``.
+
+    Drops any target whose base isn't an Ollama ``/v1`` endpoint and de-dupes,
+    so the two roles that share one local Ollama don't get pinged twice.
+    """
+    seen: set[tuple[str, str]] = set()
+    resolved: list[tuple[str, str]] = []
+    for base, model in targets:
+        native = ollama_native_base(base)
+        if native is None:
+            continue
+        entry = (native + "/generate", model)
+        if entry in seen:
+            continue
+        seen.add(entry)
+        resolved.append(entry)
+    return resolved
+
+
+async def keep_models_warm(
+    targets: list[tuple[str, str]],
+    *,
+    keep_alive: int | str = "15m",
+    interval: float = 240.0,
+    logger: logging.Logger | None = None,
+) -> None:
+    """Periodically ping each ``(api_base, model)`` so Ollama keeps it resident.
+
+    Runs until cancelled. Each ping is routed through the global inference slot
+    so it serializes cleanly with real work instead of triggering a cross-model
+    GPU split; a ping that fails (e.g. the endpoint isn't Ollama after all) is
+    logged at debug and retried next tick rather than killing the loop.
+    """
+    log = logger or logging.getLogger("gum.llm")
+    resolved = resolve_warm_targets(targets)
+    if not resolved:
+        log.debug("keep-warm: no Ollama targets to pin; pinger idle")
+        return
+
+    log.info(
+        "keep-warm: pinning %d model(s) every %.0fs (keep_alive=%s)",
+        len(resolved),
+        interval,
+        keep_alive,
+    )
+    while True:
+        for url, model in resolved:
+            try:
+                async with inference_semaphore():
+                    await asyncio.to_thread(_native_generate_ping, url, model, keep_alive)
+            except Exception as exc:  # pragma: no cover - network/transport
+                log.debug("keep-warm ping failed for %s (%s)", model, exc)
+        await asyncio.sleep(interval)
+
+
 def _allow_remote() -> bool:
     return os.getenv("GUM_ALLOW_REMOTE", "").strip().lower() in {"1", "true", "yes", "on"}
 

@@ -65,6 +65,16 @@ class Observer(ABC):
         """
         return self._name
 
+    @property
+    def warm_targets(self) -> list[tuple[str, str]]:
+        """``(api_base, model)`` pairs this observer wants Ollama to keep resident.
+
+        Observers that drive a local model return the endpoint and model name so
+        the GUM's keep-alive pinger can prevent it from unloading during idle
+        periods. Non-model observers keep the default (nothing to pin).
+        """
+        return []
+
     async def get_update(self):
         """Get the next update from the queue if available.
         

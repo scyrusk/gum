@@ -25,7 +25,7 @@ from shapely.ops import unary_union
 # — Local —
 from .observer import Observer
 from ..schemas import Update
-from ..llm import make_client, inference_semaphore
+from ..llm import make_client, inference_semaphore, resolve_api_base
 
 # — Local —
 from gum.prompts.screen import TRANSCRIPTION_PROMPT, SUMMARY_PROMPT, COMBINED_PROMPT
@@ -260,10 +260,16 @@ class Screen(Observer):
         self._last_input: float = time.monotonic()
         # Local-first inference client (defaults to Ollama; refuses non-local
         # endpoints unless GUM_ALLOW_REMOTE=1). See gum/llm.py.
+        self._api_base = resolve_api_base("screen", api_base)
         self.client = make_client("screen", api_base=api_base, api_key=api_key)
 
         # call parent
         super().__init__()
+
+    @property
+    def warm_targets(self) -> list[tuple[str, str]]:
+        """Keep the vision model resident (see gum.keep-alive pinger)."""
+        return [(self._api_base, self.model_name)]
 
     # ─────────────────────────────── tiny sync helpers
     @staticmethod
