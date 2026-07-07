@@ -385,7 +385,10 @@ def migrate_feedback_table(conn) -> None:
         """
         INSERT INTO proposition_feedback__new
             (id, proposition_id, proposition_text, reasoning, rating, note, created_at)
-        SELECT id, proposition_id, proposition_text, reasoning,
+        SELECT id,
+               CASE WHEN proposition_id IN (SELECT id FROM propositions)
+                    THEN proposition_id ELSE NULL END,
+               proposition_text, reasoning,
                CASE WHEN verdict THEN 'accurate' ELSE 'inaccurate' END, NULL, created_at
         FROM proposition_feedback
         """

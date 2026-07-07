@@ -360,7 +360,7 @@ async def cmd_review(args) -> None:
 
     api_task = asyncio.create_task(server.serve())
     print(f"GUM review UI running at {url}")
-    print("Judge each proposition True/False; your feedback trains the model. Press Ctrl-C to stop.")
+    print("Rate each proposition Accurate / Somewhat / Inaccurate; your feedback trains the model. Press Ctrl-C to stop.")
     await asyncio.sleep(0.6)
     try:
         webbrowser.open(url)
