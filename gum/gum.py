@@ -237,26 +237,49 @@ class gum:
 
     async def _update_loop(self):
         """Efficiently wait for any observer to produce an Update and dispatch it.
-        
+
         This method continuously monitors all observers for updates and processes them
         through the semaphore-guarded handler.
         """
-        while True:
-            gets = {
-                asyncio.create_task(obs.update_queue.get()): obs
-                for obs in self.observers
-            }
+        # Keep exactly one outstanding ``update_queue.get()`` per observer,
+        # persisted across loop iterations. The previous implementation rebuilt a
+        # get() task for every observer on each pass and discarded the
+        # un-completed ones WITHOUT cancelling them; with more than one observer
+        # those orphaned getters stayed registered on their queues and would
+        # eventually consume a later Update whose result nobody awaited —
+        # silently dropping observations. A long-lived getter per observer fixes
+        # that loss and also removes the per-iteration task churn.
+        pending: dict[asyncio.Task, Observer] = {}
+        try:
+            while True:
+                # (Re)arm a getter for any observer that doesn't currently have
+                # one outstanding — new observers, or ones whose getter just
+                # completed and was popped below.
+                armed = set(pending.values())
+                for obs in self.observers:
+                    if obs not in armed:
+                        pending[asyncio.create_task(obs.update_queue.get())] = obs
 
-            done, _ = await asyncio.wait(
-                gets.keys(), return_when=asyncio.FIRST_COMPLETED
-            )
+                if not pending:
+                    # No observers registered yet; yield briefly and re-check.
+                    await asyncio.sleep(0.05)
+                    continue
 
-            for fut in done:
-                upd: Update = fut.result()
-                obs = gets[fut]
+                done, _ = await asyncio.wait(
+                    pending.keys(), return_when=asyncio.FIRST_COMPLETED
+                )
 
-                for handler in self.update_handlers:
-                    asyncio.create_task(handler(obs, upd))
+                for fut in done:
+                    obs = pending.pop(fut)
+                    upd: Update = fut.result()
+
+                    for handler in self.update_handlers:
+                        asyncio.create_task(handler(obs, upd))
+        finally:
+            # Cancel any still-outstanding getters so they don't leak when the
+            # loop is cancelled on shutdown.
+            for fut in pending:
+                fut.cancel()
 
     async def _batch_processing_loop(self):
         """Process batched observations when minimum batch size is reached."""
