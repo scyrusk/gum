@@ -16,7 +16,7 @@ import asyncio
 # — Third-party —
 import mss
 import Quartz
-from PIL import Image
+from PIL import Image, ImageChops
 from pynput import mouse           # still synchronous
 from shapely.geometry import box
 from shapely.ops import unary_union
@@ -204,6 +204,25 @@ class Screen(Observer):
         self.max_image_dim = max_image_dim
         self.max_summary_images = max_summary_images
 
+        # Skip the whole observation (VLM call + emitted update) when an
+        # interaction left the screen visually unchanged — the common case for
+        # mouse moves/clicks over static content (reading, hovering). The GUM's
+        # most frequent inference is this per-interaction vision call, so
+        # transcribing an identical frame both burns that inference and injects
+        # a no-signal observation that dilutes the downstream proposition batch.
+        # A cheap downscaled-grayscale diff gates it; default on, disable with
+        # GUM_SKIP_UNCHANGED_FRAMES=0. The gate counts how many thumbnail pixels
+        # changed appreciably (see _frames_differ) rather than averaging the
+        # whole frame, so a small-but-real edit (a toggled checkbox, a new
+        # tooltip) still registers while a static screen stays at zero.
+        # GUM_FRAME_DIFF_THRESHOLD tunes how many changed pixels are tolerated
+        # before an interaction counts as unchanged (default 3, conservative).
+        self.skip_unchanged = os.getenv("GUM_SKIP_UNCHANGED_FRAMES", "1") != "0"
+        try:
+            self.changed_pixel_tolerance = int(os.getenv("GUM_FRAME_DIFF_THRESHOLD", "3"))
+        except ValueError:
+            self.changed_pixel_tolerance = 3
+
         self.debug = debug
 
         # state shared with worker
@@ -309,6 +328,49 @@ class Screen(Observer):
         if self.max_image_dim and max(img.size) > self.max_image_dim:
             img.thumbnail((self.max_image_dim, self.max_image_dim), Image.LANCZOS)
         img.save(path, "JPEG", quality=70)
+
+    # ─────────────────────────────── change detection
+    _DIFF_THUMB = (128, 128)
+    # A thumbnail pixel counts as "changed" only when its grayscale intensity
+    # moves by more than this (0-255). Absorbs sub-threshold resample shimmer
+    # while still tripping on any genuine content change.
+    _DIFF_PIXEL_DELTA = 16
+
+    def _frames_differ(self, before, after) -> bool:
+        """Return True if two raw framebuffers differ meaningfully.
+
+        Downscales both grabs to a small grayscale thumbnail, takes the
+        per-pixel absolute difference, and counts how many thumbnail pixels
+        changed by more than ``_DIFF_PIXEL_DELTA``. Frames "differ" once that
+        count exceeds ``changed_pixel_tolerance``. A *count* (not a whole-frame
+        average) is used deliberately: averaging dilutes a small localized edit
+        into noise, whereas a toggled checkbox or a popped-up tooltip lights up
+        a handful of thumbnail pixels at full delta and is preserved. Raw grabs
+        are uncompressed, so a static screen yields an exact match (count 0).
+        Runs off the event loop via ``to_thread``; any failure falls back to
+        "differ" so a comparison error never silently drops an observation.
+        """
+        try:
+            if before is None or after is None:
+                return True
+            if before.width != after.width or before.height != after.height:
+                return True
+            ba = (
+                Image.frombytes("RGB", (before.width, before.height), before.rgb)
+                .convert("L")
+                .resize(self._DIFF_THUMB, Image.BILINEAR)
+            )
+            aa = (
+                Image.frombytes("RGB", (after.width, after.height), after.rgb)
+                .convert("L")
+                .resize(self._DIFF_THUMB, Image.BILINEAR)
+            )
+            # histogram bins above the per-pixel delta = count of changed pixels
+            hist = ImageChops.difference(ba, aa).histogram()
+            changed = sum(hist[self._DIFF_PIXEL_DELTA + 1:])
+            return changed > self.changed_pixel_tolerance
+        except Exception:                                               # pragma: no cover
+            return True
 
     async def _process_and_emit(self, before_path: str, after_path: str) -> None:
         """Process screenshots and emit an update.
@@ -417,6 +479,15 @@ class Screen(Observer):
 
                 ev = self._pending_event
                 aft = await asyncio.to_thread(sct.grab, mons[ev["mon"] - 1])
+
+                # Gate on visible change: if the screen is static, skip the VLM
+                # call and the no-signal observation it would produce entirely.
+                if self.skip_unchanged and not await asyncio.to_thread(
+                    self._frames_differ, ev["before"], aft
+                ):
+                    log.info(f"{ev['type']} skipped on monitor {ev['mon']} (screen unchanged)")
+                    self._pending_event = None
+                    return
 
                 bef_path = await self._save_frame(ev["before"], "before")
                 aft_path = await self._save_frame(aft, "after")
