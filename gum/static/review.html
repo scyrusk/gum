@@ -1,0 +1,257 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>GUM · Review</title>
+<style>
+  :root {
+    --bg: #f6f7f9; --card: #ffffff; --text: #1a1c1e; --muted: #6b7280;
+    --border: #e5e7eb; --accent: #4f46e5;
+    --true: #16a34a; --true-bg: #dcfce7; --false: #dc2626; --false-bg: #fee2e2;
+    --partial: #b45309; --partial-bg: #fef3c7;
+    --skip: #6b7280; --chip: #eef2ff; --chip-text: #4338ca;
+    --shadow: 0 1px 3px rgba(0,0,0,.06), 0 8px 24px rgba(0,0,0,.06);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0f1115; --card: #191c22; --text: #e6e8eb; --muted: #9aa1ab;
+      --border: #2a2f38; --accent: #818cf8;
+      --true: #4ade80; --true-bg: #14361f; --false: #f87171; --false-bg: #3a1717;
+      --partial: #fbbf24; --partial-bg: #3a2c10;
+      --skip: #9aa1ab; --chip: #232a44; --chip-text: #b3bdf5;
+      --shadow: 0 1px 3px rgba(0,0,0,.4), 0 10px 30px rgba(0,0,0,.35);
+    }
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; }
+  body {
+    background: var(--bg); color: var(--text); -webkit-font-smoothing: antialiased;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    line-height: 1.5;
+  }
+  header {
+    position: sticky; top: 0; z-index: 5; background: var(--bg);
+    border-bottom: 1px solid var(--border); padding: 14px 20px;
+  }
+  .bar { max-width: 780px; margin: 0 auto; display: flex; align-items: center; gap: 14px; }
+  .logo { font-weight: 700; letter-spacing: .3px; }
+  .logo span { color: var(--accent); }
+  .progress-wrap { flex: 1; }
+  .progress-track { height: 8px; background: var(--border); border-radius: 999px; overflow: hidden; }
+  .progress-fill { height: 100%; width: 0%; background: var(--accent); transition: width .3s ease; }
+  .progress-label { font-size: 12px; color: var(--muted); margin-top: 4px; text-align: right; }
+
+  main { max-width: 780px; margin: 0 auto; padding: 28px 20px 120px; }
+
+  .card {
+    background: var(--card); border: 1px solid var(--border); border-radius: 16px;
+    box-shadow: var(--shadow); padding: 26px; animation: pop .18s ease;
+  }
+  @keyframes pop { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
+
+  .eyebrow { font-size: 12px; text-transform: uppercase; letter-spacing: .08em; color: var(--muted); margin-bottom: 10px; }
+  .prop { font-size: 22px; font-weight: 600; line-height: 1.35; margin: 0 0 16px; }
+  .chips { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 18px; }
+  .chip { font-size: 12px; background: var(--chip); color: var(--chip-text); padding: 4px 10px; border-radius: 999px; font-weight: 600; }
+  .reasoning { color: var(--muted); font-size: 15px; border-left: 3px solid var(--border); padding-left: 14px; margin: 0 0 8px; }
+
+  .evidence-title { margin: 26px 0 12px; font-size: 13px; font-weight: 700; color: var(--muted); text-transform: uppercase; letter-spacing: .06em; }
+  .obs { border: 1px solid var(--border); border-radius: 12px; margin-bottom: 10px; overflow: hidden; background: var(--card); }
+  .obs summary {
+    cursor: pointer; list-style: none; padding: 12px 14px; display: flex; gap: 10px;
+    align-items: center; font-size: 13px; color: var(--muted); user-select: none;
+  }
+  .obs summary::-webkit-details-marker { display: none; }
+  .obs summary::before { content: "▸"; color: var(--muted); transition: transform .15s; }
+  .obs[open] summary::before { transform: rotate(90deg); }
+  .obs .who { font-weight: 600; color: var(--text); }
+  .obs pre {
+    margin: 0; padding: 0 14px 14px; white-space: pre-wrap; word-break: break-word;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12.5px;
+    color: var(--text); max-height: 340px; overflow: auto;
+  }
+  .no-obs { color: var(--muted); font-size: 14px; font-style: italic; }
+
+  .actions {
+    position: fixed; left: 0; right: 0; bottom: 0; background: var(--bg);
+    border-top: 1px solid var(--border); padding: 14px 20px;
+  }
+  .actions-inner { max-width: 780px; margin: 0 auto; display: flex; flex-direction: column; gap: 10px; }
+  .note-input {
+    width: 100%; resize: vertical; min-height: 40px; max-height: 160px;
+    border: 1px solid var(--border); border-radius: 10px; background: var(--card); color: var(--text);
+    padding: 10px 12px; font: inherit; font-size: 14px;
+  }
+  .note-input:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
+  .btn-row { display: flex; gap: 10px; }
+  button {
+    flex: 1; border: 1px solid var(--border); border-radius: 12px; padding: 14px 12px;
+    font-size: 15px; font-weight: 600; cursor: pointer; background: var(--card); color: var(--text);
+    transition: transform .05s ease, filter .15s ease; display: flex; align-items: center; justify-content: center; gap: 8px;
+  }
+  button:active { transform: translateY(1px); }
+  button:disabled { opacity: .5; cursor: default; }
+  button kbd { font: inherit; font-size: 11px; opacity: .7; border: 1px solid currentColor; border-radius: 5px; padding: 0 5px; }
+  .btn-true { color: var(--true); border-color: var(--true); }
+  .btn-true:hover { background: var(--true-bg); }
+  .btn-partial { color: var(--partial); border-color: var(--partial); }
+  .btn-partial:hover { background: var(--partial-bg); }
+  .btn-false { color: var(--false); border-color: var(--false); }
+  .btn-false:hover { background: var(--false-bg); }
+  .btn-skip { color: var(--skip); flex: 0 0 auto; padding-left: 18px; padding-right: 18px; }
+
+  .center { text-align: center; padding: 80px 20px; color: var(--muted); }
+  .center h2 { color: var(--text); font-size: 22px; }
+  .big { font-size: 48px; margin-bottom: 8px; }
+  .spinner { width: 26px; height: 26px; border: 3px solid var(--border); border-top-color: var(--accent);
+             border-radius: 50%; animation: spin .8s linear infinite; margin: 0 auto 14px; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+</style>
+</head>
+<body>
+<header>
+  <div class="bar">
+    <div class="logo">GUM<span>·</span>Review</div>
+    <div class="progress-wrap">
+      <div class="progress-track"><div class="progress-fill" id="fill"></div></div>
+      <div class="progress-label" id="plabel">&nbsp;</div>
+    </div>
+  </div>
+</header>
+
+<main id="main">
+  <div class="center"><div class="spinner"></div>Loading…</div>
+</main>
+
+<div class="actions" id="actions" style="display:none">
+  <div class="actions-inner">
+    <textarea class="note-input" id="note" rows="1"
+      placeholder="Add context the model can learn from (optional) — e.g. why it's only somewhat right, or what it got wrong"></textarea>
+    <div class="btn-row">
+      <button class="btn-true"    onclick="submit('accurate')">✓ Accurate <kbd>T</kbd></button>
+      <button class="btn-partial" onclick="submit('partial')">≈ Somewhat <kbd>S</kbd></button>
+      <button class="btn-false"   onclick="submit('inaccurate')">✕ Inaccurate <kbd>F</kbd></button>
+      <button class="btn-skip"    onclick="skip()">Skip <kbd>K</kbd></button>
+    </div>
+  </div>
+</div>
+
+<script>
+  const main = document.getElementById('main');
+  const actions = document.getElementById('actions');
+  const fill = document.getElementById('fill');
+  const plabel = document.getElementById('plabel');
+  let current = null;         // current proposition object
+  let skipped = [];           // ids deferred this session
+  let busy = false;
+
+  const esc = (s) => (s ?? '').replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
+  const fmtDate = (iso) => { try { return new Date(iso).toLocaleString(); } catch { return iso || ''; } };
+
+  function setProgress(reviewed, total) {
+    const pct = total ? Math.round((reviewed / total) * 100) : 0;
+    fill.style.width = pct + '%';
+    plabel.textContent = `${reviewed} of ${total} reviewed`;
+  }
+
+  function showActions(on) { actions.style.display = on ? 'block' : 'none'; }
+
+  function resetNote() { const n = document.getElementById('note'); if (n) n.value = ''; }
+
+  async function loadNext() {
+    busy = true;
+    main.innerHTML = '<div class="center"><div class="spinner"></div>Loading…</div>';
+    showActions(false);
+    resetNote();
+    try {
+      const q = skipped.length ? ('?skip=' + skipped.join(',')) : '';
+      const r = await fetch('/review/next' + q);
+      const data = await r.json();
+      setProgress(data.reviewed, data.total);
+      if (data.done) { renderDone(data); busy = false; return; }
+      current = data.proposition;
+      renderProposition(data.proposition, data.observations);
+      showActions(true);
+    } catch (e) {
+      main.innerHTML = '<div class="center"><h2>Couldn\'t reach the GUM</h2><p>' + esc(String(e)) + '</p></div>';
+    }
+    busy = false;
+  }
+
+  function renderProposition(p, obs) {
+    const chips = [];
+    if (p.confidence != null) chips.push(`Confidence ${p.confidence}/10`);
+    if (p.decay != null) chips.push(`Decay ${p.decay}/10`);
+    if (p.created_at) chips.push(fmtDate(p.created_at));
+
+    const obsHtml = (obs && obs.length)
+      ? obs.map((o, i) => `
+          <details class="obs" ${i === 0 ? 'open' : ''}>
+            <summary><span class="who">${esc(o.observer_name)}</span> · ${esc(fmtDate(o.created_at))}</summary>
+            <pre>${esc(o.content)}</pre>
+          </details>`).join('')
+      : '<div class="no-obs">No observations are linked to this proposition.</div>';
+
+    main.innerHTML = `
+      <div class="card">
+        <div class="eyebrow">Is this true about you?</div>
+        <p class="prop">${esc(p.text)}</p>
+        <div class="chips">${chips.map(c => `<span class="chip">${esc(c)}</span>`).join('')}</div>
+        ${p.reasoning ? `<p class="reasoning">${esc(p.reasoning)}</p>` : ''}
+        <div class="evidence-title">Evidence · ${obs ? obs.length : 0} observation${(obs && obs.length === 1) ? '' : 's'}</div>
+        ${obsHtml}
+      </div>`;
+  }
+
+  function renderDone(data) {
+    current = null;
+    showActions(false);
+    const none = (data.total === 0);
+    main.innerHTML = `
+      <div class="center">
+        <div class="big">${none ? '🫧' : '🎉'}</div>
+        <h2>${none ? 'No propositions yet' : 'All caught up!'}</h2>
+        <p>${none
+            ? 'Let the GUM observe for a while, then come back to review.'
+            : `You've reviewed all ${data.total} propositions. Your judgments now guide the model.`}</p>
+        ${skipped.length ? `<p><a href="#" onclick="skipped=[];loadNext();return false">Revisit ${skipped.length} skipped</a></p>` : ''}
+      </div>`;
+  }
+
+  async function submit(rating) {
+    if (busy || !current) return;
+    busy = true;
+    const noteEl = document.getElementById('note');
+    const note = noteEl ? noteEl.value.trim() : '';
+    try {
+      await fetch('/review', {
+        method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({ proposition_id: current.id, rating, note })
+      });
+    } catch (_) {}
+    await loadNext();
+  }
+
+  function skip() {
+    if (busy || !current) return;
+    skipped.push(current.id);
+    loadNext();
+  }
+
+  document.addEventListener('keydown', (e) => {
+    if (busy || !current) return;
+    // Don't hijack keys while the user is typing context in the note field.
+    const tag = (document.activeElement && document.activeElement.tagName) || '';
+    if (tag === 'TEXTAREA' || tag === 'INPUT') return;
+    const k = e.key.toLowerCase();
+    if (k === 't') submit('accurate');
+    else if (k === 's') submit('partial');
+    else if (k === 'f') submit('inaccurate');
+    else if (k === 'k') skip();
+  });
+
+  loadNext();
+</script>
+</body>
+</html>

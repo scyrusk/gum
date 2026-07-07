@@ -133,6 +133,12 @@ def parse_args():
     p_obs.add_argument("--user-name", "-u", type=str)
     p_obs.add_argument("--text-model", "-m", type=str)
 
+    p_review = sub.add_parser("review", help="Open the proposition review GUI in your browser")
+    p_review.add_argument("--port", type=int, help="Review server port (default 8423)")
+    p_review.add_argument("--host", type=str, help="Review server host (default 127.0.0.1)")
+    p_review.add_argument("--user-name", "-u", type=str)
+    p_review.add_argument("--text-model", "-m", type=str)
+
     sub.add_parser("reset-cache", help="Delete the GUM cache (~/.cache/gum) and exit")
 
     return parser, parser.parse_args()
@@ -333,6 +339,39 @@ async def cmd_observations(args) -> None:
         print("\n" + text)
 
 
+async def cmd_review(args) -> None:
+    """Serve the proposition review GUI locally and open it in the browser."""
+    import webbrowser
+    from gum.api import build_server
+
+    host = _api_host(args)
+    port = getattr(args, "port", None) or int(os.getenv("GUM_REVIEW_PORT", "8423"))
+
+    g = gum(_user_name(args) or "default", _text_model(args))
+    await g.connect_db()  # also creates the feedback table if it doesn't exist yet
+
+    url = f"http://{host}:{port}/"
+    server = build_server(g, host=host, port=port)
+
+    loop = asyncio.get_running_loop()
+    stop_event = asyncio.Event()
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        loop.add_signal_handler(sig, stop_event.set)
+
+    api_task = asyncio.create_task(server.serve())
+    print(f"GUM review UI running at {url}")
+    print("Judge each proposition True/False; your feedback trains the model. Press Ctrl-C to stop.")
+    await asyncio.sleep(0.6)
+    try:
+        webbrowser.open(url)
+    except Exception:
+        pass
+    await stop_event.wait()
+    print("\nClosing review server…")
+    server.should_exit = True
+    await api_task
+
+
 def cmd_reset_cache(args) -> None:
     cache_dir = os.path.expanduser("~/.cache/gum/")
     if os.path.exists(cache_dir):
@@ -367,6 +406,8 @@ def cli() -> None:
         asyncio.run(cmd_recent(args))
     elif command == "observations":
         asyncio.run(cmd_observations(args))
+    elif command == "review":
+        asyncio.run(cmd_review(args))
     else:
         parser.print_help()
 

@@ -52,6 +52,8 @@ gum query "email" -l 10         # BM25 search over propositions
 gum observations                # list the most recent raw observations (--full for complete text)
 gum observations --date 7/7/2026  # all observations from a given Eastern-time day
 gum observations --date 7/7/2026 -o day.txt   # write results to a file (exports full content)
+
+gum review                      # open a browser GUI to judge propositions True/False (see below)
 ```
 
 `gum start` accepts overrides, e.g. `gum start --vision-model qwen2.5vl:32b --text-model gpt-oss:20b --port 8500`. Logs stream to `~/.cache/gum/gum.log`.
@@ -60,7 +62,19 @@ gum observations --date 7/7/2026 -o day.txt   # write results to a file (exports
 >
 > **Idle behaviour.** The vision model is kept warm continuously (it runs on nearly every interaction). The larger text model runs only on batches, so it is released from memory after ~10 min with no new observations (`GUM_TEXT_IDLE_UNLOAD`, seconds) and reloaded on the next batch — a cooler, lighter idle in exchange for a one-time reload. Set `GUM_TEXT_IDLE_UNLOAD=0` to keep it always resident.
 
-### 5. Build on it from other apps
+### 5. Review propositions to improve the model
+
+`gum review` opens a small browser GUI that shows you one proposition at a time — along with the observations that led to it — and asks whether it's **Accurate**, **Somewhat** accurate, or **Inaccurate** about you. You can add an optional free-text **note** with any rating to give the model context (e.g. "only when I'm coding, not for writing"). Keyboard: `t` / `s` / `f` for the three ratings, `k` to skip. It walks your most recent unreviewed propositions first.
+
+```bash
+gum review          # opens http://127.0.0.1:8423 in your browser
+```
+
+Your judgments (and notes) are stored locally and fed back into the proposition generator as few-shot calibration examples, so the model learns the kinds of inferences that are accurate about you, refines toward your notes on partially-right ones, and avoids the inaccurate ones. This runs fine alongside the background daemon (nothing leaves your machine).
+
+For each batch the examples are chosen to be **relevant** to the current activity (TF-IDF/cosine over your judged propositions) and **balanced across ratings** (round-robin over accurate/partial/inaccurate), so the model always gets contrastive, on-topic signal rather than just the most recent judgments. Tune with `GUM_FEWSHOT_LIMIT` (examples per batch, default 8; `0` disables) and `GUM_FEWSHOT_POOL` (recent candidates considered, default 200).
+
+### 6. Build on it from other apps
 
 While the GUM is running it serves a **localhost-only REST API** (default `http://127.0.0.1:8422`) that any local app, in any language, can query:
 

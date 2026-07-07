@@ -73,6 +73,7 @@ Rate how long the proposition is likely to stay relevant. Consider:
 
 Score: **1 (short-lived)** to **10 (long-lasting insight or pattern)**.
 
+{feedback_examples}
 # Input
 
 Below is a set of transcribed actions and interactions that {user_name} has performed:

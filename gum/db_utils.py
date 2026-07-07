@@ -26,6 +26,7 @@ from sqlalchemy.orm import selectinload
 from .models import (
     Observation,
     Proposition,
+    PropositionFeedback,
     observation_proposition,
 )
 
@@ -288,6 +289,140 @@ async def get_recent_propositions(
 
     result = await session.execute(stmt)
     return result.scalars().all()
+
+
+async def get_reviewed_proposition_ids(session: AsyncSession) -> set[int]:
+    """Return the set of proposition ids that already have a feedback judgment."""
+    rows = await session.execute(
+        select(PropositionFeedback.proposition_id).where(
+            PropositionFeedback.proposition_id.isnot(None)
+        )
+    )
+    return {r[0] for r in rows.all()}
+
+
+async def get_next_unreviewed_proposition(
+    session: AsyncSession,
+    *,
+    exclude_ids: set[int] | None = None,
+) -> "Proposition | None":
+    """Most recent proposition (by created_at) that has no feedback yet.
+
+    ``exclude_ids`` additionally skips propositions the user deferred this
+    session. Eager-loads observations so the review UI can show the evidence.
+    """
+    skip = await get_reviewed_proposition_ids(session)
+    if exclude_ids:
+        skip |= exclude_ids
+    stmt = select(Proposition).order_by(Proposition.created_at.desc())
+    if skip:
+        stmt = stmt.where(Proposition.id.notin_(skip))
+    stmt = stmt.options(selectinload(Proposition.observations)).limit(1)
+    result = await session.execute(stmt)
+    return result.scalars().first()
+
+
+async def add_proposition_feedback(
+    session: AsyncSession,
+    proposition: Proposition,
+    rating: str,
+    note: str | None = None,
+) -> PropositionFeedback:
+    """Record a rating (accurate/partial/inaccurate) plus optional context note,
+    snapshotting the proposition text."""
+    fb = PropositionFeedback(
+        proposition_id=proposition.id,
+        proposition_text=proposition.text,
+        reasoning=proposition.reasoning,
+        rating=rating,
+        note=(note or None),
+    )
+    session.add(fb)
+    await session.flush()
+    return fb
+
+
+async def get_recent_feedback(
+    session: AsyncSession, *, limit: int = 8
+) -> List[PropositionFeedback]:
+    """Most recent judgments, newest first (for few-shot calibration)."""
+    result = await session.execute(
+        select(PropositionFeedback)
+        .order_by(PropositionFeedback.created_at.desc())
+        .limit(limit)
+    )
+    return result.scalars().all()
+
+
+def _feedback_relevance(
+    feedback: List[PropositionFeedback], query_text: str
+) -> list[float]:
+    """TF-IDF cosine similarity of each feedback's text vs *query_text*.
+
+    Returns all-zeros when there's no usable query/vocabulary, so selection
+    gracefully degrades to recency-only ordering.
+    """
+    if not query_text or not query_text.strip():
+        return [0.0] * len(feedback)
+    docs = [f"{fb.proposition_text} {fb.note or ''}" for fb in feedback]
+    try:
+        vec = TfidfVectorizer().fit(docs)
+        sims = cosine_similarity(vec.transform(docs), vec.transform([query_text]))
+        return sims.ravel().tolist()
+    except ValueError:  # empty vocabulary, etc.
+        return [0.0] * len(feedback)
+
+
+def select_relevant_balanced_feedback(
+    feedback: List[PropositionFeedback],
+    query_text: str,
+    limit: int,
+) -> List[PropositionFeedback]:
+    """Pick up to *limit* feedback examples that are both relevant to
+    *query_text* and balanced across ratings.
+
+    Within each rating class the most relevant examples come first (ties broken
+    by recency, since *feedback* is passed newest-first). Slots are then filled
+    round-robin across the non-empty classes, so the model always sees
+    contrastive signal (accurate vs. partial vs. inaccurate) rather than whatever
+    happened to be reviewed most recently. Empty classes yield their slots to
+    the others.
+    """
+    feedback = list(feedback)
+    if limit <= 0 or not feedback:
+        return []
+    if len(feedback) <= limit:
+        return feedback
+
+    scores = _feedback_relevance(feedback, query_text)
+
+    # Group by rating, each sorted by relevance desc (stable → recency tiebreak).
+    classes: dict[str, list[PropositionFeedback]] = {}
+    for fb, score in sorted(
+        zip(feedback, scores), key=lambda t: t[1], reverse=True
+    ):
+        classes.setdefault(fb.rating, []).append(fb)
+
+    order = [r for r in ("accurate", "partial", "inaccurate") if classes.get(r)]
+    order += [r for r in classes if r not in order]  # any unexpected ratings
+
+    chosen: List[PropositionFeedback] = []
+    cursor = {r: 0 for r in order}
+    while len(chosen) < limit and any(cursor[r] < len(classes[r]) for r in order):
+        for r in order:
+            if len(chosen) >= limit:
+                break
+            if cursor[r] < len(classes[r]):
+                chosen.append(classes[r][cursor[r]])
+                cursor[r] += 1
+    return chosen
+
+
+async def count_review_progress(session: AsyncSession) -> tuple[int, int]:
+    """Return (total_propositions, reviewed_count)."""
+    total = (await session.execute(select(func.count(Proposition.id)))).scalar() or 0
+    reviewed = len(await get_reviewed_proposition_ids(session))
+    return total, reviewed
 
 
 async def get_recent_observations(

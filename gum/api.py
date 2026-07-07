@@ -7,12 +7,23 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, Query
+from fastapi.responses import HTMLResponse
+from pydantic import BaseModel
 
 from .gum import gum
-from .models import Observation, Proposition
+from .models import FEEDBACK_RATINGS, Observation, Proposition
+
+_STATIC_DIR = Path(__file__).parent / "static"
+
+
+class ReviewIn(BaseModel):
+    proposition_id: int
+    rating: str  # one of FEEDBACK_RATINGS: accurate | partial | inaccurate
+    note: str | None = None  # optional free-text context from the user
 
 
 def _serialize_proposition(prop: Proposition, score: float | None = None) -> dict[str, Any]:
@@ -73,6 +84,37 @@ def create_app(gum_instance: gum) -> FastAPI:
     async def observations(limit: int = Query(10, ge=1, le=100)) -> dict[str, Any]:
         obs = await gum_instance.recent_observations(limit=limit)
         return {"results": [_serialize_observation(o) for o in obs]}
+
+    # ── proposition review ────────────────────────────────────────────────
+    @app.get("/", response_class=HTMLResponse)
+    async def review_page() -> str:
+        return (_STATIC_DIR / "review.html").read_text()
+
+    @app.get("/review/next")
+    async def review_next(
+        skip: str = Query("", description="Comma-separated proposition ids to defer"),
+    ) -> dict[str, Any]:
+        exclude = {int(x) for x in skip.split(",") if x.strip().isdigit()}
+        total, reviewed = await gum_instance.review_progress()
+        result = await gum_instance.next_for_review(exclude_ids=exclude or None)
+        if result is None:
+            return {"done": True, "total": total, "reviewed": reviewed}
+        prop, obs = result
+        return {
+            "done": False,
+            "total": total,
+            "reviewed": reviewed,
+            "proposition": _serialize_proposition(prop),
+            "observations": [_serialize_observation(o) for o in obs],
+        }
+
+    @app.post("/review")
+    async def review_submit(body: ReviewIn) -> dict[str, Any]:
+        if body.rating not in FEEDBACK_RATINGS:
+            return {"ok": False, "error": f"rating must be one of {FEEDBACK_RATINGS}"}
+        note = (body.note or "").strip() or None
+        ok = await gum_instance.add_review(body.proposition_id, body.rating, note)
+        return {"ok": ok}
 
     return app
 

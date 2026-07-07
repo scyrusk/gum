@@ -21,6 +21,11 @@ from .db_utils import (
     search_propositions_bm25,
     get_recent_propositions,
     get_recent_observations,
+    get_next_unreviewed_proposition,
+    add_proposition_feedback,
+    get_recent_feedback,
+    select_relevant_balanced_feedback,
+    count_review_progress,
 )
 from .llm import (
     make_client,
@@ -390,6 +395,7 @@ class gum:
         """
         prompt = (
             self.propose_prompt.replace("{user_name}", self.user_name)
+            .replace("{feedback_examples}", await self._build_feedback_examples(update.content))
             .replace("{inputs}", update.content)
         )
 
@@ -401,6 +407,54 @@ class gum:
             logger=self.logger,
         )
         return result.propositions
+
+    async def _build_feedback_examples(self, query_text: str = "") -> str:
+        """Format the user's judgments as a calibration block for the propose
+        prompt, choosing examples that are relevant to the current activity
+        (*query_text*) and balanced across ratings.
+
+        Empty string when there's no feedback yet or GUM_FEWSHOT_LIMIT=0, so the
+        prompt is unchanged until the user reviews.
+        """
+        try:
+            limit = int(os.getenv("GUM_FEWSHOT_LIMIT", "8"))
+        except ValueError:
+            limit = 8
+        if limit <= 0:
+            return ""
+
+        try:
+            pool = int(os.getenv("GUM_FEWSHOT_POOL", "200"))
+        except ValueError:
+            pool = 200
+
+        # Pull a recent candidate pool, then pick the relevant + balanced subset.
+        candidates = await self.recent_feedback(limit=max(pool, limit))
+        feedback = select_relevant_balanced_feedback(candidates, query_text, limit)
+        if not feedback:
+            return ""
+
+        label = {
+            "accurate": "ACCURATE",
+            "partial": "PARTIALLY ACCURATE",
+            "inaccurate": "INACCURATE",
+        }
+        lines = []
+        for fb in feedback:
+            line = f"- [{label.get(fb.rating, fb.rating.upper())}] {fb.proposition_text}"
+            if fb.note:
+                line += f"\n    (context from {self.user_name}: {fb.note})"
+            lines.append(line)
+        examples = "\n".join(lines)
+        return (
+            f"# Calibration from {self.user_name}'s feedback\n\n"
+            f"{self.user_name} has personally reviewed earlier propositions about themselves and rated each "
+            f"as ACCURATE, PARTIALLY ACCURATE, or INACCURATE — sometimes adding context. Learn from these: "
+            f"generate propositions in the spirit of the ACCURATE examples, refine toward the context given on "
+            f"PARTIALLY ACCURATE ones, and avoid the kinds of unsupported or incorrect inferences shown in the "
+            f"INACCURATE examples.\n\n"
+            f"{examples}\n"
+        )
 
     async def _build_relation_prompt(self, all_props) -> str:
         """Build a prompt for analyzing relationships between propositions.
@@ -791,3 +845,41 @@ class gum:
                 start_time=start_time,
                 end_time=end_time,
             )
+
+    # ── proposition review / feedback ─────────────────────────────────────────
+    async def next_for_review(
+        self, exclude_ids: set[int] | None = None
+    ) -> tuple[Proposition, list[Observation]] | None:
+        """Return the next unreviewed proposition and its observations, or None.
+
+        ``exclude_ids`` skips propositions the caller deferred this session.
+        """
+        async with self._session() as session:
+            prop = await get_next_unreviewed_proposition(session, exclude_ids=exclude_ids)
+            if prop is None:
+                return None
+            obs = sorted(prop.observations, key=lambda o: o.created_at)
+            return prop, obs
+
+    async def add_review(
+        self, proposition_id: int, rating: str, note: str | None = None
+    ) -> bool:
+        """Record a rating (accurate/partial/inaccurate) plus optional context
+        note for a proposition. Returns False if the proposition no longer
+        exists."""
+        async with self._session() as session:
+            prop = await session.get(Proposition, proposition_id)
+            if prop is None:
+                return False
+            await add_proposition_feedback(session, prop, rating, note)
+            return True
+
+    async def review_progress(self) -> tuple[int, int]:
+        """Return (total_propositions, reviewed_count)."""
+        async with self._session() as session:
+            return await count_review_progress(session)
+
+    async def recent_feedback(self, *, limit: int = 8):
+        """Return the most recent true/false judgments (newest first)."""
+        async with self._session() as session:
+            return await get_recent_feedback(session, limit=limit)

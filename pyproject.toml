@@ -40,6 +40,9 @@ docs = [
     "mkdocstrings-python>=1.7.0"
 ]
 
+[tool.setuptools.package-data]
+gum = ["static/*.html"]
+
 [project.scripts]
 gum = "gum.cli:cli"
 

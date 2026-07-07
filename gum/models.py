@@ -168,6 +168,50 @@ class Proposition(Base):
         return f"<Proposition(id={self.id}, text={preview})>"
 
 
+# Allowed ratings for a proposition review.
+FEEDBACK_RATINGS = ("accurate", "partial", "inaccurate")
+
+
+class PropositionFeedback(Base):
+    """A user's judgment about a proposition, with optional context.
+
+    Stores a *snapshot* of the proposition text and reasoning (not just a
+    foreign key) so the judgment survives later revision or deletion of the
+    proposition and can be replayed as a few-shot calibration example for the
+    proposition generator. ``proposition_id`` is kept (nullable) so the review
+    queue can skip propositions that have already been judged.
+
+    Attributes:
+        id (int): Primary key.
+        proposition_id (Optional[int]): Source proposition, or NULL if it was
+            since deleted/revised.
+        proposition_text (str): Snapshot of the proposition text.
+        reasoning (Optional[str]): Snapshot of the proposition reasoning.
+        rating (str): One of ``FEEDBACK_RATINGS`` — "accurate", "partial"
+            (somewhat accurate), or "inaccurate".
+        note (Optional[str]): Free-text context the user optionally provided,
+            fed back to the model as calibration guidance.
+        created_at (datetime): When the judgment was made.
+    """
+    __tablename__ = "proposition_feedback"
+
+    id:               Mapped[int]           = mapped_column(primary_key=True)
+    proposition_id:   Mapped[Optional[int]] = mapped_column(
+        ForeignKey("propositions.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    proposition_text: Mapped[str]           = mapped_column(Text, nullable=False)
+    reasoning:        Mapped[Optional[str]] = mapped_column(Text)
+    rating:           Mapped[str]           = mapped_column(String(20), nullable=False)
+    note:             Mapped[Optional[str]] = mapped_column(Text)
+
+    created_at:       Mapped[str]           = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+    def __repr__(self) -> str:
+        return f"<PropositionFeedback(id={self.id}, rating={self.rating})>"
+
+
 FTS_TOKENIZER = "porter ascii"
 
 def create_fts_table(conn) -> None:
@@ -300,6 +344,59 @@ def create_observations_fts(conn) -> None:
     """))
 
 
+def migrate_feedback_table(conn) -> None:
+    """Evolve ``proposition_feedback`` from the old boolean ``verdict`` schema to
+    the ``rating`` + ``note`` schema, preserving existing judgments. Idempotent.
+
+    SQLite can't relax the old ``verdict NOT NULL`` column in place, so when the
+    old schema is detected we rebuild the table (copying rows, mapping
+    verdict→rating) rather than dropping any data.
+    """
+    cols = {
+        row[1]
+        for row in conn.execute(
+            sql_text("PRAGMA table_info(proposition_feedback)")
+        ).fetchall()
+    }
+    if not cols:
+        return  # table doesn't exist yet; create_all will build the new schema
+    if "rating" in cols:
+        if "note" not in cols:
+            conn.execute(sql_text("ALTER TABLE proposition_feedback ADD COLUMN note TEXT"))
+        return
+
+    # Old schema (verdict BOOLEAN NOT NULL): rebuild, mapping verdict -> rating.
+    conn.execute(sql_text(
+        """
+        CREATE TABLE proposition_feedback__new (
+            id INTEGER NOT NULL PRIMARY KEY,
+            proposition_id INTEGER,
+            proposition_text TEXT NOT NULL,
+            reasoning TEXT,
+            rating VARCHAR(20) NOT NULL,
+            note TEXT,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP NOT NULL,
+            FOREIGN KEY(proposition_id) REFERENCES propositions (id) ON DELETE SET NULL
+        )
+        """
+    ))
+    conn.execute(sql_text(
+        """
+        INSERT INTO proposition_feedback__new
+            (id, proposition_id, proposition_text, reasoning, rating, note, created_at)
+        SELECT id, proposition_id, proposition_text, reasoning,
+               CASE WHEN verdict THEN 'accurate' ELSE 'inaccurate' END, NULL, created_at
+        FROM proposition_feedback
+        """
+    ))
+    conn.execute(sql_text("DROP TABLE proposition_feedback"))
+    conn.execute(sql_text("ALTER TABLE proposition_feedback__new RENAME TO proposition_feedback"))
+    conn.execute(sql_text(
+        "CREATE INDEX IF NOT EXISTS ix_proposition_feedback_proposition_id "
+        "ON proposition_feedback (proposition_id)"
+    ))
+
+
 async def init_db(
     db_path: str = "gum.db",
     db_directory: Optional[str] = None,
@@ -324,6 +421,7 @@ async def init_db(
         await conn.execute(sql_text("PRAGMA journal_mode=WAL"))
         await conn.execute(sql_text("PRAGMA busy_timeout=30000"))
 
+        await conn.run_sync(migrate_feedback_table)
         await conn.run_sync(Base.metadata.create_all)
         await conn.run_sync(create_fts_table)
         await conn.run_sync(create_observations_fts)
