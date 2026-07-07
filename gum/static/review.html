@@ -178,6 +178,7 @@
       renderProposition(data.proposition, data.observations);
       showActions(true);
     } catch (e) {
+      current = null;
       main.innerHTML = '<div class="center"><h2>Couldn\'t reach the GUM</h2><p>' + esc(String(e)) + '</p></div>';
     }
     busy = false;

@@ -18,6 +18,7 @@ from sqlalchemy import (
     literal_column,
     text,
     func,
+    exists,
 )
 
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -420,7 +421,8 @@ async def count_review_progress(session: AsyncSession) -> tuple[int, int]:
     reviewed = (
         await session.execute(
             select(func.count(func.distinct(PropositionFeedback.proposition_id))).where(
-                PropositionFeedback.proposition_id.isnot(None)
+                PropositionFeedback.proposition_id.isnot(None),
+                exists().where(Proposition.id == PropositionFeedback.proposition_id),
             )
         )
     ).scalar() or 0

@@ -13,6 +13,7 @@ from sqlalchemy import (
     String,
     Table,
     Text,
+    event,
     text as sql_text,
 )
 from sqlalchemy.ext.asyncio import (
@@ -416,6 +417,12 @@ async def init_db(
         },
         poolclass=None,
     )
+
+    @event.listens_for(engine.sync_engine, "connect")
+    def _enable_sqlite_foreign_keys(dbapi_connection, connection_record):
+        cursor = dbapi_connection.cursor()
+        cursor.execute("PRAGMA foreign_keys=ON")
+        cursor.close()
 
     async with engine.begin() as conn:
         await conn.execute(sql_text("PRAGMA journal_mode=WAL"))

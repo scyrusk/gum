@@ -344,7 +344,7 @@ async def cmd_review(args) -> None:
     import webbrowser
     from gum.api import build_server
 
-    host = _api_host(args)
+    host = getattr(args, "host", None) or DEFAULT_API_HOST
     port = getattr(args, "port", None) or int(os.getenv("GUM_REVIEW_PORT", "8423"))
 
     g = gum(_user_name(args) or "default", _text_model(args))
