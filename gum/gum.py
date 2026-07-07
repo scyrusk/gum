@@ -87,6 +87,13 @@ class gum:
         self.min_batch_size = min_batch_size
         self.max_batch_size = max_batch_size
 
+        # When a batch's drafts match no existing persisted propositions, the
+        # relation ("SIMILAR") 32B call can only dedup drafts against each other,
+        # a low-value use of a full text-model call on the local GPU. Skip it in
+        # that case and treat every draft as new. Override with
+        # GUM_SKIP_SIMILAR_WHEN_NEW=0 to always run the relation call.
+        self.skip_similar_when_new = os.getenv("GUM_SKIP_SIMILAR_WHEN_NEW", "1") != "0"
+
         # logging
         self.logger = logging.getLogger("gum")
         self.logger.setLevel(verbosity)
@@ -259,8 +266,16 @@ class gum:
                 await session.flush()
                 
                 # Process the combined content
-                pool = await self._generate_and_search(session, combined_update)
-                identical, similar, different = await self._filter_propositions(pool)
+                drafts, existing = await self._generate_and_search(session, combined_update)
+                if self.skip_similar_when_new and not existing:
+                    # Nothing persisted matched these drafts, so the relation
+                    # call would only compare drafts against each other. Skip
+                    # that 32B call and treat each draft as a new proposition.
+                    identical, similar, different = [], [], drafts
+                else:
+                    identical, similar, different = await self._filter_propositions(
+                        existing + drafts
+                    )
 
                 self.logger.info("Applying proposition updates for batch...")
                 await self._handle_identical(session, identical, observations)
@@ -422,11 +437,18 @@ class gum:
 
     async def _generate_and_search(
         self, session: AsyncSession, update: Update
-    ) -> list[Proposition]:
+    ) -> tuple[list[Proposition], list[Proposition]]:
+        """Generate draft propositions and find related persisted ones.
+
+        Returns:
+            tuple[list[Proposition], list[Proposition]]: the freshly created
+            draft propositions, and the distinct already-persisted propositions
+            matched by BM25 search against those drafts.
+        """
 
         drafts_raw = await self._construct_propositions(update)
         drafts: list[Proposition] = []
-        pool: dict[int, Proposition] = {}
+        existing: dict[int, Proposition] = {}
 
         for itm in drafts_raw:
             draft = Proposition(
@@ -447,17 +469,14 @@ class gum:
                     enable_mmr=False,
                     enable_decay=True
                 )
-                
+
             for prop, _score in hits:
-                pool[prop.id] = prop
+                existing[prop.id] = prop
 
         session.add_all(drafts)
         await session.flush()
 
-        for draft in drafts:
-            pool[draft.id] = draft
-
-        return list(pool.values())
+        return drafts, list(existing.values())
 
     async def _handle_identical(
         self, session, identical: list[Proposition], observations: list[Observation]
