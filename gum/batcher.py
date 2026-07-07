@@ -42,7 +42,13 @@ class ObservationBatcher:
             self.max_batch_attempts = 3
 
         # Failed-attempt counter keyed by the stable observation id (obs['id']),
-        # not Python object identity, so retries across restarts still count.
+        # not Python object identity. This bound is PER DAEMON RUN: the dict is
+        # in-memory and rebuilt empty on start. That is sufficient because
+        # processing failures are caught (except Exception) and never restart the
+        # daemon, so a poison batch reaches max_batch_attempts and is set aside
+        # (ack_failed) within a single run, long before any restart. On restart
+        # the counter resets and the batch simply gets a fresh set of attempts,
+        # still converging on the cap within that run.
         self._batch_attempts: Dict[str, int] = {}
 
         self.logger = logging.getLogger("gum.batcher")
@@ -246,8 +252,10 @@ class ObservationBatcher:
         times, then set it aside as 'failed' so a poison batch can't hot-loop at
         the head of the queue and starve newer observations.
 
-        Attempts are counted by the stable observation id (obs['id']) so retries
-        that span restarts still converge on the cap.
+        Attempts are counted by the stable observation id (obs['id']). The bound
+        is per daemon run (see _batch_attempts): the counter is in-memory, but a
+        processing failure never restarts the daemon, so a poison batch converges
+        on the cap and is set aside within a single run.
         """
         attempts = 0
         for item in items:
@@ -266,15 +274,20 @@ class ObservationBatcher:
             )
             return
 
-        # Retry: return items to 'ready', but back off. Reset the idle-flush
-        # clock and let the normal idle-flush / next arrival re-wake the
-        # processor instead of immediately re-setting _batch_ready_event, so the
-        # retry doesn't hot-loop.
+        # Retry: return items to 'ready'. We deliberately do NOT re-set
+        # _batch_ready_event here. Its effect depends on the backlog: the event
+        # is only cleared in pop_batch when the post-pop ready count drops below
+        # min_batch_size, so once the queue drains below that threshold the retry
+        # waits for the next arrival / idle-flush before re-waking the processor.
+        # Under a backlog (ready count still >= min_batch_size) the event stays
+        # set and the failing batch is retried back-to-back, exhausting its
+        # attempt cap quickly and then being set aside. Either way it converges
+        # on the cap and can't hot-loop forever.
         for item in items:
             self._queue.nack(item)
         self.logger.warning(
             f"Batch failed (attempt {attempts}/{self.max_batch_attempts}); "
-            f"will retry {len(items)} observation(s) after idle-flush"
+            f"will retry {len(items)} observation(s)"
         )
         if self._oldest_pending is None and self._queue.qsize() > 0:
             self._oldest_pending = time.monotonic()
