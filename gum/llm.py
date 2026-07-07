@@ -19,7 +19,7 @@ import os
 import re
 import subprocess
 import tempfile
-from typing import Any, Type, TypeVar
+from typing import Any, Callable, Type, TypeVar
 from urllib.parse import urlparse
 
 from openai import AsyncOpenAI
@@ -244,6 +244,22 @@ def resolve_keep_warm_interval() -> float:
         return 240.0
 
 
+def resolve_text_idle_unload() -> float:
+    """Seconds of no observations before the text model is released from memory.
+
+    The text (proposition) model is the biggest resident cost and is only used
+    in bursts when a batch runs. Keeping it warm through short pauses avoids a
+    cold reload per batch, but through a long lull it just heats the machine for
+    nothing. After this idle window with no new observations, the keep-warm
+    pinger explicitly releases it (freeing memory); it reloads on the next batch.
+    Set GUM_TEXT_IDLE_UNLOAD=0 to keep the old always-warm behaviour.
+    """
+    try:
+        return max(0.0, float(os.getenv("GUM_TEXT_IDLE_UNLOAD", "600")))
+    except ValueError:
+        return 600.0
+
+
 def _native_generate_ping(url: str, model: str, keep_alive: int | str) -> None:
     """Fire a single empty-prompt native ``/api/generate`` load request.
 
@@ -287,36 +303,66 @@ def resolve_warm_targets(targets: list[tuple[str, str]]) -> list[tuple[str, str]
 async def keep_models_warm(
     targets: list[tuple[str, str]],
     *,
+    gated_targets: list[tuple[str, str]] | None = None,
+    is_active: "Callable[[], bool] | None" = None,
     keep_alive: int | str = "15m",
     interval: float = 240.0,
     logger: logging.Logger | None = None,
 ) -> None:
     """Periodically ping each ``(api_base, model)`` so Ollama keeps it resident.
 
+    ``targets`` are pinned unconditionally (e.g. the frequently-used vision
+    model). ``gated_targets`` are pinned *only while ``is_active()`` is True*;
+    when activity stops they are released with an immediate-unload ping so the
+    memory is reclaimed promptly instead of lingering for a full keep_alive
+    window. This lets the big text model unload during quiet periods and reload
+    on the next batch.
+
     Runs until cancelled. Each ping is routed through the global inference slot
-    so it serializes cleanly with real work instead of triggering a cross-model
-    GPU split; a ping that fails (e.g. the endpoint isn't Ollama after all) is
-    logged at debug and retried next tick rather than killing the loop.
+    so it serializes cleanly with real work; a ping that fails (e.g. the endpoint
+    isn't Ollama after all) is logged at debug and retried next tick rather than
+    killing the loop.
     """
     log = logger or logging.getLogger("gum.llm")
     resolved = resolve_warm_targets(targets)
-    if not resolved:
+    resolved_gated = resolve_warm_targets(gated_targets or [])
+    if not resolved and not resolved_gated:
         log.debug("keep-warm: no Ollama targets to pin; pinger idle")
         return
 
+    async def _ping(url: str, model: str, ka: int | str) -> None:
+        try:
+            async with inference_semaphore():
+                await asyncio.to_thread(_native_generate_ping, url, model, ka)
+        except Exception as exc:  # pragma: no cover - network/transport
+            log.debug("keep-warm ping failed for %s (%s)", model, exc)
+
     log.info(
-        "keep-warm: pinning %d model(s) every %.0fs (keep_alive=%s)",
+        "keep-warm: pinning %d model(s) every %.0fs (keep_alive=%s); %d activity-gated",
         len(resolved),
         interval,
         keep_alive,
+        len(resolved_gated),
     )
+
+    gated_loaded = True  # gated models are resident at startup (just provisioned)
     while True:
         for url, model in resolved:
-            try:
-                async with inference_semaphore():
-                    await asyncio.to_thread(_native_generate_ping, url, model, keep_alive)
-            except Exception as exc:  # pragma: no cover - network/transport
-                log.debug("keep-warm ping failed for %s (%s)", model, exc)
+            await _ping(url, model, keep_alive)
+
+        if resolved_gated:
+            active = is_active is None or is_active()
+            if active:
+                for url, model in resolved_gated:
+                    await _ping(url, model, keep_alive)
+                gated_loaded = True
+            elif gated_loaded:
+                # Just went idle: release the gated (text) models now.
+                log.info("keep-warm: idle — releasing %d gated model(s) to free memory", len(resolved_gated))
+                for url, model in resolved_gated:
+                    await _ping(url, model, 0)
+                gated_loaded = False
+
         await asyncio.sleep(interval)
 
 

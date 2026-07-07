@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import time
 from uuid import uuid4
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -29,6 +30,7 @@ from .llm import (
     keep_warm_enabled,
     resolve_keep_alive,
     resolve_keep_warm_interval,
+    resolve_text_idle_unload,
 )
 from .models import Observation, Proposition, init_db
 from .observers import Observer
@@ -139,6 +141,10 @@ class gum:
         self._batch_task: asyncio.Task | None = None
         self._warm_task: asyncio.Task | None = None
         self._batch_processing_lock = asyncio.Lock()
+        # Monotonic timestamp of the last observation, used to decide when the
+        # text model may be released from memory during quiet periods.
+        self._last_activity = time.monotonic()
+        self._text_idle_unload = resolve_text_idle_unload()
         self.update_handlers: list[Callable[[Observer, Update], None]] = [self._default_handler]
 
     def start_update_loop(self):
@@ -152,15 +158,27 @@ class gum:
 
         # Keep the local models resident so an idle pause doesn't unload them
         # and stall the next observation on a cold reload (see keep_models_warm).
-        # Pins this GUM's text model plus every observer's model (e.g. the
-        # screen observer's vision model).
+        # The observers' models (e.g. the screen vision model) are pinned
+        # unconditionally — they run on nearly every interaction and are cheap to
+        # keep warm. The text model is activity-gated: it's the biggest resident
+        # cost and only runs on batches, so it's released after a quiet spell
+        # (GUM_TEXT_IDLE_UNLOAD) and reloaded on the next batch.
         if self._warm_task is None and keep_warm_enabled():
-            targets = [(self._api_base, self.model)]
+            vision_targets: list[tuple[str, str]] = []
             for obs in self.observers:
-                targets.extend(obs.warm_targets)
+                vision_targets.extend(obs.warm_targets)
+            text_targets = [(self._api_base, self.model)]
+
+            gate = self._text_idle_unload
+            is_active = None if gate <= 0 else (
+                lambda: (time.monotonic() - self._last_activity) < gate
+            )
+
             self._warm_task = asyncio.create_task(
                 keep_models_warm(
-                    targets,
+                    vision_targets,
+                    gated_targets=text_targets,
+                    is_active=is_active,
                     keep_alive=resolve_keep_alive(),
                     interval=resolve_keep_warm_interval(),
                     logger=self.logger,
@@ -290,6 +308,9 @@ class gum:
             # Use lock to ensure batch processing runs synchronously
             async with self._batch_processing_lock:
                 batch = self.batcher.pop_batch()
+                # A batch needs the text model; count it as activity so the
+                # pinger won't release the model out from under a running batch.
+                self._last_activity = time.monotonic()
                 self.logger.info(f"Processing batch of {len(batch)} observations")
                 await self._process_batch(batch)
 
@@ -654,6 +675,9 @@ class gum:
 
     async def _default_handler(self, observer: Observer, update: Update) -> None:
         self.logger.info(f"Processing update from {observer.name}")
+
+        # mark activity so the keep-warm pinger holds the text model resident
+        self._last_activity = time.monotonic()
 
         # add to batch
         observation_id = self.batcher.push(

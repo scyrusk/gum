@@ -50,11 +50,14 @@ gum stop                        # stop whenever you like
 gum recent                      # list the most recent propositions
 gum query "email" -l 10         # BM25 search over propositions
 gum observations                # list the most recent raw observations (--full for complete text)
+gum observations --date 7/7/2026  # all observations from a given Eastern-time day
 ```
 
 `gum start` accepts overrides, e.g. `gum start --vision-model qwen2.5vl:32b --text-model gpt-oss:20b --port 8500`. Logs stream to `~/.cache/gum/gum.log`.
 
 > **Note on models & memory.** On first `gum start`, the GUM automatically creates lean, context-capped copies of your models (`gum-<model>-ctx<N>`) via a tiny Modelfile. Ollama otherwise loads models at their full 128K context, whose KV cache balloons a 7B vision model to ~50 GB and forces the vision and text models to constantly evict/reload each other — which shows up as a very hot machine and propositions that never appear. The capped copies (defaults: vision 16K → ~14 GB, text 32K → ~30 GB) stay resident together. Tune with `GUM_VISION_NUM_CTX` / `GUM_TEXT_NUM_CTX`.
+>
+> **Idle behaviour.** The vision model is kept warm continuously (it runs on nearly every interaction). The larger text model runs only on batches, so it is released from memory after ~10 min with no new observations (`GUM_TEXT_IDLE_UNLOAD`, seconds) and reloaded on the next batch — a cooler, lighter idle in exchange for a one-time reload. Set `GUM_TEXT_IDLE_UNLOAD=0` to keep it always resident.
 
 ### 5. Build on it from other apps
 

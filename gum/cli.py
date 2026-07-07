@@ -7,6 +7,8 @@ import signal
 import argparse
 import asyncio
 import shutil
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 from gum import gum
 from gum.observers import Screen
@@ -18,6 +20,31 @@ DEFAULT_TEXT_MODEL = "qwen2.5-coder:32b"
 DEFAULT_VISION_MODEL = "qwen2.5vl:7b"
 DEFAULT_API_HOST = "127.0.0.1"
 DEFAULT_API_PORT = 8422
+
+# Observations are stored in UTC; the CLI reports/filters days in Eastern time.
+EASTERN = ZoneInfo("America/New_York")
+
+
+def _parse_eastern_day(date_str: str) -> tuple[datetime, datetime]:
+    """Parse a date string as a calendar day in Eastern time.
+
+    Returns (start_utc, end_utc): the UTC bounds of that Eastern-time day,
+    i.e. [midnight ET, next midnight ET). Accepts M/D/YYYY and YYYY-MM-DD.
+    """
+    parsed = None
+    for fmt in ("%m/%d/%Y", "%Y-%m-%d", "%m/%d/%y", "%m-%d-%Y", "%Y/%m/%d"):
+        try:
+            parsed = datetime.strptime(date_str, fmt)
+            break
+        except ValueError:
+            continue
+    if parsed is None:
+        raise ValueError(
+            f"Could not parse date '{date_str}'. Use M/D/YYYY (e.g. 7/7/2026) or YYYY-MM-DD."
+        )
+    start = datetime(parsed.year, parsed.month, parsed.day, tzinfo=EASTERN)
+    end = start + timedelta(days=1)
+    return start.astimezone(timezone.utc), end.astimezone(timezone.utc)
 
 
 # ── config resolution helpers ─────────────────────────────────────────────────
@@ -96,8 +123,11 @@ def parse_args():
     p_recent.add_argument("--user-name", "-u", type=str)
     p_recent.add_argument("--text-model", "-m", type=str)
 
-    p_obs = sub.add_parser("observations", help="List the most recent raw observations")
-    p_obs.add_argument("--limit", "-l", type=int, default=10)
+    p_obs = sub.add_parser("observations", help="List raw observations (all of a day with --date)")
+    p_obs.add_argument("--limit", "-l", type=int, default=None,
+                       help="Max results (default 10; all-day when --date is set)")
+    p_obs.add_argument("--date", "-d", type=str,
+                       help="Only observations from this Eastern-time day, e.g. 7/7/2026 or 2026-07-07")
     p_obs.add_argument("--full", action="store_true", help="Print full content instead of a preview")
     p_obs.add_argument("--user-name", "-u", type=str)
     p_obs.add_argument("--text-model", "-m", type=str)
@@ -252,13 +282,32 @@ async def cmd_recent(args) -> None:
 
 
 async def cmd_observations(args) -> None:
+    start_utc = end_utc = None
+    if args.date:
+        try:
+            start_utc, end_utc = _parse_eastern_day(args.date)
+        except ValueError as exc:
+            print(exc)
+            return
+
+    # A date view returns the whole day unless the user set an explicit --limit.
+    limit = args.limit if args.limit is not None else (1_000_000 if args.date else 10)
+
     g = gum(_user_name(args) or "default", _text_model(args))
     await g.connect_db()
-    obs = await g.recent_observations(limit=args.limit)
-    print(f"\nRecent {len(obs)} observations:")
+    obs = await g.recent_observations(limit=limit, start_time=start_utc, end_time=end_utc)
+
+    if args.date:
+        obs = list(reversed(obs))  # chronological for a day view
+        day = start_utc.astimezone(EASTERN).strftime("%m/%d/%Y")
+        print(f"\n{len(obs)} observations on {day} (Eastern):")
+    else:
+        print(f"\nRecent {len(obs)} observations:")
+
     for o in obs:
+        ts = o.created_at.replace(tzinfo=timezone.utc).astimezone(EASTERN).strftime("%Y-%m-%d %H:%M:%S %Z")
         content = o.content if args.full else o.content.replace("\n", " ")[:300]
-        print(f"\n[{o.observer_name}] {o.created_at}  (id={o.id})")
+        print(f"\n[{o.observer_name}] {ts}  (id={o.id})")
         print(content)
         if not args.full and len(o.content) > 300:
             print("… (use --full to see everything)")
