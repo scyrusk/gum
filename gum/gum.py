@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import os
 from uuid import uuid4
@@ -13,7 +12,6 @@ from typing import Callable, List
 from .models import observation_proposition
 import traceback
 
-from openai import AsyncOpenAI
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import insert
 
@@ -23,6 +21,7 @@ from .db_utils import (
     get_recent_propositions,
     get_recent_observations,
 )
+from .llm import make_client, structured_completion
 from .models import Observation, Proposition, init_db
 from .observers import Observer
 from .schemas import (
@@ -30,7 +29,6 @@ from .schemas import (
     PropositionSchema,
     RelationSchema,
     Update,
-    get_schema,
     AuditSchema
 )
 from gum.prompts.gum import AUDIT_PROMPT, PROPOSE_PROMPT, REVISE_PROMPT, SIMILAR_PROMPT
@@ -103,10 +101,9 @@ class gum:
         self.revise_prompt = revise_prompt or REVISE_PROMPT
         self.audit_prompt = audit_prompt or AUDIT_PROMPT
 
-        self.client = AsyncOpenAI(
-            base_url=api_base or os.getenv("GUM_LM_API_BASE"), 
-            api_key=api_key or os.getenv("GUM_LM_API_KEY") or os.getenv("OPENAI_API_KEY") or "None"
-        )
+        # Local-first inference client (defaults to Ollama; refuses non-local
+        # endpoints unless GUM_ALLOW_REMOTE=1). See gum/llm.py.
+        self.client = make_client("gum", api_base=api_base, api_key=api_key)
 
         self.engine = None
         self.Session = None
@@ -298,14 +295,14 @@ class gum:
             .replace("{inputs}", update.content)
         )
 
-        schema = PropositionSchema.model_json_schema()
-        rsp = await self.client.chat.completions.create(
-            model=self.model,
-            messages=[{"role": "user", "content": prompt}],
-            response_format=get_schema(schema),
+        result = await structured_completion(
+            self.client,
+            self.model,
+            [{"role": "user", "content": prompt}],
+            PropositionSchema,
+            logger=self.logger,
         )
-
-        return json.loads(rsp.choices[0].message.content)["propositions"]
+        return result.propositions
 
     async def _build_relation_prompt(self, all_props) -> str:
         """Build a prompt for analyzing relationships between propositions.
@@ -344,13 +341,13 @@ class gum:
         ]
         prompt_text = await self._build_relation_prompt(payload)
 
-        rsp = await self.client.chat.completions.create(
-            model=self.model,
-            messages=[{"role": "user", "content": prompt_text}],
-            response_format=get_schema(RelationSchema.model_json_schema()),
+        data = await structured_completion(
+            self.client,
+            self.model,
+            [{"role": "user", "content": prompt_text}],
+            RelationSchema,
+            logger=self.logger,
         )
-
-        data = RelationSchema.model_validate_json(rsp.choices[0].message.content)
 
         id_to_prop = {p.id: p for p in rel_props}
         ident, sim, unrel = set(), set(), set()
@@ -402,7 +399,7 @@ class gum:
         self,
         related_obs: list[Observation],
         similar_cluster: list[Proposition],
-    ) -> list[dict]:
+    ) -> list[PropositionItem]:
         """Revise propositions based on related observations and similar propositions.
         
         Args:
@@ -414,12 +411,14 @@ class gum:
         """
         body = await self._build_revision_body(similar_cluster, related_obs)
         prompt = self.revise_prompt.replace("{body}", body)
-        rsp = await self.client.chat.completions.create(
-            model=self.model,
-            messages=[{"role": "user", "content": prompt}],
-            response_format=get_schema(PropositionSchema.model_json_schema()), 
+        result = await structured_completion(
+            self.client,
+            self.model,
+            [{"role": "user", "content": prompt}],
+            PropositionSchema,
+            logger=self.logger,
         )
-        return json.loads(rsp.choices[0].message.content)["propositions"]
+        return result.propositions
 
     async def _generate_and_search(
         self, session: AsyncSession, update: Update
@@ -431,10 +430,10 @@ class gum:
 
         for itm in drafts_raw:
             draft = Proposition(
-                text=itm["proposition"],
-                reasoning=itm["reasoning"],
-                confidence=itm.get("confidence"),
-                decay=itm.get("decay"),
+                text=itm.proposition,
+                reasoning=itm.reasoning,
+                confidence=itm.confidence,
+                decay=itm.decay,
                 revision_group=str(uuid4()),
                 version=1,
             )
@@ -497,10 +496,10 @@ class gum:
         revision_group = str(uuid4())
         for item in revised_items:
             new_prop = Proposition(
-                text=item["proposition"],
-                reasoning=item["reasoning"],
-                confidence=item.get("confidence"),
-                decay=item.get("decay"),
+                text=item.proposition,
+                reasoning=item.reasoning,
+                confidence=item.confidence,
+                decay=item.decay,
                 version=1,  # Start fresh with version 1
                 revision_group=revision_group,
                 observations=rel_obs,
@@ -553,19 +552,20 @@ class gum:
             .replace("{user_name}", self.user_name)
         )
 
-        rsp = await self.client.chat.completions.create(
-            model=self.model,
-            messages=[{"role": "user", "content": prompt}],
-            response_format=get_schema(AuditSchema.model_json_schema()),
+        decision = await structured_completion(
+            self.client,
+            self.model,
+            [{"role": "user", "content": prompt}],
+            AuditSchema,
             temperature=0.0,
+            logger=self.logger,
         )
-        decision = json.loads(rsp.choices[0].message.content)
 
-        if not decision["transmit_data"]:
+        if not decision.transmit_data:
             self.logger.warning(
                 "Audit blocked transmission (data_type=%s, subject=%s)",
-                decision["data_type"],
-                decision["subject"],
+                decision.data_type,
+                decision.subject,
             )
             return True
 

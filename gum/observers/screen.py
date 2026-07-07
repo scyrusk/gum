@@ -24,9 +24,7 @@ from shapely.ops import unary_union
 # — Local —
 from .observer import Observer
 from ..schemas import Update
-
-# — OpenAI async client —
-from openai import AsyncOpenAI
+from ..llm import make_client
 
 # — Local —
 from gum.prompts.screen import TRANSCRIPTION_PROMPT, SUMMARY_PROMPT
@@ -149,15 +147,17 @@ class Screen(Observer):
     # ─────────────────────────────── construction
     def __init__(
         self,
-        model_name: str = "gpt-4o-mini",
+        model_name: str = "qwen2.5vl:7b",
         screenshots_dir: str = "~/.cache/gum/screenshots",
         skip_when_visible: Optional[str | list[str]] = None,
         transcription_prompt: Optional[str] = None,
         summary_prompt: Optional[str] = None,
-        history_k: int = 10,
+        history_k: int = 2,
         debug: bool = False,
         api_key: str | None = None,
         api_base: str | None = None,
+        max_image_dim: int = 1280,
+        max_summary_images: int = 4,
     ) -> None:
         """Initialize the Screen observer.
         
@@ -182,6 +182,11 @@ class Screen(Observer):
         self.summary_prompt = summary_prompt or SUMMARY_PROMPT
         self.model_name = model_name
 
+        # Local-VLM cost controls: cap image resolution and the number of
+        # images sent per summary call so local inference stays responsive.
+        self.max_image_dim = max_image_dim
+        self.max_summary_images = max_summary_images
+
         self.debug = debug
 
         # state shared with worker
@@ -191,13 +196,9 @@ class Screen(Observer):
         self._history: deque[str] = deque(maxlen=max(0, history_k))
         self._pending_event: Optional[dict] = None
         self._debounce_handle: Optional[asyncio.TimerHandle] = None
-        self.client = AsyncOpenAI(
-            # try the class, then the env for screen, then the env for gum
-            base_url=api_base or os.getenv("SCREEN_LM_API_BASE") or os.getenv("GUM_LM_API_BASE"), 
-
-            # try the class, then the env for screen, then the env for GUM, then none
-            api_key=api_key or os.getenv("SCREEN_LM_API_KEY") or os.getenv("GUM_LM_API_KEY") or os.getenv("OPENAI_API_KEY") or "None"
-        )
+        # Local-first inference client (defaults to Ollama; refuses non-local
+        # endpoints unless GUM_ALLOW_REMOTE=1). See gum/llm.py.
+        self.client = make_client("screen", api_base=api_base, api_key=api_key)
 
         # call parent
         super().__init__()
@@ -275,13 +276,19 @@ class Screen(Observer):
         """
         ts   = f"{time.time():.5f}"
         path = os.path.join(self.screens_dir, f"{ts}_{tag}.jpg")
-        await asyncio.to_thread(
-            Image.frombytes("RGB", (frame.width, frame.height), frame.rgb).save,
-            path,
-            "JPEG",
-            quality=70,
-        )
+        await asyncio.to_thread(self._encode_frame, frame, path)
         return path
+
+    def _encode_frame(self, frame, path: str) -> None:
+        """Downscale (Retina screenshots are huge) and save a frame as JPEG.
+
+        Capping the long edge keeps local VLM inference fast without hurting
+        OCR quality. Runs in a worker thread via ``_save_frame``.
+        """
+        img = Image.frombytes("RGB", (frame.width, frame.height), frame.rgb)
+        if self.max_image_dim and max(img.size) > self.max_image_dim:
+            img.thumbnail((self.max_image_dim, self.max_image_dim), Image.LANCZOS)
+        img.save(path, "JPEG", quality=70)
 
     async def _process_and_emit(self, before_path: str, after_path: str) -> None:
         """Process screenshots and emit an update.
@@ -302,6 +309,8 @@ class Screen(Observer):
 
         prev_paths.append(before_path)
         prev_paths.append(after_path)
+        # Cap the number of images per summary call so local VLMs stay responsive.
+        prev_paths = prev_paths[-self.max_summary_images:]
         try:
             summary = await self._call_gpt_vision(self.summary_prompt, prev_paths)
         except Exception as exc:                                    # pragma: no cover

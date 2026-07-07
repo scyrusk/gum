@@ -40,9 +40,29 @@ You can start a GUM server directly from the command line.
 
 !!! info "Getting Started II: Starting a GUM server"
 
-    We recommend running this in a tmux or screen session to keep it alive.
+    === "Ollama (fully local, recommended)"
+        Run everything on your own machine with [Ollama](https://ollama.com) — no
+        screenshots or propositions ever leave your computer.
 
-    === "Local LMs on a GPU server (recommended)"
+        ```bash
+        > # 1. Pull one vision model + one text model
+        > ollama pull qwen2.5vl:7b
+        > ollama pull qwen2.5-coder:32b
+
+        > # 2. Keep both models resident so they don't reload between roles
+        > export OLLAMA_MAX_LOADED_MODELS=2
+        > export OLLAMA_KEEP_ALIVE=30m
+        > ollama serve   # usually already running
+
+        > # 3. Tell the GUM who you are (or copy .env.example -> .env)
+        > export USER_NAME="Full Name"
+        ```
+
+        That's it. The GUM defaults to `http://localhost:11434/v1` for both the
+        vision and text models. By default it **refuses** any non-local endpoint;
+        set `GUM_ALLOW_REMOTE=1` only if you deliberately want to use a remote box.
+
+    === "Local LMs on a GPU server (advanced)"
         First, install [SGLang](https://sgl-project.github.io/start/install.html) and launch its server with your LM.
 
         ```bash
@@ -81,16 +101,19 @@ You can start a GUM server directly from the command line.
         
         When you first run the GUM (below), your system may also prompt you to grant accessibility and screen recording permissions to the application. You may need to restart the process a few times as you grant these permissions.
 
-    Start the GUM listening process up through the Terminal app:
+    Start the GUM through the Terminal app. It runs in the background, so you can
+    spin it up and shut it down whenever you like:
 
     ```bash
-    > gum
+    > gum start          # begin observing + serving the local API
+    > gum status         # check it's running / see the latest proposition
+    > gum stop           # stop when you're done
     ```
 
-    Once you're all done, go ahead and try querying your GUM to view propositions and observations. You can query for recent propositions by just passing the -q flag through the CLI.
+    Once you're all done, go ahead and try querying your GUM to view propositions and observations. You can list the most recent propositions with the `recent` command.
 
     ```bash
-    > gum -q
+    > gum recent
     ```
 
     Output:
@@ -120,7 +143,15 @@ You can start a GUM server directly from the command line.
     Optionally, you can pass a query string and the number of results you want back (by default, 10). In the example below, I want to find things that are related to work on GUMs. 
 
     ```bash
-    > gum -q "gum" -l 10
+    > gum query "gum" -l 10
+    ```
+
+    While the GUM is running, the same data is available over a **localhost-only REST API** (default `http://127.0.0.1:8422`) so any local app can build on it:
+
+    ```bash
+    > curl "http://127.0.0.1:8422/query?q=gum&limit=5"
+    > curl "http://127.0.0.1:8422/recent?limit=5"
+    > curl "http://127.0.0.1:8422/observations?limit=5"
     ```
 
     Output:
@@ -153,7 +184,7 @@ Once you're all set up, check out the tutorials [here.](tutorials/mcp.md) There 
     import asyncio
     from gum import gum
 
-    gum_instance = gum("Your Name", model="gpt-4.1")
+    gum_instance = gum("Your Name", model="qwen2.5-coder:32b")
 
     async def main():
         await gum_instance.connect_db()
@@ -162,6 +193,9 @@ Once you're all set up, check out the tutorials [here.](tutorials/mcp.md) There 
     if __name__ == "__main__":
         asyncio.run(main())
     ```
+
+    Prefer HTTP? While `gum start` is running, hit the localhost REST API instead
+    (any language): `GET http://127.0.0.1:8422/query?q=email`.
 
 For example: you can set up [an MCP that uses GUMs here.](tutorials/mcp.md)
 

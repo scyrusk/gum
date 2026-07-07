@@ -39,7 +39,10 @@ Finally, install the MCP client, pointing to the .env file:
 The MCP should then be enabled in the Claude app!
 
 !!! note "The MCP **only** connects clients like the Claude app to the GUM."
-    Simply enabling the MCP does not mean the GUM is learning. You still need to have the background GUM process running to build the underlying database of propositions (e.g. from the instructions on [the front page here.](../index.md))
+    Simply enabling the MCP does not mean the GUM is learning. You still need to have the background GUM process running (`gum start`) to build the underlying database of propositions (e.g. from the instructions on [the front page here.](../index.md))
+
+!!! tip "Running fully local"
+    The MCP reads the same local SQLite model (`~/.cache/gum/gum.db`) keyed by `USER_NAME`, so set the **same `USER_NAME`** you gave `gum start`. With the Ollama setup, both the GUM and the MCP operate entirely on-device. (If you prefer a plain HTTP interface over MCP, the running GUM also serves a localhost REST API at `http://127.0.0.1:8422`.)
 
 ## Try it out!
 

@@ -23,12 +23,22 @@ dependencies = [
     "aiosqlite",
     "greenlet",
     "persist-queue",
+    "fastapi>=0.110.0",
+    "uvicorn[standard]>=0.29.0"
+]
+requires-python = ">=3.10"
+
+[project.optional-dependencies]
+calendar = [
+    "aiohttp>=3.9.0",
+    "ics>=0.7.2"
+]
+docs = [
     "mkdocs>=1.5.0",
     "mkdocs-material>=9.0.0",
     "mkdocstrings>=0.24.0",
     "mkdocstrings-python>=1.7.0"
 ]
-requires-python = ">=3.6"
 
 [project.scripts]
 gum = "gum.cli:cli"
