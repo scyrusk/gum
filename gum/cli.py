@@ -81,6 +81,13 @@ def _history_k(args) -> int:
     return int(os.getenv("HISTORY_K", "2"))
 
 
+def _sanitize_enabled(args) -> bool:
+    """Whether to pseudonymize PII on output: CLI flag → GUM_SANITIZE env → off."""
+    if getattr(args, "sanitize", False):
+        return True
+    return os.getenv("GUM_SANITIZE", "").strip().lower() in ("1", "true", "yes", "on")
+
+
 # ── argument parsing ──────────────────────────────────────────────────────────
 def _add_run_args(p: argparse.ArgumentParser) -> None:
     """Runtime arguments shared by `start` and the internal `_run` command."""
@@ -92,6 +99,8 @@ def _add_run_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--min-batch-size", type=int, help="Min observations to trigger a batch")
     p.add_argument("--max-batch-size", type=int, help="Max observations per batch")
     p.add_argument("--history-k", type=int, help="Screenshots of history kept per summary (default 2)")
+    p.add_argument("--sanitize", "-s", action="store_true",
+                   help="Serve only PII-sanitized data over the local REST API (fail-closed)")
 
 
 def parse_args():
@@ -117,11 +126,15 @@ def parse_args():
     p_query.add_argument("--mode", type=str, default="OR", help="OR | AND | PHRASE")
     p_query.add_argument("--user-name", "-u", type=str)
     p_query.add_argument("--text-model", "-m", type=str)
+    p_query.add_argument("--sanitize", "-s", action="store_true",
+                         help="Replace PII with consistent pseudo-IDs before output")
 
     p_recent = sub.add_parser("recent", help="List the most recent propositions")
     p_recent.add_argument("--limit", "-l", type=int, default=10)
     p_recent.add_argument("--user-name", "-u", type=str)
     p_recent.add_argument("--text-model", "-m", type=str)
+    p_recent.add_argument("--sanitize", "-s", action="store_true",
+                          help="Replace PII with consistent pseudo-IDs before output")
 
     p_obs = sub.add_parser("observations", help="List raw observations (all of a day with --date)")
     p_obs.add_argument("--limit", "-l", type=int, default=None,
@@ -132,6 +145,8 @@ def parse_args():
     p_obs.add_argument("--output", "-o", type=str, help="Write results to this file instead of stdout")
     p_obs.add_argument("--user-name", "-u", type=str)
     p_obs.add_argument("--text-model", "-m", type=str)
+    p_obs.add_argument("--sanitize", "-s", action="store_true",
+                       help="Replace PII with consistent pseudo-IDs before output")
 
     p_review = sub.add_parser("review", help="Open the proposition review GUI in your browser")
     p_review.add_argument("--port", type=int, help="Review server port (default 8423)")
@@ -168,6 +183,8 @@ def _run_command_from(args, vision_model: str, text_model: str) -> list[str]:
     mn, mx = _batch_sizes(args)
     cmd += ["--min-batch-size", str(mn), "--max-batch-size", str(mx)]
     cmd += ["--history-k", str(_history_k(args))]
+    if _sanitize_enabled(args):
+        cmd += ["--sanitize"]
     return cmd
 
 
@@ -235,8 +252,10 @@ async def cmd_run(args) -> None:
     vision_model = ensure_capped_model(_vision_model(args), resolve_num_ctx("screen"))
     host, port = _api_host(args), _api_port(args)
     min_batch, max_batch = _batch_sizes(args)
+    sanitize = _sanitize_enabled(args)
 
-    print(f"Listening as {user} — text={text_model}, vision={vision_model}, api=http://{host}:{port}")
+    api_note = "http://{}:{} (sanitized)".format(host, port) if sanitize else f"http://{host}:{port}"
+    print(f"Listening as {user} — text={text_model}, vision={vision_model}, api={api_note}")
 
     loop = asyncio.get_running_loop()
     stop_event = asyncio.Event()
@@ -250,7 +269,7 @@ async def cmd_run(args) -> None:
         min_batch_size=min_batch,
         max_batch_size=max_batch,
     ) as gum_instance:
-        server = build_server(gum_instance, host=host, port=port)
+        server = build_server(gum_instance, host=host, port=port, sanitize=sanitize)
         api_task = asyncio.create_task(server.serve())
         await stop_event.wait()
         print("Shutting down GUM…")
@@ -258,15 +277,24 @@ async def cmd_run(args) -> None:
         await api_task
 
 
+async def _scrub(text: str, enabled: bool) -> str:
+    """Pseudonymize *text* when sanitization is enabled, else return it unchanged."""
+    if not enabled or not text:
+        return text
+    from gum.sanitize import get_sanitizer
+    return await asyncio.to_thread(get_sanitizer().sanitize, text)
+
+
 async def cmd_query(args) -> None:
     g = gum(_user_name(args) or "default", _text_model(args))
     await g.connect_db()
     result = await g.query(args.query, limit=args.limit, mode=args.mode)
+    sanitize = _sanitize_enabled(args)
     print(f"\nFound {len(result)} results:")
     for prop, score in result:
-        print(f"\nProposition: {prop.text}")
+        print(f"\nProposition: {await _scrub(prop.text, sanitize)}")
         if prop.reasoning:
-            print(f"Reasoning: {prop.reasoning}")
+            print(f"Reasoning: {await _scrub(prop.reasoning, sanitize)}")
         if prop.confidence is not None:
             print(f"Confidence: {prop.confidence:.2f}")
         print(f"Relevance Score: {score:.2f}")
@@ -277,11 +305,12 @@ async def cmd_recent(args) -> None:
     g = gum(_user_name(args) or "default", _text_model(args))
     await g.connect_db()
     props = await g.recent(limit=args.limit)
+    sanitize = _sanitize_enabled(args)
     print(f"\nRecent {len(props)} propositions:")
     for p in props:
-        print(f"\nProposition: {p.text}")
+        print(f"\nProposition: {await _scrub(p.text, sanitize)}")
         if p.reasoning:
-            print(f"Reasoning: {p.reasoning}")
+            print(f"Reasoning: {await _scrub(p.reasoning, sanitize)}")
         if p.confidence is not None:
             print(f"Confidence: {p.confidence:.2f}")
         print(f"Created At: {p.created_at}")
@@ -306,6 +335,7 @@ async def cmd_observations(args) -> None:
     g = gum(_user_name(args) or "default", _text_model(args))
     await g.connect_db()
     obs = await g.recent_observations(limit=limit, start_time=start_utc, end_time=end_utc)
+    sanitize = _sanitize_enabled(args)
 
     lines: list[str] = []
     if args.date:
@@ -317,11 +347,14 @@ async def cmd_observations(args) -> None:
 
     for o in obs:
         ts = o.created_at.replace(tzinfo=timezone.utc).astimezone(EASTERN).strftime("%Y-%m-%d %H:%M:%S %Z")
-        content = o.content if full else o.content.replace("\n", " ")[:300]
+        # Pseudonymize the full content before previewing so truncation never
+        # slices through a pseudo-ID token.
+        raw = await _scrub(o.content, sanitize)
+        content = raw if full else raw.replace("\n", " ")[:300]
         lines.append("")
         lines.append(f"[{o.observer_name}] {ts}  (id={o.id})")
         lines.append(content)
-        if not full and len(o.content) > 300:
+        if not full and len(raw) > 300:
             lines.append("… (use --full to see everything)")
         lines.append("-" * 80)
 
