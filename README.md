@@ -51,6 +51,7 @@ gum recent                      # list the most recent propositions
 gum query "email" -l 10         # BM25 search over propositions
 gum observations                # list the most recent raw observations (--full for complete text)
 gum observations --date 7/7/2026  # all observations from a given Eastern-time day
+gum observations --date 7/7/2026 -o day.txt   # write results to a file (exports full content)
 ```
 
 `gum start` accepts overrides, e.g. `gum start --vision-model qwen2.5vl:32b --text-model gpt-oss:20b --port 8500`. Logs stream to `~/.cache/gum/gum.log`.

@@ -129,6 +129,7 @@ def parse_args():
     p_obs.add_argument("--date", "-d", type=str,
                        help="Only observations from this Eastern-time day, e.g. 7/7/2026 or 2026-07-07")
     p_obs.add_argument("--full", action="store_true", help="Print full content instead of a preview")
+    p_obs.add_argument("--output", "-o", type=str, help="Write results to this file instead of stdout")
     p_obs.add_argument("--user-name", "-u", type=str)
     p_obs.add_argument("--text-model", "-m", type=str)
 
@@ -293,25 +294,43 @@ async def cmd_observations(args) -> None:
     # A date view returns the whole day unless the user set an explicit --limit.
     limit = args.limit if args.limit is not None else (1_000_000 if args.date else 10)
 
+    # Exports (--output) default to full content; previews only make sense on-screen.
+    full = args.full or bool(args.output)
+
     g = gum(_user_name(args) or "default", _text_model(args))
     await g.connect_db()
     obs = await g.recent_observations(limit=limit, start_time=start_utc, end_time=end_utc)
 
+    lines: list[str] = []
     if args.date:
         obs = list(reversed(obs))  # chronological for a day view
         day = start_utc.astimezone(EASTERN).strftime("%m/%d/%Y")
-        print(f"\n{len(obs)} observations on {day} (Eastern):")
+        lines.append(f"{len(obs)} observations on {day} (Eastern):")
     else:
-        print(f"\nRecent {len(obs)} observations:")
+        lines.append(f"Recent {len(obs)} observations:")
 
     for o in obs:
         ts = o.created_at.replace(tzinfo=timezone.utc).astimezone(EASTERN).strftime("%Y-%m-%d %H:%M:%S %Z")
-        content = o.content if args.full else o.content.replace("\n", " ")[:300]
-        print(f"\n[{o.observer_name}] {ts}  (id={o.id})")
-        print(content)
-        if not args.full and len(o.content) > 300:
-            print("… (use --full to see everything)")
-        print("-" * 80)
+        content = o.content if full else o.content.replace("\n", " ")[:300]
+        lines.append("")
+        lines.append(f"[{o.observer_name}] {ts}  (id={o.id})")
+        lines.append(content)
+        if not full and len(o.content) > 300:
+            lines.append("… (use --full to see everything)")
+        lines.append("-" * 80)
+
+    text = "\n".join(lines)
+    if args.output:
+        path = os.path.expanduser(args.output)
+        try:
+            with open(path, "w") as fh:
+                fh.write(text + "\n")
+        except OSError as exc:
+            print(f"Could not write to {path}: {exc}")
+            return
+        print(f"Wrote {len(obs)} observations to {path}")
+    else:
+        print("\n" + text)
 
 
 def cmd_reset_cache(args) -> None:
