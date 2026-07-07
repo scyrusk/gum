@@ -1,12 +1,13 @@
 import asyncio
 import logging
 import os
+import shutil
 import time
 from datetime import datetime, timezone
 from typing import List, Optional, Dict, Any
 from pathlib import Path
 import uuid
-from persistqueue import Queue
+from persistqueue import SQLiteAckQueue, Empty
 
 class ObservationBatcher:
     """A persistent queue for batching observations to reduce API calls."""
@@ -31,18 +32,65 @@ class ObservationBatcher:
             batch_timeout = float(os.getenv("GUM_BATCH_TIMEOUT", "30"))
         self.batch_timeout = batch_timeout
 
-        # Create persistent queue backed by SQLite
+        self.logger = logging.getLogger("gum.batcher")
+
+        # Persistent, *acknowledged* queue backed by SQLite. Items are only
+        # removed once ack()'d after a batch is durably processed; a crash or
+        # restart mid-batch leaves them in the 'unack' state, and auto_resume
+        # returns them to 'ready' on reopen. This is what makes progress survive
+        # `gum stop` / restarts — a plain persist-queue Queue only commits its
+        # read position at chunk boundaries and never task_done()'d, so it would
+        # rewind and re-deliver already-processed observations on every restart.
         queue_dir = self.data_directory / "batches"
         queue_dir.mkdir(parents=True, exist_ok=True)
-        self._queue = Queue(path=str(queue_dir / "queue"))
+        self._queue = SQLiteAckQueue(path=str(queue_dir / "ackqueue"), auto_commit=True)
+        self._migrate_legacy_queue(queue_dir)
 
         self._batch_ready_event = asyncio.Event()
-        self.logger = logging.getLogger("gum.batcher")
 
         # Monotonic timestamp of the oldest un-popped observation, or None when
         # the queue is empty. Drives the idle-flush timer.
         self._oldest_pending: float | None = None
         self._timeout_task: asyncio.Task | None = None
+
+    def _migrate_legacy_queue(self, queue_dir: Path) -> None:
+        """One-time migration of any backlog from the old plain persist-queue
+        ``Queue`` (``batches/queue``) into the ack queue, then retire the legacy
+        directory so this runs only once. Best-effort — never fails startup.
+
+        The legacy queue never called ``task_done()`` and only committed its
+        read position at chunk boundaries, so its backlog was replayed on every
+        restart. We drain whatever it still holds into the ack queue so no
+        genuinely pending observation is dropped, at the cost of a one-time
+        re-processing pass (duplicate drafts are absorbed downstream by the
+        identical/similar proposition filter).
+        """
+        legacy_path = queue_dir / "queue"
+        if not (legacy_path / "info").exists():
+            return
+        try:
+            from persistqueue import Queue as LegacyQueue
+
+            legacy = LegacyQueue(path=str(legacy_path))
+            moved = 0
+            while legacy.qsize() > 0:
+                try:
+                    self._queue.put(legacy.get_nowait())
+                    moved += 1
+                except Empty:
+                    break
+            del legacy  # release file handles before retiring the directory
+            if moved:
+                self.logger.info(
+                    f"Migrated {moved} pending observation(s) from the legacy queue "
+                    "into the ack queue (one-time catch-up)"
+                )
+            retired = queue_dir / "queue.legacy"
+            if retired.exists():
+                shutil.rmtree(retired, ignore_errors=True)
+            legacy_path.rename(retired)
+        except Exception as exc:
+            self.logger.warning(f"Legacy queue migration skipped: {exc}")
 
     async def start(self):
         """Start the batching system."""
@@ -131,19 +179,26 @@ class ObservationBatcher:
         
     def pop_batch(self, batch_size: Optional[int] = None) -> List[Dict[str, Any]]:
         """Pop a batch of observations from the front of the queue (FIFO).
-        
+
+        The returned items move to the queue's 'unack' state; the caller MUST
+        later ``ack_batch`` them on success or ``nack_batch`` them on failure.
+        Until then they survive a crash/restart (auto-resumed to 'ready').
+
         Args:
             batch_size: Number of items to pop. Defaults to max_batch_size
-            
+
         Returns:
             List of observation dictionaries popped from queue
         """
         batch_size = batch_size or self.max_batch_size
-        
+
         batch = []
         for _ in range(min(batch_size, self._queue.qsize())):
-            batch.append(self._queue.get_nowait())
-        
+            try:
+                batch.append(self._queue.get_nowait())
+            except Empty:
+                break
+
         if batch:
             self.logger.debug(f"Popped batch of {len(batch)} observations (queue size: {self._queue.qsize()})")
 
@@ -155,7 +210,25 @@ class ObservationBatcher:
             self._batch_ready_event.clear()
 
         return batch
-    
+
+    def ack_batch(self, items: List[Dict[str, Any]]) -> None:
+        """Acknowledge a durably-processed batch so its items are removed for
+        good (they will not be re-delivered after a restart)."""
+        for item in items:
+            self._queue.ack(item)
+
+    def nack_batch(self, items: List[Dict[str, Any]]) -> None:
+        """Return an unprocessed batch (failed or interrupted by shutdown) to the
+        queue for a later retry, re-using the same items (no duplicate IDs)."""
+        for item in items:
+            self._queue.nack(item)
+        # The nacked items are 'ready' again: restart the idle-flush clock and
+        # wake the processor if we're back at/above the batch threshold.
+        if self._oldest_pending is None and self._queue.qsize() > 0:
+            self._oldest_pending = time.monotonic()
+        if self.should_process_batch():
+            self._batch_ready_event.set()
+
     async def wait_for_batch_ready(self):
         """Wait for a batch to be ready for processing."""
         await self._batch_ready_event.wait()

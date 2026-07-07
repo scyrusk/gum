@@ -369,10 +369,19 @@ class gum:
                 await self._handle_identical(session, identical, observations)
                 await self._handle_similar(session, similar, observations)
                 await self._handle_different(session, different, observations)
-                
-                # Observations are already removed from queue by pop_batch()
+
                 self.logger.info(f"Completed processing batch of {len(batched_observations)} observations")
-                
+
+            # The session above committed on clean exit, so the observations and
+            # propositions are durably persisted — only now is it safe to ack and
+            # permanently remove these items from the queue.
+            self.batcher.ack_batch(batched_observations)
+
+        except asyncio.CancelledError:
+            # Shutdown interrupted the batch: return the items to the queue so
+            # they're re-processed next run instead of being stranded/dropped.
+            self.batcher.nack_batch(batched_observations)
+            raise
         except Exception as e:
             self.logger.error(f"Error processing batch: {e}")
             self.logger.error(f"Traceback: {traceback.format_exc()}")
@@ -380,9 +389,8 @@ class gum:
             if batched_observations:
                 self.logger.error(f"First observation type: {type(batched_observations[0])}")
                 self.logger.error(f"First observation: {batched_observations[0]}")
-            # Put failed items back in queue for retry
-            for obs in batched_observations:
-                self.batcher.push(obs['observer_name'], obs['content'], obs['content_type'])
+            # Return the failed items to the queue for retry (same items, no dup IDs).
+            self.batcher.nack_batch(batched_observations)
 
     async def _construct_propositions(self, update: Update) -> list[PropositionItem]:
         """Generate propositions from an update.
