@@ -72,6 +72,7 @@ class gum:
         api_key: str | None = None,
         min_batch_size: int = 5,
         max_batch_size: int = 50,
+        batch_timeout: float | None = None,
     ):
         # basic paths
         data_directory = os.path.expanduser(data_directory)
@@ -121,7 +122,8 @@ class gum:
         self.batcher = ObservationBatcher(
             data_directory=data_directory,
             min_batch_size=min_batch_size,
-            max_batch_size=max_batch_size
+            max_batch_size=max_batch_size,
+            batch_timeout=batch_timeout,
         )
 
         self._loop_task: asyncio.Task | None = None
