@@ -243,6 +243,18 @@ class Screen(Observer):
         except ValueError:
             self.changed_pixel_tolerance = 3
 
+        # Rate cap: emit at most one observation per this many seconds. Each
+        # settled interaction would otherwise become its own observation, and on
+        # a local GPU the downstream text model often can't keep up, so the batch
+        # queue grows during heavy use. Throttling here caps the arrival rate at
+        # the source (interactions inside the window are coalesced away — the next
+        # emit still captures the current screen). GUM_MIN_OBSERVATION_INTERVAL in
+        # seconds; 0 (default) disables the cap. e.g. 45 targets ~1 obs/min.
+        try:
+            self.min_observation_interval = float(os.getenv("GUM_MIN_OBSERVATION_INTERVAL", "0"))
+        except ValueError:
+            self.min_observation_interval = 0.0
+
         self.debug = debug
 
         # state shared with worker
@@ -252,6 +264,9 @@ class Screen(Observer):
         self._history: deque[str] = deque(maxlen=max(0, history_k))
         self._pending_event: Optional[dict] = None
         self._debounce_handle: Optional[asyncio.TimerHandle] = None
+        # Monotonic timestamp of the last emitted observation, for the
+        # GUM_MIN_OBSERVATION_INTERVAL rate cap. 0.0 => none yet (first emits).
+        self._last_emit: float = 0.0
         # Monotonic timestamp of the most recent mouse event. Drives the
         # capture loop's adaptive backoff (see _capture_interval): the loop only
         # needs to keep a fresh "before" frame while the mouse is active, since
@@ -585,6 +600,15 @@ class Screen(Observer):
                     self._pending_event = None
                     return
 
+                # Rate cap: drop this interaction if we emitted too recently.
+                # Checked before the (expensive) after-grab + VLM so throttled
+                # interactions cost nothing.
+                if self.min_observation_interval > 0 and (
+                    time.monotonic() - self._last_emit
+                ) < self.min_observation_interval:
+                    self._pending_event = None
+                    return
+
                 ev = self._pending_event
                 aft = await asyncio.to_thread(sct.grab, mons[ev["mon"] - 1])
 
@@ -600,6 +624,7 @@ class Screen(Observer):
                 bef_path = await self._save_frame(ev["before"], "before")
                 aft_path = await self._save_frame(aft, "after")
                 await self._process_and_emit(bef_path, aft_path)
+                self._last_emit = time.monotonic()
 
                 log.info(f"{ev['type']} captured on monitor {ev['mon']}")
                 self._pending_event = None
