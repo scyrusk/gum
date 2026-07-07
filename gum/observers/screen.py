@@ -600,14 +600,20 @@ class Screen(Observer):
                     self._pending_event = None
                     return
 
-                # Rate cap: drop this interaction if we emitted too recently.
-                # Checked before the (expensive) after-grab + VLM so throttled
-                # interactions cost nothing.
+                # Rate cap: at most one observation per min_observation_interval
+                # seconds. Stamp on ADMISSION (immediately below), not after the
+                # emit: _process_and_emit runs a slow vision call, so stamping only
+                # afterward lets a whole burst of interactions pass this check while
+                # the first is still mid-inference — a thundering herd that defeats
+                # the cap, worst exactly when the GPU is busy with a text batch.
+                # Checked before the after-grab + VLM so throttled events cost
+                # nothing.
                 if self.min_observation_interval > 0 and (
                     time.monotonic() - self._last_emit
                 ) < self.min_observation_interval:
                     self._pending_event = None
                     return
+                self._last_emit = time.monotonic()
 
                 ev = self._pending_event
                 aft = await asyncio.to_thread(sct.grab, mons[ev["mon"] - 1])
@@ -624,7 +630,6 @@ class Screen(Observer):
                 bef_path = await self._save_frame(ev["before"], "before")
                 aft_path = await self._save_frame(aft, "after")
                 await self._process_and_emit(bef_path, aft_path)
-                self._last_emit = time.monotonic()
 
                 log.info(f"{ev['type']} captured on monitor {ev['mon']}")
                 self._pending_event = None
