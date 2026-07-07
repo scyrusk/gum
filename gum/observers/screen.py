@@ -5,6 +5,7 @@ from __future__ import annotations
 
 # — Standard library —
 import base64
+import io
 import logging
 import os
 import time
@@ -204,6 +205,25 @@ class Screen(Observer):
         self.max_image_dim = max_image_dim
         self.max_summary_images = max_summary_images
 
+        # Context-frame downscaling. In the combined vision call the LAST image
+        # is the current screen (transcription is scoped to it and needs full
+        # OCR-grade resolution); every earlier image is temporal context that
+        # only feeds the coarse action summary ("opened a menu", "scrolled").
+        # VLM prefill cost scales with image pixel *area*, so sending those
+        # context frames at a smaller long-edge (e.g. 768 vs 1280) cuts roughly
+        # 64% of each context frame's image tokens — a large reduction on the
+        # GUM's most frequent inference — with no effect on the transcription
+        # and negligible effect on the gross-action summary. Only applied in the
+        # combined path (the legacy transcription call reads every frame). Set
+        # GUM_CONTEXT_IMAGE_DIM=0 (or >= max_image_dim) to send context frames
+        # at full resolution.
+        try:
+            self.context_image_dim = int(os.getenv("GUM_CONTEXT_IMAGE_DIM", "768"))
+        except ValueError:
+            self.context_image_dim = 768
+        if self.context_image_dim and self.context_image_dim >= self.max_image_dim:
+            self.context_image_dim = 0
+
         # Skip the whole observation (VLM call + emitted update) when an
         # interaction left the screen visually unchanged — the common case for
         # mouse moves/clicks over static content (reading, hovering). The GUM's
@@ -258,36 +278,70 @@ class Screen(Observer):
         return None
 
     @staticmethod
-    def _encode_image(img_path: str) -> str:
-        """Encode an image file as base64.
-        
+    def _encode_image(img_path: str, max_dim: int | None = None) -> str:
+        """Encode an image file as base64, optionally downscaling it first.
+
         Args:
             img_path (str): Path to the image file.
-            
+            max_dim (int | None): If set, downscale the image so its long edge
+                is at most this many pixels before encoding (used to send
+                low-cost context frames to the VLM). When ``None`` the file is
+                encoded verbatim from disk, avoiding a re-encode.
+
         Returns:
-            str: Base64 encoded image data.
+            str: Base64 encoded JPEG data.
         """
-        with open(img_path, "rb") as fh:
-            return base64.b64encode(fh.read()).decode()
+        if not max_dim:
+            with open(img_path, "rb") as fh:
+                return base64.b64encode(fh.read()).decode()
+
+        with Image.open(img_path) as img:
+            img = img.convert("RGB")
+            if max(img.size) > max_dim:
+                img.thumbnail((max_dim, max_dim), Image.LANCZOS)
+            buf = io.BytesIO()
+            img.save(buf, "JPEG", quality=70)
+            return base64.b64encode(buf.getvalue()).decode()
 
     # ─────────────────────────────── OpenAI Vision (async)
-    async def _call_gpt_vision(self, prompt: str, img_paths: list[str]) -> str:
+    @staticmethod
+    def _per_image_dims(n: int, context_dim: int | None) -> list[int | None]:
+        """Per-image downscale caps for a vision call of *n* images.
+
+        The last image is the current screen and is always sent at full
+        resolution (``None``); every earlier image is temporal context and is
+        capped at ``context_dim`` when that is set. With ``context_dim`` unset
+        (or a single image) all images are sent verbatim.
+        """
+        dims: list[int | None] = [None] * n
+        if context_dim and n > 1:
+            for i in range(n - 1):
+                dims[i] = context_dim
+        return dims
+
+    async def _call_gpt_vision(
+        self, prompt: str, img_paths: list[str], *, context_dim: int | None = None
+    ) -> str:
         """Call GPT Vision API to analyze images.
-        
+
         Args:
             prompt (str): Prompt to guide the analysis.
             img_paths (list[str]): List of image paths to analyze.
-            
+            context_dim (int | None): If set, downscale every image except the
+                last (the current screen) to this long-edge before encoding, to
+                cut prefill cost on context frames the transcription doesn't read.
+
         Returns:
             str: GPT's analysis of the images.
         """
+        dims = self._per_image_dims(len(img_paths), context_dim)
         content = [
             {
                 "type": "image_url",
                 "image_url": {"url": f"data:image/jpeg;base64,{encoded}"},
             }
             for encoded in (await asyncio.gather(
-                *[asyncio.to_thread(self._encode_image, p) for p in img_paths]
+                *[asyncio.to_thread(self._encode_image, p, d) for p, d in zip(img_paths, dims)]
             ))
         ]
         content.append({"type": "text", "text": prompt})
@@ -396,9 +450,13 @@ class Screen(Observer):
 
         if self.combine_vision:
             # One vision call yields both the transcription and the action
-            # summary, halving per-observation inference latency.
+            # summary, halving per-observation inference latency. Context frames
+            # (all but the current/last) go at reduced resolution since the
+            # transcription only reads the current frame.
             try:
-                txt = (await self._call_gpt_vision(self.combined_prompt, prev_paths)).strip()
+                txt = (await self._call_gpt_vision(
+                    self.combined_prompt, prev_paths, context_dim=self.context_image_dim
+                )).strip()
             except Exception as exc:                                    # pragma: no cover
                 txt = f"[analysis failed: {exc}]"
         else:
