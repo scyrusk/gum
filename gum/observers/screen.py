@@ -27,7 +27,7 @@ from ..schemas import Update
 from ..llm import make_client, inference_semaphore
 
 # — Local —
-from gum.prompts.screen import TRANSCRIPTION_PROMPT, SUMMARY_PROMPT
+from gum.prompts.screen import TRANSCRIPTION_PROMPT, SUMMARY_PROMPT, COMBINED_PROMPT
 
 ###############################################################################
 # Window‑geometry helpers                                                     #
@@ -188,7 +188,16 @@ class Screen(Observer):
 
         self.transcription_prompt = transcription_prompt or TRANSCRIPTION_PROMPT
         self.summary_prompt = summary_prompt or SUMMARY_PROMPT
+        self.combined_prompt = COMBINED_PROMPT
         self.model_name = model_name
+
+        # Each observation normally costs two sequential vision calls
+        # (transcription + summary). On a single local GPU those run back to
+        # back, so an observation only surfaces after both complete. Collapsing
+        # them into one call ~halves that latency — the dominant, most frequent
+        # inference the GUM performs. Default on; set GUM_COMBINE_VISION=0 to
+        # fall back to the legacy two-call path if combined-call quality regresses.
+        self.combine_vision = os.getenv("GUM_COMBINE_VISION", "1") != "0"
 
         # Local-VLM cost controls: cap image resolution and the number of
         # images sent per summary call so local inference stays responsive.
@@ -312,22 +321,34 @@ class Screen(Observer):
         self._history.append(before_path)
         prev_paths = list(self._history)
 
-        # async OpenAI calls
-        try:
-            transcription = await self._call_gpt_vision(self.transcription_prompt, [before_path, after_path])
-        except Exception as exc:                                        # pragma: no cover
-            transcription = f"[transcription failed: {exc}]"
-
+        # Chronological image set (recent history + this interaction's before/
+        # after), capped so local VLMs stay responsive. The last image is the
+        # current screen state.
         prev_paths.append(before_path)
         prev_paths.append(after_path)
-        # Cap the number of images per summary call so local VLMs stay responsive.
         prev_paths = prev_paths[-self.max_summary_images:]
-        try:
-            summary = await self._call_gpt_vision(self.summary_prompt, prev_paths)
-        except Exception as exc:                                    # pragma: no cover
-            summary = f"[summary failed: {exc}]"
 
-        txt = (transcription + summary).strip()
+        if self.combine_vision:
+            # One vision call yields both the transcription and the action
+            # summary, halving per-observation inference latency.
+            try:
+                txt = (await self._call_gpt_vision(self.combined_prompt, prev_paths)).strip()
+            except Exception as exc:                                    # pragma: no cover
+                txt = f"[analysis failed: {exc}]"
+        else:
+            # Legacy two-call path (GUM_COMBINE_VISION=0).
+            try:
+                transcription = await self._call_gpt_vision(self.transcription_prompt, [before_path, after_path])
+            except Exception as exc:                                    # pragma: no cover
+                transcription = f"[transcription failed: {exc}]"
+
+            try:
+                summary = await self._call_gpt_vision(self.summary_prompt, prev_paths)
+            except Exception as exc:                                    # pragma: no cover
+                summary = f"[summary failed: {exc}]"
+
+            txt = (transcription + summary).strip()
+
         await self.update_queue.put(Update(content=txt, content_type="input_text"))
 
     # ─────────────────────────────── skip guard
