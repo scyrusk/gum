@@ -317,14 +317,18 @@ class Screen(Observer):
             before_path (str): Path to the "before" screenshot.
             after_path (str | None): Path to the "after" screenshot, if any.
         """
-        # chronology: append 'before' first (history order == real order)
+        # chronology: append 'before' first (history order == real order).
+        # After this append, self._history already ends with before_path, so
+        # list(self._history) yields [..recent befores.., before_path].
         self._history.append(before_path)
         prev_paths = list(self._history)
 
-        # Chronological image set (recent history + this interaction's before/
-        # after), capped so local VLMs stay responsive. The last image is the
-        # current screen state.
-        prev_paths.append(before_path)
+        # Chronological image set (recent history + this interaction's after),
+        # capped so local VLMs stay responsive. The last image is the current
+        # screen state. Do NOT re-append before_path here: it is already the
+        # last element of prev_paths from history above, and sending the same
+        # frame twice just doubles that image's encode + VLM prefill tokens
+        # (the dominant cost of every combined vision call) for no new signal.
         prev_paths.append(after_path)
         prev_paths = prev_paths[-self.max_summary_images:]
 
