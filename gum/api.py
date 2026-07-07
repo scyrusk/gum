@@ -4,9 +4,16 @@
 # can build on what the GUM has learned. It is served inside the listening
 # daemon and shares the same live `gum` instance, so reads always reflect the
 # current model. It is strictly read-only and binds to 127.0.0.1.
+#
+# When launched with sanitize=True (`gum start --sanitize`), every response is
+# pseudonymized on the way out: PII is replaced with consistent pseudo-IDs so
+# downstream / off-device consumers (e.g. a frontier model behind the MCP) never
+# see raw identities. This posture is fail-closed — if the sanitizer cannot load,
+# the server refuses to start rather than serving raw data.
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 from typing import Any
 
@@ -26,11 +33,18 @@ class ReviewIn(BaseModel):
     note: str | None = None  # optional free-text context from the user
 
 
-def _serialize_proposition(prop: Proposition, score: float | None = None) -> dict[str, Any]:
+async def _scrub(text: str | None, sanitizer) -> str | None:
+    """Pseudonymize *text* when a sanitizer is active, else return it unchanged."""
+    if sanitizer is None or not text:
+        return text
+    return await asyncio.to_thread(sanitizer.sanitize, text)
+
+
+async def _serialize_proposition(prop: Proposition, sanitizer, score: float | None = None) -> dict[str, Any]:
     data: dict[str, Any] = {
         "id": prop.id,
-        "text": prop.text,
-        "reasoning": prop.reasoning,
+        "text": await _scrub(prop.text, sanitizer),
+        "reasoning": await _scrub(prop.reasoning, sanitizer),
         "confidence": prop.confidence,
         "decay": prop.decay,
         "created_at": prop.created_at.isoformat() if prop.created_at else None,
@@ -41,18 +55,29 @@ def _serialize_proposition(prop: Proposition, score: float | None = None) -> dic
     return data
 
 
-def _serialize_observation(obs: Observation) -> dict[str, Any]:
+async def _serialize_observation(obs: Observation, sanitizer) -> dict[str, Any]:
     return {
         "id": obs.id,
         "observer_name": obs.observer_name,
-        "content": obs.content,
+        "content": await _scrub(obs.content, sanitizer),
         "content_type": obs.content_type,
         "created_at": obs.created_at.isoformat() if obs.created_at else None,
     }
 
 
-def create_app(gum_instance: gum) -> FastAPI:
-    """Build the FastAPI app backed by a live `gum` instance."""
+def create_app(gum_instance: gum, *, sanitize: bool = False) -> FastAPI:
+    """Build the FastAPI app backed by a live `gum` instance.
+
+    When *sanitize* is True the sanitizer is loaded eagerly (fail-closed): if the
+    model or its dependencies are missing, this raises so the server never comes up
+    serving raw PII.
+    """
+    sanitizer = None
+    if sanitize:
+        from .sanitize import get_sanitizer
+        sanitizer = get_sanitizer()
+        sanitizer.load()
+
     app = FastAPI(
         title="GUM Local API",
         description="Read-only local interface to your General User Model.",
@@ -61,7 +86,7 @@ def create_app(gum_instance: gum) -> FastAPI:
 
     @app.get("/health")
     async def health() -> dict[str, Any]:
-        return {"status": "ok", "user": gum_instance.user_name}
+        return {"status": "ok", "user": gum_instance.user_name, "sanitized": sanitizer is not None}
 
     @app.get("/query")
     async def query(
@@ -72,18 +97,18 @@ def create_app(gum_instance: gum) -> FastAPI:
         results = await gum_instance.query(q, limit=limit, mode=mode)
         return {
             "query": q,
-            "results": [_serialize_proposition(p, score) for p, score in results],
+            "results": [await _serialize_proposition(p, sanitizer, score) for p, score in results],
         }
 
     @app.get("/recent")
     async def recent(limit: int = Query(10, ge=1, le=100)) -> dict[str, Any]:
         props = await gum_instance.recent(limit=limit)
-        return {"results": [_serialize_proposition(p) for p in props]}
+        return {"results": [await _serialize_proposition(p, sanitizer) for p in props]}
 
     @app.get("/observations")
     async def observations(limit: int = Query(10, ge=1, le=100)) -> dict[str, Any]:
         obs = await gum_instance.recent_observations(limit=limit)
-        return {"results": [_serialize_observation(o) for o in obs]}
+        return {"results": [await _serialize_observation(o, sanitizer) for o in obs]}
 
     # ── proposition review ────────────────────────────────────────────────
     @app.get("/", response_class=HTMLResponse)
@@ -100,12 +125,16 @@ def create_app(gum_instance: gum) -> FastAPI:
         if result is None:
             return {"done": True, "total": total, "reviewed": reviewed}
         prop, obs = result
+        # The review UI is the user's own local tool for judging whether
+        # propositions about them are accurate, so it always shows raw content
+        # (sanitizer=None) — pseudonymized text would defeat the review — even when
+        # the machine-facing endpoints above are sanitized under `--sanitize`.
         return {
             "done": False,
             "total": total,
             "reviewed": reviewed,
-            "proposition": _serialize_proposition(prop),
-            "observations": [_serialize_observation(o) for o in obs],
+            "proposition": await _serialize_proposition(prop, None),
+            "observations": [await _serialize_observation(o, None) for o in obs],
         }
 
     @app.post("/review")
@@ -119,15 +148,16 @@ def create_app(gum_instance: gum) -> FastAPI:
     return app
 
 
-def build_server(gum_instance: gum, host: str = "127.0.0.1", port: int = 8422):
+def build_server(gum_instance: gum, host: str = "127.0.0.1", port: int = 8422, *, sanitize: bool = False):
     """Build a uvicorn Server for the API (caller awaits ``server.serve()``).
 
-    Host defaults to 127.0.0.1 so the API is never exposed off-machine.
+    Host defaults to 127.0.0.1 so the API is never exposed off-machine. When
+    *sanitize* is True, all responses are pseudonymized (fail-closed at build).
     """
     import uvicorn
 
     config = uvicorn.Config(
-        create_app(gum_instance),
+        create_app(gum_instance, sanitize=sanitize),
         host=host,
         port=port,
         log_level="warning",
