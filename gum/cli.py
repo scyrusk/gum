@@ -154,6 +154,8 @@ def parse_args():
     p_review.add_argument("--user-name", "-u", type=str)
     p_review.add_argument("--text-model", "-m", type=str)
 
+    sub.add_parser("tray", help="Launch the macOS menu-bar app (needs the [tray] extra)")
+
     sub.add_parser("reset-cache", help="Delete the GUM cache (~/.cache/gum) and exit")
 
     return parser, parser.parse_args()
@@ -441,6 +443,9 @@ def cli() -> None:
         asyncio.run(cmd_observations(args))
     elif command == "review":
         asyncio.run(cmd_review(args))
+    elif command == "tray":
+        from gum.tray import run as run_tray
+        run_tray()  # runs the AppKit event loop on the main thread
     else:
         parser.print_help()
 

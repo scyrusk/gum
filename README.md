@@ -74,7 +74,66 @@ Your judgments (and notes) are stored locally and fed back into the proposition 
 
 For each batch the examples are chosen to be **relevant** to the current activity (TF-IDF/cosine over your judged propositions) and **balanced across ratings** (round-robin over accurate/partial/inaccurate), so the model always gets contrastive, on-topic signal rather than just the most recent judgments. Tune with `GUM_FEWSHOT_LIMIT` (examples per batch, default 8; `0` disables) and `GUM_FEWSHOT_POOL` (recent candidates considered, default 200).
 
-### 6. Build on it from other apps
+### 6. Menu-bar app (macOS)
+
+Prefer clicking to typing? A small menu-bar companion lets you start/stop the GUM, search it, and browse the most recent propositions without leaving the toolbar.
+
+```bash
+pip install "gum-ai[tray]"      # one-time: adds rumps
+gum tray                        # 🧠 appears in the menu bar (💤 when stopped)
+```
+
+From the menu you can **Start / Stop GUM**, **Search GUM…** (results in a pop-up), skim **Recent Propositions** (click one for its full reasoning and confidence), **Open Review UI**, or **Open Logs**. It drives the same daemon and localhost API as the CLI, so it works alongside everything above.
+
+#### Launch it at login
+
+Because `gum tray` is a CLI command (not an `.app`), the cleanest way to start it at login is a **LaunchAgent**. Create `~/Library/LaunchAgents/ai.gum.tray.plist` — replace `/path/to/gum` with your checkout and `/path/to/gum/.venv/bin/gum` with the `gum` on your `PATH` (`which gum`):
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>ai.gum.tray</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/path/to/gum/.venv/bin/gum</string>
+        <string>tray</string>
+    </array>
+    <!-- So the tray finds your .env (USER_NAME, etc.) as it does in the terminal. -->
+    <key>WorkingDirectory</key>
+    <string>/path/to/gum</string>
+    <key>RunAtLoad</key>
+    <true/>
+    <!-- false so "Quit GUM" from the menu sticks until the next login. -->
+    <key>KeepAlive</key>
+    <false/>
+    <key>StandardOutPath</key>
+    <string>/tmp/gum-tray.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/gum-tray.log</string>
+</dict>
+</plist>
+```
+
+Then manage it with `launchctl`:
+
+```bash
+# Enable + start now (registers it to launch at every login):
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/ai.gum.tray.plist
+
+# Stop it now and disable auto-start at login:
+launchctl bootout gui/$(id -u)/ai.gum.tray
+
+# Remove it permanently:
+launchctl bootout gui/$(id -u)/ai.gum.tray   # if still loaded
+rm ~/Library/LaunchAgents/ai.gum.tray.plist
+```
+
+The tray auto-starts, but it won't begin observing until you click **Start GUM** (or run `gum start`). Note that a LaunchAgent won't appear in **System Settings → Login Items** — that list only shows `.app` bundles.
+
+### 7. Build on it from other apps
 
 While the GUM is running it serves a **localhost-only REST API** (default `http://127.0.0.1:8422`) that any local app, in any language, can query:
 
