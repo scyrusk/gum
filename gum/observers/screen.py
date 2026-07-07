@@ -24,7 +24,7 @@ from shapely.ops import unary_union
 # — Local —
 from .observer import Observer
 from ..schemas import Update
-from ..llm import make_client
+from ..llm import make_client, inference_semaphore
 
 # — Local —
 from gum.prompts.screen import TRANSCRIPTION_PROMPT, SUMMARY_PROMPT
@@ -140,7 +140,15 @@ class Screen(Observer):
         _MON_START (int): Index of first real display in mss.
     """
 
-    _CAPTURE_FPS: int = 10
+    # The capture loop only maintains a recent "before" frame per monitor so
+    # that, when a mouse event fires, there is a snapshot of the pre-interaction
+    # state. That frame just needs to be sub-second fresh — grabbing every
+    # display's full framebuffer 10x/second is wasteful and, on a machine that
+    # is simultaneously running local inference, steals CPU and (on Apple
+    # Silicon's unified memory) memory bandwidth from the GPU. 2 FPS keeps the
+    # before-frame <0.5s old while cutting this idle background load ~5x.
+    # Override with GUM_CAPTURE_FPS.
+    _CAPTURE_FPS: int = 2
     _DEBOUNCE_SEC: int = 2
     _MON_START: int = 1     # first real display in mss
 
@@ -256,11 +264,14 @@ class Screen(Observer):
         ]
         content.append({"type": "text", "text": prompt})
 
-        rsp = await self.client.chat.completions.create(
-            model=self.model_name,
-            messages=[{"role": "user", "content": content}],
-            response_format={"type": "text"},
-        )
+        # Serialize through the shared inference slot so vision calls don't
+        # collide with the text model's proposition calls on the local server.
+        async with inference_semaphore():
+            rsp = await self.client.chat.completions.create(
+                model=self.model_name,
+                messages=[{"role": "user", "content": content}],
+                response_format={"type": "text"},
+            )
         return rsp.choices[0].message.content
 
     # ─────────────────────────────── I/O helpers
@@ -345,7 +356,10 @@ class Screen(Observer):
             log.addHandler(logging.NullHandler())
             log.propagate = False
 
-        CAP_FPS  = self._CAPTURE_FPS
+        try:
+            CAP_FPS = max(1, int(os.getenv("GUM_CAPTURE_FPS", str(self._CAPTURE_FPS))))
+        except ValueError:
+            CAP_FPS = self._CAPTURE_FPS
         DEBOUNCE = self._DEBOUNCE_SEC
 
         loop = asyncio.get_running_loop()

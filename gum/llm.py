@@ -12,6 +12,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -44,6 +45,48 @@ _LOCAL_HOSTS = {"localhost", "127.0.0.1", "0.0.0.0", "::1", ""}
 T = TypeVar("T", bound=BaseModel)
 
 logger = logging.getLogger("gum.llm")
+
+
+# --------------------------------------------------------------------------- #
+# Global inference slot                                                       #
+# --------------------------------------------------------------------------- #
+# A single local GPU running large models (e.g. a 32B text model + a 7B vision
+# model, both resident) gets no benefit from overlapping requests: with Ollama's
+# default OLLAMA_NUM_PARALLEL=1 same-model requests simply queue, and two
+# *different* models fired at once just split the one GPU's compute — each runs
+# proportionally slower, for no net throughput gain, while doubling the in-flight
+# KV cache and risking eviction of a co-resident model (the very thrash the
+# context caps above exist to prevent). Yet the GUM naturally overlaps work: the
+# screen observer emits vision calls while the batch loop is mid-way through its
+# text-model calls, and bursts of user activity stack multiple observations.
+#
+# This semaphore funnels every model call (vision + text) through a single global
+# slot so requests serialize cleanly at full speed instead of colliding. It is
+# released between calls, so a long proposition batch never blocks a fresh
+# observation for more than one call (and vice versa). Widen it only if your
+# Ollama is explicitly configured for real parallelism (OLLAMA_NUM_PARALLEL) with
+# the VRAM headroom to match, via GUM_MAX_CONCURRENT_INFERENCE.
+_INFERENCE_SEMAPHORE: asyncio.Semaphore | None = None
+
+
+def _max_concurrent_inference() -> int:
+    try:
+        return max(1, int(os.getenv("GUM_MAX_CONCURRENT_INFERENCE", "1")))
+    except ValueError:
+        return 1
+
+
+def inference_semaphore() -> asyncio.Semaphore:
+    """Return the process-wide inference slot, created lazily on first use.
+
+    Lazy creation ties the semaphore to the running event loop the first time a
+    coroutine acquires it, which keeps a single shared instance across the
+    screen observer and the batch loop (they run in the same loop/process).
+    """
+    global _INFERENCE_SEMAPHORE
+    if _INFERENCE_SEMAPHORE is None:
+        _INFERENCE_SEMAPHORE = asyncio.Semaphore(_max_concurrent_inference())
+    return _INFERENCE_SEMAPHORE
 
 
 # --------------------------------------------------------------------------- #
@@ -236,7 +279,8 @@ async def structured_completion(
             kwargs["temperature"] = temperature
 
         try:
-            rsp = await client.chat.completions.create(**kwargs)
+            async with inference_semaphore():
+                rsp = await client.chat.completions.create(**kwargs)
             content = rsp.choices[0].message.content or ""
             return schema_model.model_validate_json(extract_json(content))
         except (json.JSONDecodeError, ValidationError) as exc:
