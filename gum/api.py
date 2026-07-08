@@ -22,6 +22,7 @@ from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
 from .gum import gum
+from .gumbo import Gumbo, Suggestion
 from .models import FEEDBACK_RATINGS, Observation, Proposition
 
 _STATIC_DIR = Path(__file__).parent / "static"
@@ -55,6 +56,19 @@ async def _serialize_proposition(prop: Proposition, sanitizer, score: float | No
     return data
 
 
+async def _serialize_suggestion(sug: Suggestion, sanitizer) -> dict[str, Any]:
+    """Serialize a scored suggestion for the API.
+
+    The mixed-initiative scores and derived fields are numeric and carry no PII,
+    so they pass through unchanged; only the model-written text (which was
+    generated from raw propositions) is pseudonymized when a sanitizer is active.
+    """
+    data = sug.to_dict()
+    for field in ("title", "description", "rationale"):
+        data[field] = await _scrub(data[field], sanitizer)
+    return data
+
+
 async def _serialize_observation(obs: Observation, sanitizer) -> dict[str, Any]:
     return {
         "id": obs.id,
@@ -84,6 +98,10 @@ def create_app(gum_instance: gum, *, sanitize: bool = False) -> FastAPI:
         version="1.0.0",
     )
 
+    # GUMBO suggestion engine over the same live GUM. Cheap to construct and does
+    # no I/O until asked, so one shared instance is reused across requests.
+    gumbo = Gumbo(gum_instance)
+
     @app.get("/health")
     async def health() -> dict[str, Any]:
         return {"status": "ok", "user": gum_instance.user_name, "sanitized": sanitizer is not None}
@@ -109,6 +127,28 @@ def create_app(gum_instance: gum, *, sanitize: bool = False) -> FastAPI:
     async def observations(limit: int = Query(10, ge=1, le=100)) -> dict[str, Any]:
         obs = await gum_instance.recent_observations(limit=limit)
         return {"results": [await _serialize_observation(o, sanitizer) for o in obs]}
+
+    # ── GUMBO proactive suggestions ───────────────────────────────────────
+    @app.get("/suggestions")
+    async def suggestions(
+        focus: str = Query(
+            "", description="Optional topic (e.g. a project tab) to focus suggestions on."
+        ),
+        surfaced_only: bool = Query(
+            False,
+            description="If true, return only suggestions the mixed-initiative filter "
+            "would surface (expected utility of interrupting > staying quiet).",
+        ),
+        limit: int = Query(10, ge=1, le=50),
+    ) -> dict[str, Any]:
+        results = await gumbo.generate(focus=focus.strip() or None)
+        if surfaced_only:
+            results = [s for s in results if s.should_surface]
+        results = results[:limit]
+        return {
+            "focus": focus,
+            "suggestions": [await _serialize_suggestion(s, sanitizer) for s in results],
+        }
 
     # ── proposition review ────────────────────────────────────────────────
     @app.get("/", response_class=HTMLResponse)
