@@ -66,7 +66,7 @@
              background: none; cursor: pointer; border-radius: 8px; }
   .tab-add:hover { color: var(--accent); background: var(--chip); }
 
-  main { max-width: 860px; margin: 0 auto; padding: 24px 20px 80px; }
+  .wrap { max-width: 860px; margin: 0 auto; padding: 24px 20px 80px; }
 
   .card {
     background: var(--card); border: 1px solid var(--border); border-radius: 16px;
@@ -107,23 +107,57 @@
   .spinner { width: 26px; height: 26px; border: 3px solid var(--border); border-top-color: var(--accent);
              border-radius: 50%; animation: spin .8s linear infinite; margin: 0 auto 14px; }
   @keyframes spin { to { transform: rotate(360deg); } }
+
+  /* Top-level page nav (Suggestions / Memory) — the desktop app's sections */
+  .nav { display: inline-flex; gap: 2px; background: var(--chip); padding: 3px; border-radius: 10px; }
+  .navbtn { border: none; background: none; color: var(--muted); font: inherit; font-size: 13px;
+            font-weight: 600; padding: 6px 13px; border-radius: 8px; cursor: pointer; }
+  .navbtn:hover { color: var(--text); }
+  .navbtn.active { background: var(--card); color: var(--text); box-shadow: 0 1px 2px rgba(0,0,0,.12); }
+  [hidden] { display: none !important; }
+  .search { border: 1px solid var(--border); border-radius: 10px; background: var(--card); color: var(--text);
+            padding: 7px 12px; font: inherit; font-size: 13px; min-width: 240px; }
+  .search:focus { outline: none; border-color: var(--accent); }
+
+  /* Memory page — a table of the raw propositions in the GUM (paper Fig 3B) */
+  .mem-table { width: 100%; border-collapse: collapse; background: var(--card);
+               border: 1px solid var(--border); border-radius: 14px; overflow: hidden; box-shadow: var(--shadow); }
+  .mem-table th { text-align: left; font-size: 11px; text-transform: uppercase; letter-spacing: .05em;
+                  color: var(--muted); font-weight: 700; padding: 12px 16px; border-bottom: 1px solid var(--border); }
+  .mem-table td { padding: 14px 16px; border-bottom: 1px solid var(--border); font-size: 14px; vertical-align: top; }
+  .mem-table tr:last-child td { border-bottom: none; }
+  .mem-table tbody tr:hover td { background: var(--bg); }
+  .mem-prop { line-height: 1.45; }
+  .mem-reason { color: var(--muted); font-size: 13px; margin-top: 5px; }
+  .col-num { white-space: nowrap; width: 1px; text-align: center; }
+  .pill { display: inline-block; font-size: 12px; font-weight: 700; background: var(--chip);
+          color: var(--chip-text); padding: 3px 10px; border-radius: 999px; }
 </style>
 </head>
 <body>
 <header>
   <div class="bar">
     <div class="logo">GUMBO<span>·</span>Assistant</div>
+    <nav class="nav" id="nav">
+      <button class="navbtn active" data-view="suggestions">Suggestions</button>
+      <button class="navbtn" data-view="memory">Memory</button>
+    </nav>
     <div class="grow"></div>
-    <label class="toggle" title="Only show suggestions the mixed-initiative filter would surface">
+    <label class="toggle view-suggestions" title="Only show suggestions the mixed-initiative filter would surface">
       <input type="checkbox" id="surfacedOnly" /> Worth surfacing only
     </label>
-    <button class="toolbtn" id="refreshBtn" onclick="load(true)">↻ Refresh</button>
+    <button class="toolbtn view-suggestions" id="refreshBtn" onclick="load(true)">↻ Refresh</button>
+    <input class="search view-memory" id="memSearch" type="search"
+           placeholder="Search your propositions…" hidden />
   </div>
-  <div class="tabs" id="tabs"></div>
+  <div class="tabs view-suggestions" id="tabs"></div>
 </header>
 
-<main id="main">
-  <div class="center"><div class="spinner"></div>Thinking…</div>
+<main class="wrap">
+  <div id="main">
+    <div class="center"><div class="spinner"></div>Thinking…</div>
+  </div>
+  <div id="memory" hidden></div>
 </main>
 
 <script>
@@ -139,6 +173,9 @@
   const main = document.getElementById('main');
   const tabsEl = document.getElementById('tabs');
   const surfacedOnly = document.getElementById('surfacedOnly');
+  const nav = document.getElementById('nav');
+  const memoryEl = document.getElementById('memory');
+  const memSearch = document.getElementById('memSearch');
 
   let projects = loadProjects();
   let active = localStorage.getItem(ACTIVE_KEY) || ALL;
@@ -273,6 +310,85 @@
       </div>`;
   }
 
+  // ── Page views (Suggestions / Memory) ─────────────────────────────────────
+  // The desktop app has two sections (paper Fig 3): the Suggestions page and the
+  // Memory page — a browsable view of the raw propositions in the GUM. Switching
+  // is client-side; the Memory list is fetched lazily the first time it's shown.
+  const VIEW_KEY = 'gumbo.view.v1';
+  let view = localStorage.getItem(VIEW_KEY) === 'memory' ? 'memory' : 'suggestions';
+  let memoryLoaded = false;
+
+  function setView(next) {
+    view = next;
+    localStorage.setItem(VIEW_KEY, view);
+    for (const b of nav.querySelectorAll('.navbtn')) {
+      b.classList.toggle('active', b.dataset.view === view);
+    }
+    const memoryView = view === 'memory';
+    document.querySelectorAll('.view-suggestions').forEach(el => { el.hidden = memoryView; });
+    document.querySelectorAll('.view-memory').forEach(el => { el.hidden = !memoryView; });
+    main.hidden = memoryView;
+    memoryEl.hidden = !memoryView;
+    if (memoryView && !memoryLoaded) loadMemory();
+    else if (!memoryView && !document.querySelector('.card') && !busy) load();
+  }
+
+  // ── Memory page (raw propositions) ────────────────────────────────────────
+  let memBusy = false;
+  async function loadMemory() {
+    if (memBusy) return;
+    memBusy = true;
+    memoryLoaded = true;
+    memoryEl.innerHTML = '<div class="center"><div class="spinner"></div>Reading memory…</div>';
+    const params = new URLSearchParams();
+    const q = memSearch.value.trim();
+    if (q) params.set('q', q);
+    params.set('limit', '100');
+    try {
+      const r = await fetch('/memory?' + params.toString());
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      const data = await r.json();
+      renderMemory(data.propositions || [], q);
+    } catch (e) {
+      memoryEl.innerHTML = '<div class="center"><h2>Couldn\'t read memory</h2><p>'
+        + esc(String(e && e.message || e)) + '</p><p>Is GUM running?</p></div>';
+    }
+    memBusy = false;
+  }
+
+  function renderMemory(props, q) {
+    if (!props.length) {
+      memoryEl.innerHTML = `
+        <div class="center">
+          <div class="big">🧠</div>
+          <h2>${q ? 'No matching propositions' : 'Memory is empty'}</h2>
+          <p>${q
+            ? 'Nothing in the GUM matches <b>' + esc(q) + '</b> yet.'
+            : 'GUM builds up propositions as it observes. Let it keep watching.'}</p>
+        </div>`;
+      return;
+    }
+    const rows = props.map(p => {
+      const conf = (typeof p.confidence === 'number')
+        ? `<span class="pill">${p.confidence}/10</span>` : '<span class="mem-reason">—</span>';
+      const support = (typeof p.support === 'number') ? p.support : '—';
+      return `
+        <tr>
+          <td class="mem-prop">${esc(p.text)}
+            ${p.reasoning ? `<div class="mem-reason">${esc(p.reasoning)}</div>` : ''}</td>
+          <td class="col-num">${conf}</td>
+          <td class="col-num">${support}</td>
+        </tr>`;
+    }).join('');
+    memoryEl.innerHTML = `
+      <table class="mem-table">
+        <thead><tr>
+          <th>Proposition</th><th class="col-num">Confidence</th><th class="col-num">Support</th>
+        </tr></thead>
+        <tbody>${rows}</tbody>
+      </table>`;
+  }
+
   // ── Feedback (thumbs) ─────────────────────────────────────────────────────
   // A reaction is itself an observation about the user (paper §4.3): POST it so
   // the GUM learns which proactive suggestions land and future ones improve.
@@ -314,8 +430,22 @@
   });
 
   surfacedOnly.addEventListener('change', () => load());
+
+  nav.addEventListener('click', (e) => {
+    const btn = e.target.closest('.navbtn');
+    if (btn && btn.dataset.view !== view) setView(btn.dataset.view);
+  });
+
+  // Debounced search on the Memory page.
+  let memTimer = null;
+  memSearch.addEventListener('input', () => {
+    clearTimeout(memTimer);
+    memTimer = setTimeout(loadMemory, 250);
+  });
+
   renderTabs();
-  load();
+  if (view === 'memory') setView('memory');
+  else load();
 </script>
 </body>
 </html>
