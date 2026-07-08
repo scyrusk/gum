@@ -159,6 +159,21 @@
   .mem-forget:hover { color: #c0392b; border-color: #c0392b; }
   .mem-forget:disabled { opacity: .5; cursor: default; }
   .mem-table tr.forgetting td { opacity: .4; }
+  .mem-actions { display: flex; gap: 6px; justify-content: flex-end; }
+  /* Per-row "Edit" — correct a close-but-wrong proposition (paper Fig 3B) */
+  .mem-edit { font: inherit; font-size: 13px; cursor: pointer; color: var(--muted);
+              background: transparent; border: 1px solid var(--border); border-radius: 8px;
+              padding: 5px 12px; white-space: nowrap; transition: color .12s, border-color .12s; }
+  .mem-edit:hover { color: var(--accent); border-color: var(--accent); }
+  .mem-edit:disabled { opacity: .5; cursor: default; }
+  .mem-editor textarea, .mem-editor input { font: inherit; width: 100%; box-sizing: border-box;
+              background: var(--card); color: var(--text); border: 1px solid var(--border);
+              border-radius: 8px; padding: 7px 10px; margin-bottom: 6px; }
+  .mem-editor .mem-conf-input { width: 5em; margin-bottom: 0; }
+  .mem-editor label { display: block; font-size: 12px; color: var(--muted); margin-bottom: 3px; }
+  .mem-save { font: inherit; font-size: 13px; cursor: pointer; color: #fff; background: var(--accent);
+              border: 1px solid var(--accent); border-radius: 8px; padding: 5px 12px; white-space: nowrap; }
+  .mem-save:disabled { opacity: .5; cursor: default; }
 </style>
 </head>
 <body>
@@ -216,6 +231,8 @@
   function saveProjects() { localStorage.setItem(TABS_KEY, JSON.stringify(projects)); }
 
   const esc = (s) => (s ?? '').replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
+  // Attribute-safe variant: also escapes quotes so values survive inside data-* attrs.
+  const escAttr = (s) => (s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 
   function renderTabs() {
     const mk = (key, label, removable) => {
@@ -402,12 +419,14 @@
         ? `<span class="pill">${p.confidence}/10</span>` : '<span class="mem-reason">—</span>';
       const support = (typeof p.support === 'number') ? p.support : '—';
       return `
-        <tr data-id="${p.id}">
+        <tr data-id="${p.id}" data-text="${escAttr(p.text)}" data-reasoning="${escAttr(p.reasoning || '')}" data-confidence="${typeof p.confidence === 'number' ? p.confidence : ''}">
           <td class="mem-prop">${esc(p.text)}
             ${p.reasoning ? `<div class="mem-reason">${esc(p.reasoning)}</div>` : ''}</td>
-          <td class="col-num">${conf}</td>
+          <td class="col-num mem-conf">${conf}</td>
           <td class="col-num">${support}</td>
-          <td class="col-num"><button class="mem-forget" title="Remove this from GUMBO's memory">Forget</button></td>
+          <td class="col-num mem-actions">
+            <button class="mem-edit" title="Correct this proposition">Edit</button>
+            <button class="mem-forget" title="Remove this from GUMBO's memory">Forget</button></td>
         </tr>`;
     }).join('');
     memoryEl.innerHTML = `
@@ -444,7 +463,79 @@
     }
   }
 
+  // ── Edit (curate memory, paper Fig 3B) ────────────────────────────────────
+  // The user corrects a close-but-wrong proposition instead of forgetting it.
+  // Swap the row into an inline editor, then PATCH /memory/{id} on save.
+  function startEdit(row) {
+    if (row.classList.contains('editing')) return;
+    row.classList.add('editing');
+    const text = row.dataset.text || '';
+    const reasoning = row.dataset.reasoning || '';
+    const confidence = row.dataset.confidence || '';
+    const propCell = row.querySelector('.mem-prop');
+    propCell.dataset.orig = propCell.innerHTML;
+    propCell.classList.add('mem-editor');
+    propCell.innerHTML = `
+      <label>Proposition</label>
+      <textarea class="mem-edit-text" rows="2">${esc(text)}</textarea>
+      <label>Reasoning</label>
+      <textarea class="mem-edit-reason" rows="2">${esc(reasoning)}</textarea>`;
+    const confCell = row.querySelector('.mem-conf');
+    confCell.dataset.orig = confCell.innerHTML;
+    confCell.classList.add('mem-editor');
+    confCell.innerHTML = `<input class="mem-conf-input" type="number" min="1" max="10" value="${esc(confidence)}">`;
+    const actions = row.querySelector('.mem-actions');
+    actions.dataset.orig = actions.innerHTML;
+    actions.innerHTML = `
+      <button class="mem-save">Save</button>
+      <button class="mem-edit mem-cancel">Cancel</button>`;
+    propCell.querySelector('.mem-edit-text').focus();
+  }
+
+  function cancelEdit(row) {
+    row.classList.remove('editing');
+    ['.mem-prop', '.mem-conf', '.mem-actions'].forEach(sel => {
+      const cell = row.querySelector(sel);
+      if (cell && cell.dataset.orig !== undefined) {
+        cell.innerHTML = cell.dataset.orig;
+        cell.classList.remove('mem-editor');
+        delete cell.dataset.orig;
+      }
+    });
+  }
+
+  async function saveEdit(row) {
+    const id = row.dataset.id;
+    if (!id) return;
+    const text = row.querySelector('.mem-edit-text').value.trim();
+    const reasoning = row.querySelector('.mem-edit-reason').value.trim();
+    const confRaw = row.querySelector('.mem-conf-input').value.trim();
+    if (!text || !reasoning) return;  // empty proposition is meaningless
+    const saveBtn = row.querySelector('.mem-save');
+    saveBtn.disabled = true;
+    const body = { text, reasoning };
+    if (confRaw !== '') body.confidence = parseInt(confRaw, 10);
+    try {
+      const r = await fetch('/memory/' + encodeURIComponent(id), {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      const data = await r.json();
+      if (!data.ok) throw new Error(data.error || 'failed');
+      // Re-render the whole table so the row reflects the saved values cleanly.
+      loadMemory();
+    } catch (e) {
+      saveBtn.disabled = false;
+      saveBtn.textContent = "Couldn't — retry";
+    }
+  }
+
   memoryEl.addEventListener('click', (e) => {
+    if (e.target.closest('.mem-cancel')) { cancelEdit(e.target.closest('tr')); return; }
+    if (e.target.closest('.mem-save')) { saveEdit(e.target.closest('tr')); return; }
+    if (e.target.closest('.mem-edit')) { startEdit(e.target.closest('tr')); return; }
     const btn = e.target.closest('.mem-forget');
     if (btn) forgetProposition(btn.closest('tr'));
   });

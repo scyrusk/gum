@@ -14,7 +14,7 @@ from .models import observation_proposition
 import traceback
 
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import insert
+from sqlalchemy import insert, select, update, delete as sql_delete, literal
 
 from .db_utils import (
     get_related_observations,
@@ -672,11 +672,23 @@ class gum:
 
         # Generate revised propositions
         revised_items = await self._revise_propositions(list(rel_obs), similar)
-        
-        # Delete all old similar propositions
+
+        # Delete all old similar propositions. We issue a Core bulk DELETE keyed by
+        # id and let the DB's ON DELETE CASCADE clear the observation_proposition
+        # junction, rather than ORM-deleting each object. The ORM path verifies the
+        # junction row count against the collection it loaded *before* the slow
+        # revise call above; if the user forgot one of these propositions from the
+        # Memory page in that window, the counts disagree and the flush dies with a
+        # StaleDataError (the bug this replaces). Expunging first keeps the unit of
+        # work from re-scheduling that same count-checked delete; a bulk DELETE that
+        # matches fewer rows than expected is simply a no-op for the missing ones.
+        similar_ids = [p.id for p in similar]
         for prop in similar:
-            await session.delete(prop)
-        
+            session.expunge(prop)
+        await session.execute(
+            sql_delete(Proposition).where(Proposition.id.in_(similar_ids))
+        )
+
         # Create new propositions to replace them
         revision_group = str(uuid4())
         for item in revised_items:
@@ -778,12 +790,30 @@ class gum:
 
     @staticmethod
     async def _attach_obs_if_missing(prop: Proposition, obs: Observation, session):
+        # Attach the observation only if the proposition still exists: a concurrent
+        # Memory-page delete may have removed it during the batch's LLM calls. A
+        # plain INSERT OR IGNORE does NOT swallow the resulting foreign-key
+        # violation (OR IGNORE only skips uniqueness conflicts), so we guard on
+        # existence with INSERT ... SELECT — it inserts zero rows if the prop is
+        # gone. updated_at is bumped with a Core UPDATE for the same reason: an ORM
+        # attribute assignment would schedule a row-count-checked UPDATE that raises
+        # StaleDataError against the now-deleted row, whereas this matches zero rows
+        # harmlessly.
         await session.execute(
             insert(observation_proposition)
             .prefix_with("OR IGNORE")
-            .values(observation_id=obs.id, proposition_id=prop.id)
+            .from_select(
+                ["observation_id", "proposition_id"],
+                select(literal(obs.id), Proposition.id).where(
+                    Proposition.id == prop.id
+                ),
+            )
         )
-        prop.updated_at = datetime.now(timezone.utc)
+        await session.execute(
+            update(Proposition)
+            .where(Proposition.id == prop.id)
+            .values(updated_at=datetime.now(timezone.utc))
+        )
 
     def add_observer(self, observer: Observer):
         """Add an observer to track user behavior.
@@ -933,6 +963,13 @@ class gum:
         (ondelete=CASCADE), the FTS index is kept in sync by the AFTER DELETE
         trigger, and any feedback rows have their FK nulled (ondelete=SET NULL).
         Returns False if the proposition no longer exists so callers can 404.
+
+        Curation must stay responsive, so this deliberately does NOT hold
+        ``_batch_processing_lock``: a batch is inference-bound and can hold that lock
+        for minutes, which would make deletes appear to hang. Instead the batch's own
+        writes are made tolerant of a proposition disappearing underneath them (see
+        :meth:`_handle_similar` and :meth:`_attach_obs_if_missing`), so a concurrent
+        delete no longer crashes an in-flight batch with ``StaleDataError``.
         """
         async with self._session() as session:
             prop = await session.get(Proposition, proposition_id)
@@ -940,6 +977,41 @@ class gum:
                 return False
             await session.delete(prop)
             return True
+
+    async def update_proposition(
+        self,
+        proposition_id: int,
+        *,
+        text: str | None = None,
+        reasoning: str | None = None,
+        confidence: int | None = None,
+    ) -> Proposition | None:
+        """Edit a proposition in place (paper Fig 3B, Memory page).
+
+        The Memory page lets the user curate their own GUM: as well as removing a
+        proposition (:meth:`delete_proposition`), they can correct one that is
+        close-but-wrong rather than throwing it away. Only the fields passed are
+        changed; the rest are left untouched. The propositions_fts index is kept
+        in sync by the AFTER UPDATE trigger, and ``updated_at`` refreshes via the
+        column's ``onupdate``. Returns the updated proposition, or None if it no
+        longer exists so callers can 404. Like :meth:`delete_proposition`, this does
+        not hold ``_batch_processing_lock`` — curation stays responsive and the batch
+        tolerates concurrent edits.
+        """
+        async with self._session() as session:
+            prop = await session.get(Proposition, proposition_id)
+            if prop is None:
+                return None
+            if text is not None:
+                prop.text = text
+            if reasoning is not None:
+                prop.reasoning = reasoning
+            if confidence is not None:
+                prop.confidence = confidence
+            await session.flush()
+            await session.refresh(prop)
+            session.expunge(prop)
+            return prop
 
     async def review_progress(self) -> tuple[int, int]:
         """Return (total_propositions, reviewed_count)."""

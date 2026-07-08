@@ -41,6 +41,14 @@ class SuggestionFeedbackIn(BaseModel):
     focus: str | None = None  # active project tab, if any
 
 
+class PropositionEditIn(BaseModel):
+    # All fields optional: the user edits whichever they want. text is the
+    # proposition statement, reasoning the justification, confidence the 1-10 pill.
+    text: str | None = None
+    reasoning: str | None = None
+    confidence: int | None = None
+
+
 class ChatMessage(BaseModel):
     role: str  # "user" | "assistant"
     content: str
@@ -178,6 +186,31 @@ def create_app(gum_instance: gum, *, sanitize: bool = False) -> FastAPI:
                 await _serialize_proposition(p, sanitizer, include_support=True)
                 for p in props
             ],
+        }
+
+    @app.patch("/memory/{proposition_id}")
+    async def memory_edit(
+        proposition_id: int, body: PropositionEditIn
+    ) -> dict[str, Any]:
+        # Curate the model (paper Fig 3B): the user corrects a proposition that is
+        # close-but-wrong instead of deleting it. Blank text/reasoning are rejected
+        # (an empty proposition is meaningless); confidence is clamped to 1-10 to
+        # match the model's own scale.
+        text = body.text.strip() if body.text is not None else None
+        reasoning = body.reasoning.strip() if body.reasoning is not None else None
+        if text == "" or reasoning == "":
+            return {"ok": False, "error": "text and reasoning cannot be blank"}
+        confidence = body.confidence
+        if confidence is not None:
+            confidence = max(1, min(10, confidence))
+        prop = await gum_instance.update_proposition(
+            proposition_id, text=text, reasoning=reasoning, confidence=confidence
+        )
+        if prop is None:
+            return {"ok": False, "error": "not found"}
+        return {
+            "ok": True,
+            "proposition": await _serialize_proposition(prop, sanitizer),
         }
 
     @app.delete("/memory/{proposition_id}")
