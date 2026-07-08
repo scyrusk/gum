@@ -211,6 +211,69 @@ class SuggestionsEndpointTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('data-view="memory"', body)
         self.assertIn("Support", body)
 
+    def test_chat_replies_grounded_in_propositions(self):
+        # "Start Chat" (paper §4.3.3): the local text model answers grounded in
+        # the user's high-confidence propositions and the suggestion in scope.
+        captured = {}
+
+        async def fake_chat(client, model, messages, **kwargs):
+            captured["messages"] = messages
+            return "Here are three suit-rental shops near the venue."
+
+        app = create_app(self.gum)
+        with mock.patch("gum.gumbo.text_completion", side_effect=fake_chat):
+            with TestClient(app) as client:
+                resp = client.post("/suggestions/chat", json={
+                    "messages": [{"role": "user", "content": "Where can I rent one?"}],
+                    "suggestion": {
+                        "title": "Rent a suit in Chicago",
+                        "description": "Found three suit-rental shops near the venue.",
+                        "rationale": "Wedding + no formal wear.",
+                    },
+                })
+        self.assertEqual(resp.status_code, 200)
+        body = resp.json()
+        self.assertTrue(body["ok"])
+        self.assertIn("suit-rental", body["reply"])
+        msgs = captured["messages"]
+        # A system turn grounds GUMBO; the user's question is passed through.
+        self.assertEqual(msgs[0]["role"], "system")
+        self.assertIn("wedding", msgs[0]["content"].lower())
+        self.assertIn("Rent a suit in Chicago", msgs[0]["content"])
+        self.assertEqual(msgs[-1], {"role": "user", "content": "Where can I rent one?"})
+
+    def test_chat_requires_a_user_message(self):
+        app = create_app(self.gum)
+        with mock.patch("gum.gumbo.text_completion") as tc:
+            with TestClient(app) as client:
+                resp = client.post("/suggestions/chat", json={"messages": []})
+        self.assertFalse(resp.json()["ok"])
+        tc.assert_not_called()
+
+    def test_chat_sanitizes_reply(self):
+        fake_sanitizer = mock.Mock()
+        fake_sanitizer.load = mock.Mock()
+        fake_sanitizer.sanitize = mock.Mock(side_effect=lambda t: t.replace("Chicago", "[CITY]"))
+
+        async def fake_chat(client, model, messages, **kwargs):
+            return "Try the shops in downtown Chicago."
+
+        with mock.patch("gum.sanitize.get_sanitizer", return_value=fake_sanitizer):
+            app = create_app(self.gum, sanitize=True)
+            with mock.patch("gum.gumbo.text_completion", side_effect=fake_chat):
+                with TestClient(app) as client:
+                    resp = client.post("/suggestions/chat", json={
+                        "messages": [{"role": "user", "content": "where?"}],
+                    })
+        self.assertEqual(resp.json()["reply"], "Try the shops in downtown [CITY].")
+
+    def test_gumbo_page_has_start_chat(self):
+        app = create_app(self.gum)
+        with TestClient(app) as client:
+            body = client.get("/gumbo").text
+        self.assertIn("/suggestions/chat", body)
+        self.assertIn("Start Chat", body)
+
     def test_sanitize_scrubs_suggestion_text(self):
         # Under --sanitize, the model-written text is pseudonymized on the way out
         # while numeric scores pass through unchanged.

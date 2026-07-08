@@ -20,9 +20,9 @@ from dataclasses import asdict, dataclass
 from typing import Any
 
 from .gum import gum
-from .llm import structured_completion
+from .llm import structured_completion, text_completion
 from .models import Proposition
-from .prompts.gumbo import SUGGESTIONS_PROMPT
+from .prompts.gumbo import CHAT_SYSTEM_PROMPT, SUGGESTIONS_PROMPT
 from .schemas import SuggestionSchema
 
 # Only propositions the GUM is fairly sure about should seed suggestions — a
@@ -178,6 +178,56 @@ class Gumbo:
         # Rank by expected utility so the most worth-surfacing float to the top.
         suggestions.sort(key=lambda s: s.expected_utility, reverse=True)
         return suggestions
+
+    # ── conversation ─────────────────────────────────────────────────────────
+    async def chat(
+        self,
+        messages: list[dict[str, str]],
+        *,
+        suggestion: dict[str, str] | None = None,
+        focus: str | None = None,
+    ) -> str:
+        """Continue a "Start Chat" conversation about a suggestion (paper §4.3.3).
+
+        *messages* is the running user/assistant turn list (each ``{"role", "content"}``).
+        The reply is grounded in the user's high-confidence propositions — retrieved
+        by *focus* (the active project tab) if given, otherwise the suggestion's own
+        title/description — so GUMBO answers from what it actually knows. Returns the
+        assistant's plain-text reply.
+        """
+        seed = focus
+        if not (seed and seed.strip()) and suggestion:
+            seed = " ".join(
+                v for v in (suggestion.get("title"), suggestion.get("description")) if v
+            ).strip() or None
+        props = await self.select_propositions(seed)
+
+        suggestion_context = ""
+        if suggestion and (suggestion.get("title") or suggestion.get("description")):
+            parts = [f"\n## The suggestion {self.gum.user_name} is asking about\n"]
+            if suggestion.get("title"):
+                parts.append(f"Title: {suggestion['title'].strip()}")
+            if suggestion.get("description"):
+                parts.append(f"Details: {suggestion['description'].strip()}")
+            if suggestion.get("rationale"):
+                parts.append(f"Why GUMBO raised it: {suggestion['rationale'].strip()}")
+            suggestion_context = "\n".join(parts) + "\n"
+
+        system = CHAT_SYSTEM_PROMPT.format(
+            user_name=self.gum.user_name,
+            propositions=self._format_propositions(props) or "(nothing confidently known yet)",
+            suggestion_context=suggestion_context,
+        )
+        convo = [{"role": "system", "content": system}]
+        for m in messages:
+            role = m.get("role")
+            content = (m.get("content") or "").strip()
+            if role in ("user", "assistant") and content:
+                convo.append({"role": role, "content": content})
+
+        return await text_completion(
+            self.gum.client, self.gum.model, convo, logger=self.logger
+        )
 
     def _score(self, item) -> Suggestion:
         eu, surface = expected_utility(

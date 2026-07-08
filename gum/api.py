@@ -41,6 +41,17 @@ class SuggestionFeedbackIn(BaseModel):
     focus: str | None = None  # active project tab, if any
 
 
+class ChatMessage(BaseModel):
+    role: str  # "user" | "assistant"
+    content: str
+
+
+class SuggestionChatIn(BaseModel):
+    messages: list[ChatMessage]  # running conversation (user/assistant turns)
+    suggestion: dict[str, str] | None = None  # {title, description, rationale} in scope
+    focus: str | None = None  # active project tab, if any
+
+
 async def _scrub(text: str | None, sanitizer) -> str | None:
     """Pseudonymize *text* when a sanitizer is active, else return it unchanged."""
     if sanitizer is None or not text:
@@ -205,6 +216,24 @@ def create_app(gum_instance: gum, *, sanitize: bool = False) -> FastAPI:
             focus=body.focus,
         )
         return {"ok": ok}
+
+    @app.post("/suggestions/chat")
+    async def suggestions_chat(body: SuggestionChatIn) -> dict[str, Any]:
+        # "Start Chat" (paper §4.3.3): talk to GUMBO in more detail about a
+        # surfaced suggestion. The conversation is grounded in the user's
+        # high-confidence propositions via the local text model. The reply is
+        # model-written prose over raw propositions, so it is pseudonymized under
+        # --sanitize just like the suggestion text.
+        turns = [{"role": m.role, "content": m.content} for m in body.messages]
+        if not any(t["role"] == "user" and t["content"].strip() for t in turns):
+            return {"ok": False, "error": "at least one user message is required"}
+        try:
+            reply = await gumbo.chat(
+                turns, suggestion=body.suggestion, focus=body.focus
+            )
+        except Exception as exc:  # local model unavailable / transport error
+            return {"ok": False, "error": f"chat failed: {exc}"}
+        return {"ok": True, "reply": await _scrub(reply, sanitizer)}
 
     # ── GUMBO assistant desktop UI ────────────────────────────────────────
     @app.get("/gumbo", response_class=HTMLResponse)
