@@ -99,6 +99,39 @@ class SuggestionsEndpointTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(sugs[0]["title"], "Rent a suit in Chicago")
         self.assertTrue(sugs[0]["should_surface"])
 
+    def test_rate_limited_caps_surfacing_across_requests(self):
+        # Two suggestions clear the mixed-initiative bar, but the token-bucket
+        # rate limit (paper §4.3.2, ~1/min) lets only one surface — and its state
+        # is shared across requests, so a second immediate poll surfaces nothing.
+        two_surfaced = SuggestionSchema(suggestions=[
+            SuggestionItem(
+                title="Rent a suit in Chicago",
+                description="Found three suit-rental shops near the venue.",
+                rationale="Wedding + no formal wear.",
+                probability_useful=9, benefit=9, cost_if_wrong=2, cost_if_missed=7,
+            ),
+            SuggestionItem(
+                title="Book a hotel near the venue",
+                description="Reserve a room close to the ceremony.",
+                rationale="Travel logistics.",
+                probability_useful=8, benefit=8, cost_if_wrong=2, cost_if_missed=6,
+            ),
+        ])
+
+        async def _fake(client, model, messages, schema, **kwargs):
+            return two_surfaced
+
+        app = create_app(self.gum)
+        with mock.patch("gum.gumbo.structured_completion", side_effect=_fake):
+            with TestClient(app) as client:
+                first = client.get("/suggestions", params={"rate_limited": "true"})
+                second = client.get("/suggestions", params={"rate_limited": "true"})
+        first_sugs = first.json()["suggestions"]
+        self.assertEqual(len(first_sugs), 1)  # only one of two worthy surfaces
+        self.assertEqual(first_sugs[0]["title"], "Rent a suit in Chicago")
+        # Bucket drained (well under a minute of real time elapsed) → nothing more.
+        self.assertEqual(second.json()["suggestions"], [])
+
     def test_limit_caps_results(self):
         app = create_app(self.gum)
         with mock.patch("gum.gumbo.structured_completion", side_effect=_fake_completion):
