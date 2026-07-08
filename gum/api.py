@@ -48,7 +48,13 @@ async def _scrub(text: str | None, sanitizer) -> str | None:
     return await asyncio.to_thread(sanitizer.sanitize, text)
 
 
-async def _serialize_proposition(prop: Proposition, sanitizer, score: float | None = None) -> dict[str, Any]:
+async def _serialize_proposition(
+    prop: Proposition,
+    sanitizer,
+    score: float | None = None,
+    *,
+    include_support: bool = False,
+) -> dict[str, Any]:
     data: dict[str, Any] = {
         "id": prop.id,
         "text": await _scrub(prop.text, sanitizer),
@@ -60,6 +66,11 @@ async def _serialize_proposition(prop: Proposition, sanitizer, score: float | No
     }
     if score is not None:
         data["score"] = score
+    if include_support:
+        # "Support" (paper Fig 3B) = how many observations back this proposition.
+        # Requires the observations relationship to have been eager-loaded by the
+        # caller (selectin), so this stays a cheap len() with no extra I/O.
+        data["support"] = len(prop.observations)
     return data
 
 
@@ -134,6 +145,29 @@ def create_app(gum_instance: gum, *, sanitize: bool = False) -> FastAPI:
     async def observations(limit: int = Query(10, ge=1, le=100)) -> dict[str, Any]:
         obs = await gum_instance.recent_observations(limit=limit)
         return {"results": [await _serialize_observation(o, sanitizer) for o in obs]}
+
+    # ── memory (raw propositions) ─────────────────────────────────────────
+    @app.get("/memory")
+    async def memory(
+        q: str = Query("", description="Optional search text; empty = most recent."),
+        limit: int = Query(50, ge=1, le=200),
+    ) -> dict[str, Any]:
+        # The Memory page (paper Fig 3B) lets the user browse the raw
+        # propositions in their GUM, each annotated with its "support" — the
+        # number of observations backing it. Searching reuses the same BM25 query
+        # the rest of the API uses; an empty query browses the most recent.
+        if q.strip():
+            results = await gum_instance.query(q.strip(), limit=limit)
+            props = [p for p, _ in results]
+        else:
+            props = await gum_instance.recent(limit=limit, include_observations=True)
+        return {
+            "query": q,
+            "propositions": [
+                await _serialize_proposition(p, sanitizer, include_support=True)
+                for p in props
+            ],
+        }
 
     # ── GUMBO proactive suggestions ───────────────────────────────────────
     @app.get("/suggestions")

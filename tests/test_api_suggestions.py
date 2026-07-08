@@ -18,7 +18,7 @@ from fastapi.testclient import TestClient
 
 from gum import gum as Gum
 from gum.api import create_app
-from gum.models import Proposition
+from gum.models import Observation, Proposition
 from gum.schemas import SuggestionItem, SuggestionSchema
 
 
@@ -166,6 +166,50 @@ class SuggestionsEndpointTests(unittest.IsolatedAsyncioTestCase):
             body = client.get("/gumbo").text
         self.assertIn("/suggestions/feedback", body)
         self.assertIn("Was this useful?", body)
+
+    async def test_memory_lists_propositions_with_support(self):
+        # The Memory page (paper Fig 3B) browses the raw propositions, each
+        # annotated with its "support" — the number of observations backing it.
+        async with self.gum._session() as s:
+            prop = _prop("Omar is planning a Chicago trip", 9)
+            prop.observations = {
+                Observation(observer_name="screen", content="booked flight to ORD", content_type="text"),
+                Observation(observer_name="screen", content="compared downtown hotels", content_type="text"),
+            }
+            s.add(prop)
+        app = create_app(self.gum)
+        with TestClient(app) as client:
+            resp = client.get("/memory")
+        self.assertEqual(resp.status_code, 200)
+        props = resp.json()["propositions"]
+        self.assertTrue(props)
+        # Memory is NOT confidence-filtered — every proposition shows, each with a
+        # support count and confidence for the table.
+        for p in props:
+            self.assertIn("support", p)
+            self.assertIn("confidence", p)
+        planned = next(p for p in props if p["text"].startswith("Omar is planning a Chicago trip"))
+        self.assertEqual(planned["support"], 2)
+
+    def test_memory_search_filters_and_keeps_support(self):
+        app = create_app(self.gum)
+        with TestClient(app) as client:
+            resp = client.get("/memory", params={"q": "wedding"})
+        self.assertEqual(resp.status_code, 200)
+        props = resp.json()["propositions"]
+        self.assertTrue(props)
+        self.assertTrue(any("wedding" in p["text"].lower() for p in props))
+        self.assertTrue(all("support" in p for p in props))
+
+    def test_gumbo_page_has_memory_view(self):
+        # The desktop app exposes a Memory section wired to /memory, with the
+        # Support column from the paper.
+        app = create_app(self.gum)
+        with TestClient(app) as client:
+            body = client.get("/gumbo").text
+        self.assertIn("/memory?", body)
+        self.assertIn('data-view="memory"', body)
+        self.assertIn("Support", body)
 
     def test_sanitize_scrubs_suggestion_text(self):
         # Under --sanitize, the model-written text is pseudonymized on the way out
