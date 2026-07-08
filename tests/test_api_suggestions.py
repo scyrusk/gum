@@ -211,6 +211,46 @@ class SuggestionsEndpointTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('data-view="memory"', body)
         self.assertIn("Support", body)
 
+    async def test_memory_delete_removes_proposition(self):
+        # Curating the model (paper Fig 3B): the user removes a proposition, and
+        # it disappears from Memory. A backing observation must not block the
+        # delete (the junction cascades).
+        async with self.gum._session() as s:
+            prop = _prop("Omar secretly dislikes cilantro", 8)
+            prop.observations = {
+                Observation(observer_name="screen", content="searched cilantro substitute", content_type="text"),
+            }
+            s.add(prop)
+        async with self.gum._session() as s:
+            row = next(p for p in (await self.gum.recent(limit=50))
+                       if p.text.startswith("Omar secretly dislikes cilantro"))
+            target_id = row.id
+
+        app = create_app(self.gum)
+        with TestClient(app) as client:
+            resp = client.delete(f"/memory/{target_id}")
+            self.assertEqual(resp.status_code, 200)
+            self.assertTrue(resp.json()["ok"])
+            # It's gone from the Memory listing.
+            remaining = client.get("/memory").json()["propositions"]
+        self.assertFalse(any(p["id"] == target_id for p in remaining))
+
+    async def test_memory_delete_missing_returns_not_ok(self):
+        app = create_app(self.gum)
+        with TestClient(app) as client:
+            resp = client.delete("/memory/999999")
+        self.assertEqual(resp.status_code, 200)
+        self.assertFalse(resp.json()["ok"])
+
+    def test_gumbo_page_has_forget_control(self):
+        # The Memory table exposes a per-row Forget action wired to DELETE /memory/.
+        app = create_app(self.gum)
+        with TestClient(app) as client:
+            body = client.get("/gumbo").text
+        self.assertIn("mem-forget", body)
+        self.assertIn("/memory/", body)
+        self.assertIn("DELETE", body)
+
     def test_chat_replies_grounded_in_propositions(self):
         # "Start Chat" (paper §4.3.3): the local text model answers grounded in
         # the user's high-confidence propositions and the suggestion in scope.

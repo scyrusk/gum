@@ -152,6 +152,13 @@
   .col-num { white-space: nowrap; width: 1px; text-align: center; }
   .pill { display: inline-block; font-size: 12px; font-weight: 700; background: var(--chip);
           color: var(--chip-text); padding: 3px 10px; border-radius: 999px; }
+  /* Per-row "Forget" — lets the user curate the model (paper Fig 3B) */
+  .mem-forget { font: inherit; font-size: 13px; cursor: pointer; color: var(--muted);
+                background: transparent; border: 1px solid var(--border); border-radius: 8px;
+                padding: 5px 12px; white-space: nowrap; transition: color .12s, border-color .12s; }
+  .mem-forget:hover { color: #c0392b; border-color: #c0392b; }
+  .mem-forget:disabled { opacity: .5; cursor: default; }
+  .mem-table tr.forgetting td { opacity: .4; }
 </style>
 </head>
 <body>
@@ -395,21 +402,52 @@
         ? `<span class="pill">${p.confidence}/10</span>` : '<span class="mem-reason">—</span>';
       const support = (typeof p.support === 'number') ? p.support : '—';
       return `
-        <tr>
+        <tr data-id="${p.id}">
           <td class="mem-prop">${esc(p.text)}
             ${p.reasoning ? `<div class="mem-reason">${esc(p.reasoning)}</div>` : ''}</td>
           <td class="col-num">${conf}</td>
           <td class="col-num">${support}</td>
+          <td class="col-num"><button class="mem-forget" title="Remove this from GUMBO's memory">Forget</button></td>
         </tr>`;
     }).join('');
     memoryEl.innerHTML = `
       <table class="mem-table">
         <thead><tr>
-          <th>Proposition</th><th class="col-num">Confidence</th><th class="col-num">Support</th>
+          <th>Proposition</th><th class="col-num">Confidence</th><th class="col-num">Support</th><th class="col-num"></th>
         </tr></thead>
         <tbody>${rows}</tbody>
       </table>`;
   }
+
+  // ── Forget (curate memory, paper Fig 3B) ──────────────────────────────────
+  // The user removes a proposition they judge wrong or unwanted. DELETE the row
+  // from the GUM, then drop it from the table on success.
+  async function forgetProposition(row) {
+    const id = row.dataset.id;
+    if (!id) return;
+    const btn = row.querySelector('.mem-forget');
+    if (!btn || btn.disabled) return;
+    btn.disabled = true;
+    row.classList.add('forgetting');
+    try {
+      const r = await fetch('/memory/' + encodeURIComponent(id), { method: 'DELETE' });
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      const data = await r.json();
+      if (!data.ok) throw new Error('not found');
+      row.remove();
+      if (!memoryEl.querySelector('tbody tr')) loadMemory();
+    } catch (e) {
+      // Leave the row in place so the user can retry.
+      row.classList.remove('forgetting');
+      btn.disabled = false;
+      btn.textContent = "Couldn't — retry";
+    }
+  }
+
+  memoryEl.addEventListener('click', (e) => {
+    const btn = e.target.closest('.mem-forget');
+    if (btn) forgetProposition(btn.closest('tr'));
+  });
 
   // ── Feedback (thumbs) ─────────────────────────────────────────────────────
   // A reaction is itself an observation about the user (paper §4.3): POST it so
