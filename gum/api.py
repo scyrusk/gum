@@ -180,6 +180,15 @@ def create_app(gum_instance: gum, *, sanitize: bool = False) -> FastAPI:
             ],
         }
 
+    @app.delete("/memory/{proposition_id}")
+    async def memory_delete(proposition_id: int) -> dict[str, Any]:
+        # Curate the model (paper Fig 3B): the user removes a proposition they
+        # judge wrong or unwanted. This mutates the GUM, but it is the user acting
+        # on their own model from their own machine — the same spirit as the
+        # existing review/feedback write routes.
+        ok = await gum_instance.delete_proposition(proposition_id)
+        return {"ok": ok}
+
     # ── GUMBO proactive suggestions ───────────────────────────────────────
     @app.get("/suggestions")
     async def suggestions(

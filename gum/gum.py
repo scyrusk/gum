@@ -924,6 +924,23 @@ class gum:
             await add_proposition_feedback(session, prop, rating, note)
             return True
 
+    async def delete_proposition(self, proposition_id: int) -> bool:
+        """Delete a proposition from the model (paper Fig 3B, Memory page).
+
+        The Memory page lets the user curate their own GUM: a proposition that is
+        wrong or that they simply don't want the model to hold can be removed. The
+        row is deleted outright — the observation↔proposition junction cascades
+        (ondelete=CASCADE), the FTS index is kept in sync by the AFTER DELETE
+        trigger, and any feedback rows have their FK nulled (ondelete=SET NULL).
+        Returns False if the proposition no longer exists so callers can 404.
+        """
+        async with self._session() as session:
+            prop = await session.get(Proposition, proposition_id)
+            if prop is None:
+                return False
+            await session.delete(prop)
+            return True
+
     async def review_progress(self) -> tuple[int, int]:
         """Return (total_propositions, reviewed_count)."""
         async with self._session() as session:
