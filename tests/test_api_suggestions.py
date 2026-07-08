@@ -121,6 +121,52 @@ class SuggestionsEndpointTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("surfaced_only", body)
         self.assertIn("Add a project", body)
 
+    async def test_feedback_recorded_as_observation(self):
+        # A thumbs vote is fed back into the GUM as an observation (paper §4.3)
+        # so future suggestions reflect what the user found useful. Exercised
+        # against the real batcher on the same thread the gum was built on.
+        ok = await self.gum.add_suggestion_feedback(
+            title="Rent a suit in Chicago",
+            vote="down",
+            description="Found three suit-rental shops near the venue.",
+            focus="Wedding",
+        )
+        self.assertTrue(ok)
+        item = self.gum.batcher._queue.get()
+        self.assertEqual(item["observer_name"], "gumbo_feedback")
+        self.assertIn("did not find helpful", item["content"])
+        self.assertIn("Rent a suit in Chicago", item["content"])
+        self.assertIn("Wedding", item["content"])
+
+    async def test_feedback_bad_vote_records_nothing(self):
+        ok = await self.gum.add_suggestion_feedback(title="x", vote="sideways")
+        self.assertFalse(ok)
+        self.assertEqual(self.gum.batcher.size(), 0)
+
+    def test_feedback_endpoint_wires_to_gum(self):
+        # The POST endpoint hands the vote to the GUM and reports the result.
+        # (batcher.push is patched: its SQLite queue is bound to the gum's
+        # creation thread, while TestClient runs endpoints on another thread.)
+        app = create_app(self.gum)
+        with mock.patch.object(self.gum.batcher, "push") as push:
+            with TestClient(app) as client:
+                good = client.post("/suggestions/feedback", json={
+                    "title": "Rent a suit in Chicago", "vote": "up", "focus": "Wedding",
+                })
+                bad = client.post("/suggestions/feedback", json={"title": "x", "vote": "nope"})
+        self.assertTrue(good.json()["ok"])
+        self.assertFalse(bad.json()["ok"])
+        push.assert_called_once()
+        self.assertEqual(push.call_args.kwargs["observer_name"], "gumbo_feedback")
+        self.assertIn("found helpful", push.call_args.kwargs["content"])
+
+    def test_gumbo_page_has_feedback_controls(self):
+        app = create_app(self.gum)
+        with TestClient(app) as client:
+            body = client.get("/gumbo").text
+        self.assertIn("/suggestions/feedback", body)
+        self.assertIn("Was this useful?", body)
+
     def test_sanitize_scrubs_suggestion_text(self):
         # Under --sanitize, the model-written text is pseudonymized on the way out
         # while numeric scores pass through unchanged.
