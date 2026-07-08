@@ -933,3 +933,37 @@ class gum:
         """Return the most recent true/false judgments (newest first)."""
         async with self._session() as session:
             return await get_recent_feedback(session, limit=limit)
+
+    async def add_suggestion_feedback(
+        self,
+        *,
+        title: str,
+        vote: str,
+        description: str | None = None,
+        focus: str | None = None,
+    ) -> bool:
+        """Record the user's thumbs up/down on a GUMBO suggestion as an observation.
+
+        Feeding reactions back in as observations closes the mixed-initiative loop
+        (paper §4.3): a thumbs-down on a proactive suggestion is itself evidence
+        about the user, so GUMBO submits it through the same batching pipeline as
+        any other observation. Future propositions — and thus future suggestions —
+        then reflect what the user actually found useful. Returns False for an
+        unrecognized vote so callers can validate input.
+        """
+        vote = (vote or "").strip().lower()
+        if vote not in ("up", "down"):
+            return False
+        reaction = "found helpful" if vote == "up" else "did not find helpful"
+        title = (title or "").strip() or "(untitled)"
+        parts = [f'{self.user_name} {reaction} a proactive GUMBO suggestion titled "{title}".']
+        if description and description.strip():
+            parts.append(f"The suggestion was: {description.strip()}")
+        if focus and focus.strip():
+            parts.append(f"(project focus: {focus.strip()})")
+        self.batcher.push(
+            observer_name="gumbo_feedback",
+            content=" ".join(parts),
+            content_type="input_text",
+        )
+        return True

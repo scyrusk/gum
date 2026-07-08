@@ -89,6 +89,18 @@
   .score b { font-weight: 800; }
   .eu { margin-left: auto; font-size: 12px; color: var(--muted); font-weight: 600; align-self: center; }
 
+  .actions { display: flex; align-items: center; gap: 8px; margin-top: 16px;
+             padding-top: 14px; border-top: 1px solid var(--border); }
+  .fb-label { font-size: 13px; color: var(--muted); margin-right: 2px; }
+  .fb { border: 1px solid var(--border); border-radius: 9px; background: var(--card); color: var(--text);
+        padding: 5px 11px; font-size: 15px; line-height: 1; cursor: pointer; transition: border-color .12s, background .12s; }
+  .fb:hover { border-color: var(--accent); }
+  .fb:active { transform: translateY(1px); }
+  .fb.chosen { border-color: var(--surface); background: var(--surface-bg); }
+  .actions.done .fb { cursor: default; opacity: .55; }
+  .actions.done .fb.chosen { opacity: 1; }
+  .fb-thanks { font-size: 13px; color: var(--surface); font-weight: 600; margin-left: 2px; }
+
   .center { text-align: center; padding: 70px 20px; color: var(--muted); }
   .center h2 { color: var(--text); font-size: 20px; margin: 0 0 8px; }
   .big { font-size: 44px; margin-bottom: 10px; }
@@ -236,8 +248,10 @@
       : '<span class="badge quiet">Keeping quiet</span>';
     const eu = (typeof s.expected_utility === 'number')
       ? `<span class="eu">EU ${s.expected_utility.toFixed(1)}</span>` : '';
+    const attr = (v) => esc(v).replace(/"/g, '&quot;');
     return `
-      <div class="card${s.should_surface ? ' surfaced' : ''}">
+      <div class="card${s.should_surface ? ' surfaced' : ''}"
+           data-title="${attr(s.title || '')}" data-desc="${attr(s.description || '')}">
         <div class="card-head">
           <h3 class="title">${esc(s.title)}</h3>
           ${badge}
@@ -251,8 +265,53 @@
           ${scoreChip('Cost if missed', s.cost_if_missed)}
           ${eu}
         </div>
+        <div class="actions">
+          <span class="fb-label">Was this useful?</span>
+          <button class="fb" data-vote="up" title="Helpful — GUMBO learns from this">👍</button>
+          <button class="fb" data-vote="down" title="Not helpful — GUMBO learns from this">👎</button>
+        </div>
       </div>`;
   }
+
+  // ── Feedback (thumbs) ─────────────────────────────────────────────────────
+  // A reaction is itself an observation about the user (paper §4.3): POST it so
+  // the GUM learns which proactive suggestions land and future ones improve.
+  async function sendFeedback(card, vote) {
+    const actions = card.querySelector('.actions');
+    if (actions.classList.contains('done')) return;
+    actions.classList.add('done');
+    actions.querySelector(`.fb[data-vote="${vote}"]`).classList.add('chosen');
+    const body = {
+      title: card.dataset.title || '',
+      description: card.dataset.desc || '',
+      vote,
+    };
+    if (active !== ALL) body.focus = active;
+    try {
+      const r = await fetch('/suggestions/feedback', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      const thanks = document.createElement('span');
+      thanks.className = 'fb-thanks';
+      thanks.textContent = vote === 'up' ? 'Thanks — noted 👍' : 'Thanks — GUMBO will adjust';
+      actions.appendChild(thanks);
+    } catch (e) {
+      // Let the user try again if the write didn't land.
+      actions.classList.remove('done');
+      actions.querySelector(`.fb[data-vote="${vote}"]`).classList.remove('chosen');
+      actions.querySelector('.fb-label').textContent = "Couldn't save — try again";
+    }
+  }
+
+  main.addEventListener('click', (e) => {
+    const btn = e.target.closest('.fb');
+    if (!btn) return;
+    const card = btn.closest('.card');
+    if (card) sendFeedback(card, btn.dataset.vote);
+  });
 
   surfacedOnly.addEventListener('change', () => load());
   renderTabs();

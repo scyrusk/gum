@@ -34,6 +34,13 @@ class ReviewIn(BaseModel):
     note: str | None = None  # optional free-text context from the user
 
 
+class SuggestionFeedbackIn(BaseModel):
+    title: str  # the suggestion the user reacted to (for the observation text)
+    vote: str  # "up" | "down"
+    description: str | None = None  # suggestion body, for richer context
+    focus: str | None = None  # active project tab, if any
+
+
 async def _scrub(text: str | None, sanitizer) -> str | None:
     """Pseudonymize *text* when a sanitizer is active, else return it unchanged."""
     if sanitizer is None or not text:
@@ -149,6 +156,21 @@ def create_app(gum_instance: gum, *, sanitize: bool = False) -> FastAPI:
             "focus": focus,
             "suggestions": [await _serialize_suggestion(s, sanitizer) for s in results],
         }
+
+    @app.post("/suggestions/feedback")
+    async def suggestions_feedback(body: SuggestionFeedbackIn) -> dict[str, Any]:
+        # Thumbs up/down on a proactive suggestion (paper §4.3). The reaction is
+        # fed back into the GUM as an observation so future suggestions reflect
+        # what the user actually finds useful — closing the mixed-initiative loop.
+        if body.vote not in ("up", "down"):
+            return {"ok": False, "error": "vote must be 'up' or 'down'"}
+        ok = await gum_instance.add_suggestion_feedback(
+            title=body.title,
+            vote=body.vote,
+            description=body.description,
+            focus=body.focus,
+        )
+        return {"ok": ok}
 
     # ── GUMBO assistant desktop UI ────────────────────────────────────────
     @app.get("/gumbo", response_class=HTMLResponse)
