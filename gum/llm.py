@@ -561,3 +561,30 @@ async def structured_completion(
         f"structured_completion failed after {retries} attempts for model "
         f"'{model}': {last_err}"
     )
+
+
+async def text_completion(
+    client: AsyncOpenAI,
+    model: str,
+    messages: list[dict[str, Any]],
+    *,
+    temperature: float | None = None,
+    logger: logging.Logger | None = None,
+) -> str:
+    """Call the model and return its plain-text reply (no schema/JSON coercion).
+
+    Used for free-form conversation — e.g. GUMBO's "Start Chat" (paper §4.3.3) —
+    where we want prose, not structured output. Shares the same inference
+    semaphore so it competes fairly with the rest of the local pipeline.
+    """
+    log = logger or logging.getLogger("gum.llm")
+    kwargs: dict[str, Any] = {"model": model, "messages": list(messages)}
+    if temperature is not None:
+        kwargs["temperature"] = temperature
+    try:
+        async with inference_semaphore():
+            rsp = await client.chat.completions.create(**kwargs)
+        return (rsp.choices[0].message.content or "").strip()
+    except Exception as exc:
+        log.warning("text_completion call failed for model '%s': %s", model, exc)
+        raise

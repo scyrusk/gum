@@ -100,6 +100,26 @@
   .actions.done .fb { cursor: default; opacity: .55; }
   .actions.done .fb.chosen { opacity: 1; }
   .fb-thanks { font-size: 13px; color: var(--surface); font-weight: 600; margin-left: 2px; }
+  .chatbtn { margin-left: auto; border: 1px solid var(--accent); border-radius: 9px;
+             background: var(--accent); color: #fff; padding: 6px 13px; font-size: 13px;
+             font-weight: 600; cursor: pointer; }
+  .chatbtn:hover { filter: brightness(1.08); }
+  .chatbtn:active { transform: translateY(1px); }
+
+  /* "Start Chat" panel (paper §4.3.3) — talk to GUMBO about a suggestion */
+  .chat { margin-top: 14px; padding-top: 14px; border-top: 1px solid var(--border); }
+  .chat-log { display: flex; flex-direction: column; gap: 10px; margin-bottom: 12px; }
+  .msg { max-width: 82%; padding: 9px 13px; border-radius: 14px; font-size: 14px; line-height: 1.45; white-space: pre-wrap; }
+  .msg.user { align-self: flex-end; background: var(--accent); color: #fff; border-bottom-right-radius: 5px; }
+  .msg.assistant { align-self: flex-start; background: var(--chip); color: var(--text); border-bottom-left-radius: 5px; }
+  .msg.pending { color: var(--muted); font-style: italic; }
+  .chat-input { display: flex; gap: 8px; }
+  .chat-input textarea { flex: 1; resize: none; border: 1px solid var(--border); border-radius: 10px;
+             background: var(--card); color: var(--text); padding: 9px 12px; font: inherit; font-size: 14px; min-height: 40px; }
+  .chat-input textarea:focus { outline: none; border-color: var(--accent); }
+  .chat-send { border: none; border-radius: 10px; background: var(--accent); color: #fff;
+             padding: 0 16px; font: inherit; font-size: 14px; font-weight: 600; cursor: pointer; }
+  .chat-send:disabled { opacity: .5; cursor: default; }
 
   .center { text-align: center; padding: 70px 20px; color: var(--muted); }
   .center h2 { color: var(--text); font-size: 20px; margin: 0 0 8px; }
@@ -288,7 +308,8 @@
     const attr = (v) => esc(v).replace(/"/g, '&quot;');
     return `
       <div class="card${s.should_surface ? ' surfaced' : ''}"
-           data-title="${attr(s.title || '')}" data-desc="${attr(s.description || '')}">
+           data-title="${attr(s.title || '')}" data-desc="${attr(s.description || '')}"
+           data-rationale="${attr(s.rationale || '')}">
         <div class="card-head">
           <h3 class="title">${esc(s.title)}</h3>
           ${badge}
@@ -306,6 +327,7 @@
           <span class="fb-label">Was this useful?</span>
           <button class="fb" data-vote="up" title="Helpful — GUMBO learns from this">👍</button>
           <button class="fb" data-vote="down" title="Not helpful — GUMBO learns from this">👎</button>
+          <button class="chatbtn" data-action="chat" title="Talk to GUMBO about this suggestion">💬 Start Chat</button>
         </div>
       </div>`;
   }
@@ -423,11 +445,88 @@
   }
 
   main.addEventListener('click', (e) => {
+    const chatBtn = e.target.closest('.chatbtn');
+    if (chatBtn) { toggleChat(chatBtn.closest('.card')); return; }
     const btn = e.target.closest('.fb');
     if (!btn) return;
     const card = btn.closest('.card');
     if (card) sendFeedback(card, btn.dataset.vote);
   });
+
+  // ── Start Chat (paper §4.3.3) ─────────────────────────────────────────────
+  // Open an inline conversation with GUMBO about a specific suggestion. The
+  // running turns are POSTed to /suggestions/chat, where the local text model
+  // replies grounded in the same high-confidence propositions the suggestion
+  // came from. Each card keeps its own conversation state.
+  function toggleChat(card) {
+    const existing = card.querySelector('.chat');
+    if (existing) { existing.remove(); return; }
+    const suggestion = {
+      title: card.dataset.title || '',
+      description: card.dataset.desc || '',
+      rationale: card.dataset.rationale || '',
+    };
+    const turns = [];  // {role, content}
+    const chat = document.createElement('div');
+    chat.className = 'chat';
+    chat.innerHTML = `
+      <div class="chat-log"></div>
+      <div class="chat-input">
+        <textarea rows="1" placeholder="Ask GUMBO to go deeper, draft, or plan…"></textarea>
+        <button class="chat-send">Send</button>
+      </div>`;
+    card.appendChild(chat);
+    const log = chat.querySelector('.chat-log');
+    const box = chat.querySelector('textarea');
+    const send = chat.querySelector('.chat-send');
+
+    function addMsg(role, text, cls) {
+      const el = document.createElement('div');
+      el.className = 'msg ' + role + (cls ? ' ' + cls : '');
+      el.textContent = text;
+      log.appendChild(el);
+      log.scrollTop = log.scrollHeight;
+      return el;
+    }
+
+    async function submit() {
+      const text = box.value.trim();
+      if (!text || send.disabled) return;
+      box.value = '';
+      addMsg('user', text);
+      turns.push({ role: 'user', content: text });
+      send.disabled = true;
+      const pending = addMsg('assistant', 'GUMBO is thinking…', 'pending');
+      try {
+        const body = { messages: turns, suggestion };
+        if (active !== ALL) body.focus = active;
+        const r = await fetch('/suggestions/chat', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body),
+        });
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+        const data = await r.json();
+        if (!data.ok) throw new Error(data.error || 'chat failed');
+        pending.classList.remove('pending');
+        pending.textContent = data.reply || '(no reply)';
+        turns.push({ role: 'assistant', content: data.reply || '' });
+      } catch (err) {
+        pending.classList.remove('pending');
+        pending.style.opacity = '.7';
+        pending.textContent = "Couldn't reach GUMBO — " + (err && err.message || err);
+        turns.pop();  // drop the unanswered user turn so a retry is clean
+      }
+      send.disabled = false;
+      box.focus();
+    }
+
+    send.addEventListener('click', submit);
+    box.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); submit(); }
+    });
+    box.focus();
+  }
 
   surfacedOnly.addEventListener('change', () => load());
 
