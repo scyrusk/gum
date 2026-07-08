@@ -106,6 +106,21 @@ class SuggestionsEndpointTests(unittest.IsolatedAsyncioTestCase):
                 resp = client.get("/suggestions", params={"limit": 1})
         self.assertEqual(len(resp.json()["suggestions"]), 1)
 
+    def test_gumbo_page_served(self):
+        # The desktop-style GUMBO assistant page is served as static HTML and
+        # wires itself to the /suggestions endpoint (project tabs pass `focus`).
+        app = create_app(self.gum)
+        with TestClient(app) as client:
+            resp = client.get("/gumbo")
+        self.assertEqual(resp.status_code, 200)
+        self.assertIn("text/html", resp.headers["content-type"])
+        body = resp.text
+        self.assertIn("GUMBO", body)
+        self.assertIn("/suggestions?", body)
+        # Project tabs and the mixed-initiative surfacing toggle are present.
+        self.assertIn("surfaced_only", body)
+        self.assertIn("Add a project", body)
+
     def test_sanitize_scrubs_suggestion_text(self):
         # Under --sanitize, the model-written text is pseudonymized on the way out
         # while numeric scores pass through unchanged.

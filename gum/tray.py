@@ -92,6 +92,7 @@ class GumTray:
             rumps.MenuItem("Search GUM…", callback=self._on_search),
             self._recent_menu,
             None,
+            rumps.MenuItem("Open GUMBO Assistant", callback=self._on_gumbo),
             rumps.MenuItem("Open Review UI", callback=self._on_review),
             rumps.MenuItem("Open Logs", callback=self._on_logs),
         ]
@@ -251,6 +252,13 @@ class GumTray:
         if prop.get("reasoning"):
             parts.append(f"\nReasoning:\n{prop['reasoning'].strip()}")
         self._rumps.alert(title="Proposition", message="\n".join(parts))
+
+    def _on_gumbo(self, _sender=None) -> None:
+        if not daemon.is_running():
+            self._rumps.alert("GUM is not running", "Start GUM first to open the GUMBO assistant.")
+            return
+        # The daemon's API serves the GUMBO assistant page at "/gumbo".
+        webbrowser.open(_api_base() + "/gumbo")
 
     def _on_review(self, _sender=None) -> None:
         if not daemon.is_running():
