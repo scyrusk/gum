@@ -17,8 +17,9 @@ from __future__ import annotations
 import logging
 import os
 import re
+import time
 from dataclasses import asdict, dataclass
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 
 from .gum import gum
 from .llm import structured_completion, text_completion
@@ -40,6 +41,12 @@ DEFAULT_NUM_SUGGESTIONS = 5
 # makes the model emit near-duplicate suggestions, and surfacing the same idea
 # twice is exactly the kind of noise mixed-initiative interaction tries to avoid.
 DEFAULT_DEDUP_THRESHOLD = 0.6
+# Even after the mixed-initiative filter, the paper (§4.3.2) found suggestions
+# would "pour through the decision boundary" because Horvitz's framework treats
+# each interruption as independent, whereas the cost of *another* notification
+# depends on how many the user already got this minute. So GUMBO adds a
+# token-bucketing rate limit on top, capped at ~1 surfaced suggestion per minute.
+DEFAULT_SURFACE_INTERVAL = 60.0
 
 
 def _env_int(name: str, default: int) -> int:
@@ -73,6 +80,54 @@ def lexical_overlap(a: str, b: str) -> float:
     if not ta or not tb:
         return 0.0
     return len(ta & tb) / len(ta | tb)
+
+
+class TokenBucket:
+    """A classic token bucket (paper §4.3.2, [17]) for rate-limiting surfacing.
+
+    Starts full with *capacity* tokens and regains one token every
+    *refill_seconds*, never exceeding *capacity*. :meth:`take` withdraws whole
+    tokens (one per suggestion we want to surface) and returns how many were
+    granted — so with capacity 1 and refill 60s, at most one suggestion surfaces
+    per minute, with no burst beyond a single held token.
+
+    The clock is injectable (defaults to a monotonic wall clock) so callers can
+    drive it deterministically in tests and so time only ever moves forward.
+    """
+
+    def __init__(
+        self,
+        capacity: float,
+        refill_seconds: float,
+        *,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self.capacity = float(capacity)
+        self.refill_seconds = float(refill_seconds)
+        self._clock = clock
+        self._tokens = self.capacity
+        self._last = clock()
+
+    def _refill(self) -> None:
+        now = self._clock()
+        elapsed = max(0.0, now - self._last)
+        self._last = now
+        if self.refill_seconds > 0:
+            self._tokens = min(self.capacity, self._tokens + elapsed / self.refill_seconds)
+
+    @property
+    def available(self) -> float:
+        """Tokens currently available (after accounting for elapsed refill)."""
+        self._refill()
+        return self._tokens
+
+    def take(self, max_n: int) -> int:
+        """Withdraw up to *max_n* whole tokens; return the number granted (>= 0)."""
+        self._refill()
+        n = min(int(max_n), int(self._tokens))
+        if n > 0:
+            self._tokens -= n
+        return n
 
 
 @dataclass
@@ -131,6 +186,8 @@ class Gumbo:
         max_propositions: int | None = None,
         num_suggestions: int | None = None,
         dedup_threshold: float | None = None,
+        surface_interval: float | None = None,
+        clock: Callable[[], float] = time.monotonic,
         logger: logging.Logger | None = None,
     ) -> None:
         self.gum = gum_instance
@@ -149,6 +206,17 @@ class Gumbo:
         self.dedup_threshold = (
             dedup_threshold if dedup_threshold is not None
             else _env_float("GUMBO_DEDUP_THRESHOLD", DEFAULT_DEDUP_THRESHOLD)
+        )
+        self.surface_interval = (
+            surface_interval if surface_interval is not None
+            else _env_float("GUMBO_SURFACE_INTERVAL", DEFAULT_SURFACE_INTERVAL)
+        )
+        # One token, refilled once per interval → at most one surfaced suggestion
+        # per interval (paper's ~1/min). A non-positive interval disables the
+        # limit entirely (bucket is None → surface() returns every worthy item).
+        self._bucket = (
+            TokenBucket(1, self.surface_interval, clock=clock)
+            if self.surface_interval > 0 else None
         )
         self.logger = logger or logging.getLogger("gum.gumbo")
 
@@ -254,6 +322,34 @@ class Gumbo:
         # Filter repeats (paper §4.3.2) *after* ranking, so each de-duplicated
         # cluster is represented by its highest-utility member.
         return self._dedupe(suggestions, seen=seen)
+
+    # ── surfacing (rate-limited notifications) ───────────────────────────────
+    async def surface(
+        self,
+        focus: str | None = None,
+        *,
+        seen: Iterable[str] | None = None,
+    ) -> list[Suggestion]:
+        """The suggestions worth *interrupting* the user with, right now.
+
+        Runs the full pipeline (:meth:`generate` → rank → de-dup), keeps only the
+        mixed-initiative-surfaced ones, then applies the paper's token-bucket rate
+        limit (§4.3.2) so at most ~1 surfaces per minute even when several clear
+        the expected-utility bar in the same poll. Because the bucket lives on the
+        (shared) engine, that cap holds *across* successive calls, not just within
+        one. With the limit disabled it returns every worthy suggestion.
+        """
+        ranked = await self.generate(focus, seen=seen)
+        worthy = [s for s in ranked if s.should_surface]
+        if self._bucket is None or not worthy:
+            return worthy
+        granted = self._bucket.take(len(worthy))
+        if granted < len(worthy):
+            self.logger.debug(
+                "gumbo: rate-limited %d surfaced suggestion(s) to %d this interval",
+                len(worthy), granted,
+            )
+        return worthy[:granted]
 
     # ── conversation ─────────────────────────────────────────────────────────
     async def chat(

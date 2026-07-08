@@ -200,11 +200,21 @@ def create_app(gum_instance: gum, *, sanitize: bool = False) -> FastAPI:
             description="If true, return only suggestions the mixed-initiative filter "
             "would surface (expected utility of interrupting > staying quiet).",
         ),
+        rate_limited: bool = Query(
+            False,
+            description="If true, additionally apply the paper's token-bucket rate "
+            "limit (~1 surfaced suggestion per minute) on top of the mixed-initiative "
+            "filter. Implies surfaced_only. State is shared across requests.",
+        ),
         limit: int = Query(10, ge=1, le=50),
     ) -> dict[str, Any]:
-        results = await gumbo.generate(focus=focus.strip() or None)
-        if surfaced_only:
-            results = [s for s in results if s.should_surface]
+        if rate_limited:
+            # surface() already filters to should_surface and applies the bucket.
+            results = await gumbo.surface(focus=focus.strip() or None)
+        else:
+            results = await gumbo.generate(focus=focus.strip() or None)
+            if surfaced_only:
+                results = [s for s in results if s.should_surface]
         results = results[:limit]
         return {
             "focus": focus,

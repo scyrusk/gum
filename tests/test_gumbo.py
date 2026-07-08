@@ -15,7 +15,7 @@ import uuid
 from unittest import mock
 
 from gum import gum as Gum
-from gum.gumbo import Gumbo, Suggestion, expected_utility, lexical_overlap
+from gum.gumbo import Gumbo, Suggestion, TokenBucket, expected_utility, lexical_overlap
 from gum.models import Proposition
 from gum.schemas import SuggestionItem, SuggestionSchema
 
@@ -38,6 +38,37 @@ class LexicalOverlapTests(unittest.TestCase):
         v = lexical_overlap("rent a suit in chicago", "rent a tuxedo in chicago")
         self.assertGreater(v, 0.0)
         self.assertLess(v, 1.0)
+
+
+class TokenBucketTests(unittest.TestCase):
+    def _clock(self):
+        # A hand-cranked clock so refill is deterministic (no real time / sleeps).
+        self._t = [0.0]
+        return lambda: self._t[0]
+
+    def test_starts_full_and_drains(self):
+        clock = self._clock()
+        b = TokenBucket(1, 60, clock=clock)
+        self.assertEqual(b.take(5), 1)  # one token available, only one granted
+        self.assertEqual(b.take(5), 0)  # empty now
+
+    def test_refills_one_per_interval_and_caps_at_capacity(self):
+        clock = self._clock()
+        b = TokenBucket(1, 60, clock=clock)
+        self.assertEqual(b.take(1), 1)
+        self._t[0] = 59.0  # not yet a full interval
+        self.assertEqual(b.take(1), 0)
+        self._t[0] = 60.0  # exactly one interval → one token back
+        self.assertEqual(b.take(1), 1)
+        # Idle for a long time must not let tokens accumulate past capacity.
+        self._t[0] = 100000.0
+        self.assertEqual(b.take(5), 1)
+
+    def test_take_grants_up_to_capacity(self):
+        clock = self._clock()
+        b = TokenBucket(3, 10, clock=clock)
+        self.assertEqual(b.take(5), 3)  # capped at what's available
+        self.assertEqual(b.take(5), 0)
 
 
 class ExpectedUtilityTests(unittest.TestCase):
@@ -218,6 +249,47 @@ class GumboEngineTests(unittest.IsolatedAsyncioTestCase):
                 seen=["Rent a suit in Chicago Find a suit rental shop near the wedding venue in Chicago."]
             )
         self.assertEqual(suggestions, [])  # already surfaced earlier → withheld
+
+    async def _two_surfaced_completion(self, client, model, messages, schema, **kwargs):
+        # Two distinct, high-value/low-intrusion suggestions — both clear the
+        # mixed-initiative bar, so only the rate limit should hold them back.
+        return SuggestionSchema(suggestions=[
+            SuggestionItem(
+                title="Rent a suit in Chicago",
+                description="Find a suit rental shop near the wedding venue.",
+                rationale="Wedding + no formal wear.",
+                probability_useful=9, benefit=9, cost_if_wrong=2, cost_if_missed=7,
+            ),
+            SuggestionItem(
+                title="Book a hotel near the venue",
+                description="Reserve a room close to the ceremony.",
+                rationale="Travel logistics.",
+                probability_useful=8, benefit=8, cost_if_wrong=2, cost_if_missed=6,
+            ),
+        ])
+
+    async def test_surface_rate_limits_to_one_per_interval(self):
+        t = [0.0]
+        engine = Gumbo(self.gum, min_confidence=7, surface_interval=60, clock=lambda: t[0])
+        with mock.patch("gum.gumbo.structured_completion", side_effect=self._two_surfaced_completion):
+            # Two clear the EU bar, but the token bucket only lets one through.
+            first = await engine.surface()
+            self.assertEqual(len(first), 1)
+            self.assertEqual(first[0].title, "Rent a suit in Chicago")  # highest utility
+
+            # A second poll within the same minute surfaces nothing.
+            self.assertEqual(await engine.surface(), [])
+
+            # After a full interval the bucket refills and one surfaces again.
+            t[0] = 60.0
+            again = await engine.surface()
+            self.assertEqual(len(again), 1)
+
+    async def test_surface_disabled_returns_all_worthy(self):
+        engine = Gumbo(self.gum, min_confidence=7, surface_interval=0)  # limit off
+        with mock.patch("gum.gumbo.structured_completion", side_effect=self._two_surfaced_completion):
+            worthy = await engine.surface()
+        self.assertEqual(len(worthy), 2)  # both surfaced, no rate cap
 
     async def test_generate_stays_quiet_without_confident_propositions(self):
         engine = Gumbo(self.gum, min_confidence=10)  # nothing qualifies
