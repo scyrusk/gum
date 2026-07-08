@@ -17,6 +17,7 @@ import json
 import logging
 import os
 import re
+import shutil
 import subprocess
 import tempfile
 from typing import Any, Callable, Type, TypeVar
@@ -131,6 +132,36 @@ def capped_model_name(base_model: str, num_ctx: int) -> str:
     return f"gum-{safe}-ctx{num_ctx}"
 
 
+# Common install locations for the ollama CLI, checked when it isn't on PATH.
+_OLLAMA_BIN_CANDIDATES = (
+    "/usr/local/bin/ollama",
+    "/opt/homebrew/bin/ollama",
+    "/Applications/Ollama.app/Contents/Resources/ollama",
+)
+
+
+def _ollama_bin() -> str:
+    """Resolve the ollama CLI path robustly.
+
+    GUM is often launched from a context with a minimal PATH — a macOS
+    LaunchAgent / menu-bar app, launchd, or cron — that omits /usr/local/bin and
+    Homebrew's bin. A bare ``ollama`` then isn't found, and model provisioning
+    silently falls back to *uncapped* base models (full 128K context, huge KV
+    cache, models evicting each other). So look past PATH: honor an explicit
+    GUM_OLLAMA_BIN override, then PATH, then the usual install locations.
+    """
+    override = os.getenv("GUM_OLLAMA_BIN")
+    if override:
+        return override
+    found = shutil.which("ollama")
+    if found:
+        return found
+    for cand in _OLLAMA_BIN_CANDIDATES:
+        if os.path.exists(cand):
+            return cand
+    return "ollama"  # last resort; raises FileNotFoundError as before if truly absent
+
+
 def ensure_capped_model(base_model: str, num_ctx: int, *, logger: logging.Logger | None = None) -> str:
     """Ensure a lean, context-capped derived model of *base_model* exists in Ollama.
 
@@ -151,8 +182,9 @@ def ensure_capped_model(base_model: str, num_ctx: int, *, logger: logging.Logger
 
     derived = capped_model_name(base_model, num_ctx)
     try:
+        ollama = _ollama_bin()
         listed = subprocess.run(
-            ["ollama", "list"], capture_output=True, text=True, check=True
+            [ollama, "list"], capture_output=True, text=True, check=True
         ).stdout
         if derived in listed:
             return derived
@@ -163,7 +195,7 @@ def ensure_capped_model(base_model: str, num_ctx: int, *, logger: logging.Logger
             modelfile = fh.name
         try:
             subprocess.run(
-                ["ollama", "create", derived, "-f", modelfile],
+                [ollama, "create", derived, "-f", modelfile],
                 capture_output=True, text=True, check=True,
             )
         finally:
