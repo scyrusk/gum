@@ -1,0 +1,262 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>GUMBO · Assistant</title>
+<style>
+  :root {
+    --bg: #f6f7f9; --card: #ffffff; --text: #1a1c1e; --muted: #6b7280;
+    --border: #e5e7eb; --accent: #4f46e5;
+    --surface: #16a34a; --surface-bg: #dcfce7; --quiet: #6b7280;
+    --chip: #eef2ff; --chip-text: #4338ca;
+    --tab-active: #4f46e5; --tab-bg: #ffffff;
+    --shadow: 0 1px 3px rgba(0,0,0,.06), 0 8px 24px rgba(0,0,0,.06);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0f1115; --card: #191c22; --text: #e6e8eb; --muted: #9aa1ab;
+      --border: #2a2f38; --accent: #818cf8;
+      --surface: #4ade80; --surface-bg: #14361f; --quiet: #9aa1ab;
+      --chip: #232a44; --chip-text: #b3bdf5;
+      --tab-active: #818cf8; --tab-bg: #191c22;
+      --shadow: 0 1px 3px rgba(0,0,0,.4), 0 10px 30px rgba(0,0,0,.35);
+    }
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; }
+  body {
+    background: var(--bg); color: var(--text); -webkit-font-smoothing: antialiased;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    line-height: 1.5;
+  }
+  header {
+    position: sticky; top: 0; z-index: 5; background: var(--bg);
+    border-bottom: 1px solid var(--border);
+  }
+  .bar { max-width: 860px; margin: 0 auto; display: flex; align-items: center; gap: 14px; padding: 14px 20px 0; }
+  .logo { font-weight: 700; letter-spacing: .3px; font-size: 18px; }
+  .logo span { color: var(--accent); }
+  .sub { color: var(--muted); font-size: 13px; }
+  .grow { flex: 1; }
+  .toolbtn {
+    border: 1px solid var(--border); border-radius: 10px; background: var(--card); color: var(--text);
+    padding: 7px 12px; font-size: 13px; font-weight: 600; cursor: pointer; display: inline-flex; gap: 6px; align-items: center;
+  }
+  .toolbtn:hover { border-color: var(--accent); }
+  .toolbtn:active { transform: translateY(1px); }
+  .toggle { display: inline-flex; align-items: center; gap: 7px; font-size: 13px; color: var(--muted); cursor: pointer; user-select: none; }
+  .toggle input { accent-color: var(--accent); width: 15px; height: 15px; }
+
+  /* Project tabs */
+  .tabs { max-width: 860px; margin: 0 auto; display: flex; align-items: center; gap: 4px;
+          padding: 10px 20px 0; overflow-x: auto; }
+  .tab {
+    position: relative; white-space: nowrap; border: none; background: none; color: var(--muted);
+    padding: 9px 14px 12px; font: inherit; font-size: 14px; font-weight: 600; cursor: pointer;
+    border-bottom: 2px solid transparent; display: inline-flex; align-items: center; gap: 7px;
+  }
+  .tab:hover { color: var(--text); }
+  .tab.active { color: var(--tab-active); border-bottom-color: var(--tab-active); }
+  .tab .x { opacity: 0; font-weight: 700; font-size: 15px; line-height: 1; color: var(--muted);
+            border-radius: 5px; padding: 0 3px; }
+  .tab:hover .x { opacity: .7; }
+  .tab .x:hover { opacity: 1; color: var(--text); background: var(--border); }
+  .tab-add { color: var(--muted); font-size: 18px; font-weight: 700; padding: 6px 12px; border: none;
+             background: none; cursor: pointer; border-radius: 8px; }
+  .tab-add:hover { color: var(--accent); background: var(--chip); }
+
+  main { max-width: 860px; margin: 0 auto; padding: 24px 20px 80px; }
+
+  .card {
+    background: var(--card); border: 1px solid var(--border); border-radius: 16px;
+    box-shadow: var(--shadow); padding: 20px 22px; margin-bottom: 14px; animation: pop .18s ease;
+  }
+  .card.surfaced { border-color: var(--surface); }
+  @keyframes pop { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
+
+  .card-head { display: flex; align-items: flex-start; gap: 12px; }
+  .title { font-size: 18px; font-weight: 650; line-height: 1.3; margin: 0; flex: 1; }
+  .badge { font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: .05em;
+           padding: 4px 9px; border-radius: 999px; white-space: nowrap; }
+  .badge.surface { color: var(--surface); background: var(--surface-bg); }
+  .badge.quiet { color: var(--quiet); background: var(--chip); }
+  .desc { margin: 10px 0 0; font-size: 15px; }
+  .rationale { color: var(--muted); font-size: 14px; border-left: 3px solid var(--border); padding-left: 12px; margin: 12px 0 0; }
+
+  .scores { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 14px; }
+  .score { font-size: 12px; background: var(--chip); color: var(--chip-text); padding: 4px 10px; border-radius: 999px; font-weight: 600; }
+  .score b { font-weight: 800; }
+  .eu { margin-left: auto; font-size: 12px; color: var(--muted); font-weight: 600; align-self: center; }
+
+  .center { text-align: center; padding: 70px 20px; color: var(--muted); }
+  .center h2 { color: var(--text); font-size: 20px; margin: 0 0 8px; }
+  .big { font-size: 44px; margin-bottom: 10px; }
+  .spinner { width: 26px; height: 26px; border: 3px solid var(--border); border-top-color: var(--accent);
+             border-radius: 50%; animation: spin .8s linear infinite; margin: 0 auto 14px; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+</style>
+</head>
+<body>
+<header>
+  <div class="bar">
+    <div class="logo">GUMBO<span>·</span>Assistant</div>
+    <div class="grow"></div>
+    <label class="toggle" title="Only show suggestions the mixed-initiative filter would surface">
+      <input type="checkbox" id="surfacedOnly" /> Worth surfacing only
+    </label>
+    <button class="toolbtn" id="refreshBtn" onclick="load(true)">↻ Refresh</button>
+  </div>
+  <div class="tabs" id="tabs"></div>
+</header>
+
+<main id="main">
+  <div class="center"><div class="spinner"></div>Thinking…</div>
+</main>
+
+<script>
+  // ── Project tabs ──────────────────────────────────────────────────────────
+  // The "All" tab uses no focus; each project tab passes its name as the
+  // `focus` query param so GUMBO pulls related propositions for that project
+  // (paper §4.3.1). Tabs are the user's own organizing labels, persisted
+  // locally so the desktop app remembers them between sessions.
+  const TABS_KEY = 'gumbo.tabs.v1';
+  const ACTIVE_KEY = 'gumbo.activeTab.v1';
+  const ALL = '__all__';
+
+  const main = document.getElementById('main');
+  const tabsEl = document.getElementById('tabs');
+  const surfacedOnly = document.getElementById('surfacedOnly');
+
+  let projects = loadProjects();
+  let active = localStorage.getItem(ACTIVE_KEY) || ALL;
+  if (active !== ALL && !projects.includes(active)) active = ALL;
+  let busy = false;
+
+  function loadProjects() {
+    try { const v = JSON.parse(localStorage.getItem(TABS_KEY)); return Array.isArray(v) ? v : []; }
+    catch { return []; }
+  }
+  function saveProjects() { localStorage.setItem(TABS_KEY, JSON.stringify(projects)); }
+
+  const esc = (s) => (s ?? '').replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
+
+  function renderTabs() {
+    const mk = (key, label, removable) => {
+      const b = document.createElement('button');
+      b.className = 'tab' + (key === active ? ' active' : '');
+      b.appendChild(document.createTextNode(label));
+      if (removable) {
+        const x = document.createElement('span');
+        x.className = 'x'; x.textContent = '×'; x.title = 'Remove project';
+        x.onclick = (e) => { e.stopPropagation(); removeProject(key); };
+        b.appendChild(x);
+      }
+      b.onclick = () => selectTab(key);
+      return b;
+    };
+    tabsEl.replaceChildren();
+    tabsEl.appendChild(mk(ALL, 'All', false));
+    for (const p of projects) tabsEl.appendChild(mk(p, p, true));
+    const add = document.createElement('button');
+    add.className = 'tab-add'; add.textContent = '+'; add.title = 'Add a project';
+    add.onclick = addProject;
+    tabsEl.appendChild(add);
+  }
+
+  function selectTab(key) {
+    if (key === active) return;
+    active = key;
+    localStorage.setItem(ACTIVE_KEY, active);
+    renderTabs();
+    load();
+  }
+
+  function addProject() {
+    const name = (prompt('Name this project (GUMBO focuses suggestions on it):') || '').trim();
+    if (!name) return;
+    if (name.length > 60) { alert('Please keep project names under 60 characters.'); return; }
+    if (!projects.includes(name)) { projects.push(name); saveProjects(); }
+    selectTab(name);
+    renderTabs();
+  }
+
+  function removeProject(name) {
+    projects = projects.filter(p => p !== name);
+    saveProjects();
+    if (active === name) { active = ALL; localStorage.setItem(ACTIVE_KEY, active); }
+    renderTabs();
+    load();
+  }
+
+  // ── Suggestions ───────────────────────────────────────────────────────────
+  async function load(force) {
+    if (busy) return;
+    busy = true;
+    main.innerHTML = '<div class="center"><div class="spinner"></div>Thinking…</div>';
+    const params = new URLSearchParams();
+    if (active !== ALL) params.set('focus', active);
+    if (surfacedOnly.checked) params.set('surfaced_only', 'true');
+    params.set('limit', '20');
+    try {
+      const r = await fetch('/suggestions?' + params.toString());
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      const data = await r.json();
+      render(data.suggestions || []);
+    } catch (e) {
+      main.innerHTML = '<div class="center"><h2>Couldn\'t reach GUMBO</h2><p>'
+        + esc(String(e && e.message || e)) + '</p><p>Is GUM running?</p></div>';
+    }
+    busy = false;
+  }
+
+  function render(suggestions) {
+    if (!suggestions.length) {
+      const focused = active !== ALL;
+      main.innerHTML = `
+        <div class="center">
+          <div class="big">🫧</div>
+          <h2>Nothing to suggest right now</h2>
+          <p>${focused
+            ? 'GUMBO has no confident propositions related to <b>' + esc(active) + '</b> yet.'
+            : 'GUMBO stays quiet until it is confident enough to help. Let GUM keep observing.'}</p>
+        </div>`;
+      return;
+    }
+    main.innerHTML = suggestions.map(cardHtml).join('');
+  }
+
+  function scoreChip(label, val) {
+    return `<span class="score">${label} <b>${val}</b>/10</span>`;
+  }
+
+  function cardHtml(s) {
+    const badge = s.should_surface
+      ? '<span class="badge surface">Worth surfacing</span>'
+      : '<span class="badge quiet">Keeping quiet</span>';
+    const eu = (typeof s.expected_utility === 'number')
+      ? `<span class="eu">EU ${s.expected_utility.toFixed(1)}</span>` : '';
+    return `
+      <div class="card${s.should_surface ? ' surfaced' : ''}">
+        <div class="card-head">
+          <h3 class="title">${esc(s.title)}</h3>
+          ${badge}
+        </div>
+        ${s.description ? `<p class="desc">${esc(s.description)}</p>` : ''}
+        ${s.rationale ? `<p class="rationale">${esc(s.rationale)}</p>` : ''}
+        <div class="scores">
+          ${scoreChip('Useful', s.probability_useful)}
+          ${scoreChip('Benefit', s.benefit)}
+          ${scoreChip('Cost if wrong', s.cost_if_wrong)}
+          ${scoreChip('Cost if missed', s.cost_if_missed)}
+          ${eu}
+        </div>
+      </div>`;
+  }
+
+  surfacedOnly.addEventListener('change', () => load());
+  renderTabs();
+  load();
+</script>
+</body>
+</html>

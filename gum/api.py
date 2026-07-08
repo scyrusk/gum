@@ -150,6 +150,14 @@ def create_app(gum_instance: gum, *, sanitize: bool = False) -> FastAPI:
             "suggestions": [await _serialize_suggestion(s, sanitizer) for s in results],
         }
 
+    # ── GUMBO assistant desktop UI ────────────────────────────────────────
+    @app.get("/gumbo", response_class=HTMLResponse)
+    async def gumbo_page() -> str:
+        # A single-page desktop-style front-end (project tabs + suggestion
+        # cards) over the /suggestions endpoint above. The page is static; it
+        # inherits the server's sanitize posture through that endpoint.
+        return (_STATIC_DIR / "gumbo.html").read_text()
+
     # ── proposition review ────────────────────────────────────────────────
     @app.get("/", response_class=HTMLResponse)
     async def review_page() -> str:
