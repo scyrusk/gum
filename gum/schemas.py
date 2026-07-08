@@ -71,6 +71,40 @@ class RelationSchema(BaseModel):
         }
     )
 
+class SuggestionItem(BaseModel):
+    """A single proactive suggestion GUMBO derives from the user's GUM.
+
+    The four score fields feed the mixed-initiative expected-utility decision
+    (Horvitz [36]) that GUMBO uses to decide whether a suggestion is worth
+    surfacing — see gum.gumbo.expected_utility. All scores are on a 1 (low) to
+    10 (high) scale so the local text model has a consistent, easy target.
+    """
+    title: str = Field(..., description="Short imperative title, e.g. 'Draft the wedding-travel budget'")
+    description: str = Field(..., description="What GUMBO proposes to do or has already drafted on the user's behalf")
+    rationale: str = Field(..., description="Why this is relevant right now, grounded in the provided propositions")
+    probability_useful: int = Field(
+        ..., description="How likely the user finds any value in this suggestion, P(useful), from 1 (low) to 10 (high)"
+    )
+    benefit: int = Field(
+        ..., description="Benefit to the user if the suggestion is completed, from 1 (low) to 10 (high)"
+    )
+    cost_if_wrong: int = Field(
+        ..., description="Cost of interrupting the user with this if it is not useful (false positive), from 1 to 10"
+    )
+    cost_if_missed: int = Field(
+        ..., description="Cost to the user of never seeing this if it is useful (false negative), from 1 to 10"
+    )
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class SuggestionSchema(BaseModel):
+    suggestions: List[SuggestionItem] = Field(
+        ..., description="Candidate suggestions for the user, most relevant first"
+    )
+    model_config = ConfigDict(extra="forbid")
+
+
 def get_schema(json_schema):
     return {
         "type": "json_schema",
