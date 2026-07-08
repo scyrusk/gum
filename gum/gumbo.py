@@ -16,8 +16,9 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from dataclasses import asdict, dataclass
-from typing import Any
+from typing import Any, Iterable
 
 from .gum import gum
 from .llm import structured_completion, text_completion
@@ -33,6 +34,12 @@ DEFAULT_MIN_CONFIDENCE = 7
 # the text model's context window (see DEFAULT_TEXT_NUM_CTX in llm.py).
 DEFAULT_MAX_PROPOSITIONS = 20
 DEFAULT_NUM_SUGGESTIONS = 5
+# Two suggestions whose title+description share at least this fraction of their
+# words (Jaccard token overlap) are treated as repeats. The paper (§4.3.2) filters
+# repeats "using lexical overlap heuristics"; a slew of related propositions often
+# makes the model emit near-duplicate suggestions, and surfacing the same idea
+# twice is exactly the kind of noise mixed-initiative interaction tries to avoid.
+DEFAULT_DEDUP_THRESHOLD = 0.6
 
 
 def _env_int(name: str, default: int) -> int:
@@ -40,6 +47,32 @@ def _env_int(name: str, default: int) -> int:
         return int(os.getenv(name, str(default)))
     except (TypeError, ValueError):
         return default
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+
+
+_TOKEN_RE = re.compile(r"[a-z0-9]+")
+
+
+def _tokens(text: str) -> set[str]:
+    return set(_TOKEN_RE.findall((text or "").lower()))
+
+
+def lexical_overlap(a: str, b: str) -> float:
+    """Jaccard token overlap between two strings, in [0, 1].
+
+    1.0 means the two share every word; 0.0 means no word in common. Used to spot
+    near-duplicate suggestions (paper §4.3.2's "lexical overlap heuristics").
+    """
+    ta, tb = _tokens(a), _tokens(b)
+    if not ta or not tb:
+        return 0.0
+    return len(ta & tb) / len(ta | tb)
 
 
 @dataclass
@@ -97,6 +130,7 @@ class Gumbo:
         min_confidence: int | None = None,
         max_propositions: int | None = None,
         num_suggestions: int | None = None,
+        dedup_threshold: float | None = None,
         logger: logging.Logger | None = None,
     ) -> None:
         self.gum = gum_instance
@@ -111,6 +145,10 @@ class Gumbo:
         self.num_suggestions = (
             num_suggestions if num_suggestions is not None
             else _env_int("GUMBO_NUM_SUGGESTIONS", DEFAULT_NUM_SUGGESTIONS)
+        )
+        self.dedup_threshold = (
+            dedup_threshold if dedup_threshold is not None
+            else _env_float("GUMBO_DEDUP_THRESHOLD", DEFAULT_DEDUP_THRESHOLD)
         )
         self.logger = logger or logging.getLogger("gum.gumbo")
 
@@ -144,12 +182,48 @@ class Gumbo:
                 lines.append(f"   reasoning: {p.reasoning.strip()}")
         return "\n".join(lines)
 
+    # ── de-duplication ───────────────────────────────────────────────────────
+    def _dedupe(
+        self,
+        suggestions: list[Suggestion],
+        seen: Iterable[str] | None = None,
+    ) -> list[Suggestion]:
+        """Drop near-duplicate suggestions via lexical overlap (paper §4.3.2).
+
+        *suggestions* is assumed already ranked best-first, so when two overlap we
+        keep the earlier (higher-utility) one. *seen* is an optional set of already
+        surfaced suggestion texts (title/description) — used to suppress repeats
+        across successive polls, not just within one batch. A threshold of 0 turns
+        de-duplication off.
+        """
+        if self.dedup_threshold <= 0:
+            return suggestions
+
+        kept: list[Suggestion] = []
+        kept_texts: list[str] = [t for t in (seen or []) if t and t.strip()]
+        for s in suggestions:
+            text = f"{s.title} {s.description}"
+            if any(lexical_overlap(text, prev) >= self.dedup_threshold for prev in kept_texts):
+                self.logger.debug("gumbo: dropping near-duplicate suggestion %r", s.title)
+                continue
+            kept.append(s)
+            kept_texts.append(text)
+        return kept
+
     # ── generation ───────────────────────────────────────────────────────────
-    async def generate(self, focus: str | None = None) -> list[Suggestion]:
+    async def generate(
+        self,
+        focus: str | None = None,
+        *,
+        seen: Iterable[str] | None = None,
+    ) -> list[Suggestion]:
         """Return scored suggestions for the user, ranked by expected utility.
 
-        Returns an empty list when there aren't enough confident propositions to
-        ground a suggestion — GUMBO stays quiet rather than guessing.
+        Near-duplicate suggestions are filtered out by lexical overlap (paper
+        §4.3.2); pass *seen* (already surfaced title/description strings) to also
+        suppress repeats carried over from an earlier poll. Returns an empty list
+        when there aren't enough confident propositions to ground a suggestion —
+        GUMBO stays quiet rather than guessing.
         """
         props = await self.select_propositions(focus)
         if not props:
@@ -177,7 +251,9 @@ class Gumbo:
         suggestions = [self._score(item) for item in result.suggestions]
         # Rank by expected utility so the most worth-surfacing float to the top.
         suggestions.sort(key=lambda s: s.expected_utility, reverse=True)
-        return suggestions
+        # Filter repeats (paper §4.3.2) *after* ranking, so each de-duplicated
+        # cluster is represented by its highest-utility member.
+        return self._dedupe(suggestions, seen=seen)
 
     # ── conversation ─────────────────────────────────────────────────────────
     async def chat(

@@ -15,9 +15,29 @@ import uuid
 from unittest import mock
 
 from gum import gum as Gum
-from gum.gumbo import Gumbo, Suggestion, expected_utility
+from gum.gumbo import Gumbo, Suggestion, expected_utility, lexical_overlap
 from gum.models import Proposition
 from gum.schemas import SuggestionItem, SuggestionSchema
+
+
+class LexicalOverlapTests(unittest.TestCase):
+    def test_identical_is_one(self):
+        self.assertEqual(lexical_overlap("rent a suit", "rent a suit"), 1.0)
+
+    def test_disjoint_is_zero(self):
+        self.assertEqual(lexical_overlap("rent suit", "book flight"), 0.0)
+
+    def test_case_and_punctuation_insensitive(self):
+        # "Rent a Suit!" and "rent a suit" tokenize identically.
+        self.assertEqual(lexical_overlap("Rent a Suit!", "rent a suit"), 1.0)
+
+    def test_empty_is_zero(self):
+        self.assertEqual(lexical_overlap("", "rent a suit"), 0.0)
+
+    def test_partial_overlap_between_zero_and_one(self):
+        v = lexical_overlap("rent a suit in chicago", "rent a tuxedo in chicago")
+        self.assertGreater(v, 0.0)
+        self.assertLess(v, 1.0)
 
 
 class ExpectedUtilityTests(unittest.TestCase):
@@ -123,6 +143,81 @@ class GumboEngineTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Omar", prompt_text)
         self.assertIn("wedding in Chicago", prompt_text)
         self.assertNotIn("idly browsing social media", prompt_text)
+
+    async def test_generate_filters_near_duplicate_suggestions(self):
+        # The model emits two phrasings of the same idea plus a distinct one; the
+        # lower-utility near-duplicate should be dropped, keeping the best of the pair.
+        async def fake_completion(client, model, messages, schema, **kwargs):
+            return SuggestionSchema(suggestions=[
+                SuggestionItem(
+                    title="Rent a suit in Chicago",
+                    description="Find a suit rental shop near the wedding venue in Chicago.",
+                    rationale="Wedding + no formal wear.",
+                    probability_useful=9, benefit=9, cost_if_wrong=2, cost_if_missed=7,
+                ),
+                SuggestionItem(  # near-duplicate of the first, but lower utility
+                    title="Rent a suit in Chicago soon",
+                    description="Find a suit rental shop near the wedding venue in Chicago today.",
+                    rationale="Same idea, restated.",
+                    probability_useful=6, benefit=6, cost_if_wrong=3, cost_if_missed=4,
+                ),
+                SuggestionItem(
+                    title="Book a hotel near the venue",
+                    description="Reserve a room close to the ceremony.",
+                    rationale="Travel logistics.",
+                    probability_useful=8, benefit=7, cost_if_wrong=2, cost_if_missed=5,
+                ),
+            ])
+
+        engine = Gumbo(self.gum, min_confidence=7)
+        with mock.patch("gum.gumbo.structured_completion", side_effect=fake_completion):
+            suggestions = await engine.generate()
+
+        titles = [s.title for s in suggestions]
+        self.assertEqual(len(suggestions), 2)
+        self.assertIn("Rent a suit in Chicago", titles)  # higher-utility survivor kept
+        self.assertNotIn("Rent a suit in Chicago soon", titles)  # near-dup dropped
+        self.assertIn("Book a hotel near the venue", titles)  # distinct idea kept
+
+    async def test_generate_dedup_disabled_by_zero_threshold(self):
+        async def fake_completion(client, model, messages, schema, **kwargs):
+            return SuggestionSchema(suggestions=[
+                SuggestionItem(
+                    title="Rent a suit in Chicago",
+                    description="Find a suit rental shop.",
+                    rationale="x", probability_useful=9, benefit=9,
+                    cost_if_wrong=2, cost_if_missed=7,
+                ),
+                SuggestionItem(
+                    title="Rent a suit in Chicago",
+                    description="Find a suit rental shop.",
+                    rationale="x", probability_useful=9, benefit=9,
+                    cost_if_wrong=2, cost_if_missed=7,
+                ),
+            ])
+
+        engine = Gumbo(self.gum, min_confidence=7, dedup_threshold=0.0)
+        with mock.patch("gum.gumbo.structured_completion", side_effect=fake_completion):
+            suggestions = await engine.generate()
+        self.assertEqual(len(suggestions), 2)  # nothing filtered
+
+    async def test_generate_suppresses_already_seen_across_polls(self):
+        async def fake_completion(client, model, messages, schema, **kwargs):
+            return SuggestionSchema(suggestions=[
+                SuggestionItem(
+                    title="Rent a suit in Chicago",
+                    description="Find a suit rental shop near the wedding venue in Chicago.",
+                    rationale="x", probability_useful=9, benefit=9,
+                    cost_if_wrong=2, cost_if_missed=7,
+                ),
+            ])
+
+        engine = Gumbo(self.gum, min_confidence=7)
+        with mock.patch("gum.gumbo.structured_completion", side_effect=fake_completion):
+            suggestions = await engine.generate(
+                seen=["Rent a suit in Chicago Find a suit rental shop near the wedding venue in Chicago."]
+            )
+        self.assertEqual(suggestions, [])  # already surfaced earlier → withheld
 
     async def test_generate_stays_quiet_without_confident_propositions(self):
         engine = Gumbo(self.gum, min_confidence=10)  # nothing qualifies
