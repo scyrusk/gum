@@ -284,6 +284,64 @@ class SuggestionsEndpointTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("/memory/", body)
         self.assertIn("DELETE", body)
 
+    async def test_memory_edit_updates_proposition(self):
+        # Curating the model (paper Fig 3B): the user corrects a close-but-wrong
+        # proposition instead of deleting it. The edit persists and search reflects
+        # the new text (the FTS AFTER UPDATE trigger keeps the index in sync).
+        async with self.gum._session() as s:
+            s.add(_prop("Omar prefers tea over coffee", 6))
+        async with self.gum._session() as s:
+            row = next(p for p in (await self.gum.recent(limit=50))
+                       if p.text.startswith("Omar prefers tea"))
+            target_id = row.id
+
+        app = create_app(self.gum)
+        with TestClient(app) as client:
+            resp = client.patch(
+                f"/memory/{target_id}",
+                json={"text": "Omar prefers coffee over tea", "confidence": 9},
+            )
+            self.assertEqual(resp.status_code, 200)
+            payload = resp.json()
+            self.assertTrue(payload["ok"])
+            self.assertEqual(payload["proposition"]["text"], "Omar prefers coffee over tea")
+            self.assertEqual(payload["proposition"]["confidence"], 9)
+            # Reasoning was not passed, so it is left untouched.
+            self.assertEqual(payload["proposition"]["reasoning"],
+                             "because of Omar prefers tea over coffee")
+            # The change is durable and the FTS index tracks the new wording.
+            hits = client.get("/memory", params={"q": "coffee"}).json()["propositions"]
+        self.assertTrue(any(p["id"] == target_id and p["text"] == "Omar prefers coffee over tea"
+                            for p in hits))
+
+    async def test_memory_edit_rejects_blank_and_missing(self):
+        async with self.gum._session() as s:
+            s.add(_prop("Omar has a cat", 5))
+        async with self.gum._session() as s:
+            target_id = next(p for p in (await self.gum.recent(limit=50))
+                             if p.text.startswith("Omar has a cat")).id
+
+        app = create_app(self.gum)
+        with TestClient(app) as client:
+            # Blank proposition text is meaningless and is rejected, unchanged.
+            blank = client.patch(f"/memory/{target_id}", json={"text": "   "})
+            self.assertFalse(blank.json()["ok"])
+            # An unknown id reports not-ok rather than erroring.
+            missing = client.patch("/memory/999999", json={"text": "anything"})
+            self.assertFalse(missing.json()["ok"])
+            # The original proposition is intact.
+            still = client.get("/memory").json()["propositions"]
+        self.assertTrue(any(p["id"] == target_id and p["text"] == "Omar has a cat"
+                            for p in still))
+
+    def test_gumbo_page_has_edit_control(self):
+        # The Memory table exposes a per-row Edit action wired to PATCH /memory/.
+        app = create_app(self.gum)
+        with TestClient(app) as client:
+            body = client.get("/gumbo").text
+        self.assertIn("mem-edit", body)
+        self.assertIn("PATCH", body)
+
     def test_chat_replies_grounded_in_propositions(self):
         # "Start Chat" (paper §4.3.3): the local text model answers grounded in
         # the user's high-confidence propositions and the suggestion in scope.
