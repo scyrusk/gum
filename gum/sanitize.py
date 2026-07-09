@@ -224,8 +224,21 @@ class Sanitizer:
 
     def sanitize(self, text: str) -> str:
         """Return *text* with every detected PII span replaced by a pseudo-ID."""
+        return self.sanitize_map(text)[0]
+
+    def sanitize_map(self, text: str) -> tuple[str, dict[str, str]]:
+        """Sanitize *text* and also return the ``{raw_span: pseudo_id}`` map of what
+        was replaced.
+
+        Same output text as :meth:`sanitize`, plus the mapping of each detected
+        real entity to the pseudo-ID it became. Callers use this to expose the
+        pseudo-IDs for entities *they already supplied* (e.g. the terms in a
+        search query) without leaking anything new — it reveals only mappings for
+        text the caller passed in, never for entities elsewhere in the GUM.
+        """
+        aliases: dict[str, str] = {}
         if not text:
-            return text
+            return text, aliases
         pipe = self._ensure_pipeline()
         # Run inference in bounded windows (see MAX_PIPE_CHARS) so one oversized
         # observation can't blow up the O(seq_len^2) forward pass, and push the
@@ -278,9 +291,11 @@ class Sanitizer:
                 end -= 1
             if start >= end:
                 continue
-            pseudo = self._entities.pseudo_for(cat, text[start:end])
+            raw = text[start:end]
+            pseudo = self._entities.pseudo_for(cat, raw)
+            aliases[raw] = pseudo
             text = text[:start] + pseudo + text[end:]
-        return text
+        return text, aliases
 
     def rehydrate(self, text: str) -> tuple[str, int]:
         """Replace every known pseudo-ID in *text* with its original value.

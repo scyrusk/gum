@@ -22,6 +22,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import re
 from contextlib import asynccontextmanager
 from typing import Any
@@ -94,7 +95,9 @@ _INSTRUCTIONS = (
     "it to see the raw observations the model inferred it from when you need the "
     "underlying evidence to ground your work. Content may be pseudonymized "
     "(e.g. [PERSON_1]); treat each pseudo-ID as a stable stand-in for one real "
-    "entity.\n\n"
+    "entity. When the pseudonymized context refers to an entity you named in the "
+    "task, `gather_context` returns a `query_aliases` map (real name -> pseudo-ID) "
+    "so you can tell which propositions concern it.\n\n"
     "The `with_user_context` prompt packages this whole workflow — gather "
     "context, optionally inspect evidence, then execute — for a given task; "
     "clients can offer it to the user as a one-shot action."
@@ -139,6 +142,7 @@ def build_mcp(gum_instance: gum, *, sanitize: bool = True) -> FastMCP:
         topic = (topic or "").strip()
         limit = max(1, min(int(limit), 50))
         search_terms = ""
+        query_aliases: dict[str, str] = {}
         if not topic:
             # An empty topic degrades to "what is the user up to lately", which
             # is a reasonable default rather than an error for an agent probe.
@@ -154,9 +158,21 @@ def build_mcp(gum_instance: gum, *, sanitize: bool = True) -> FastMCP:
                 await _serialize_proposition(p, sanitizer, score)
                 for p, score in results
             ]
+            # Bridge the task->context gap: the returned propositions are
+            # pseudonymized, so an entity the agent named in `topic` (e.g.
+            # "Schmidt") shows up in the context as a pseudo-ID (e.g. "[ORG_1]").
+            # Expose how the topic's own entities map to those pseudo-IDs so the
+            # agent can tell which pseudonymized propositions actually concern the
+            # thing it was asked about. This leaks nothing new — the values come
+            # from the caller's own topic, so it already knows them.
+            if sanitizer is not None:
+                _, query_aliases = await asyncio.to_thread(
+                    sanitizer.sanitize_map, topic
+                )
         return {
             "topic": topic,
             "search_terms": search_terms,
+            "query_aliases": query_aliases,
             "count": len(items),
             "propositions": items,
             "sanitized": sanitizer is not None,
@@ -203,7 +219,9 @@ def build_mcp(gum_instance: gum, *, sanitize: bool = True) -> FastMCP:
             "General User Model (GUM) knows about them:\n"
             f"1. Call `gather_context` with topic \"{task}\" to retrieve the "
             "relevant propositions (each has a `confidence` from 1-10 — weight "
-            "higher-confidence facts more).\n"
+            "higher-confidence facts more). If the context is pseudonymized, use "
+            "the returned `query_aliases` map to see how the entities you named "
+            "(e.g. the funder) appear as pseudo-IDs in it.\n"
             "2. For any proposition you intend to rely on but want evidence for, "
             "call `inspect_proposition` with its `id` to read the underlying "
             "observations.\n"

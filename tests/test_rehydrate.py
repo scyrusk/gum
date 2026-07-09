@@ -90,6 +90,45 @@ class RehydrateTests(unittest.TestCase):
         self.assertIsNone(_PSEUDO_ID_RE.fullmatch("[link]"))
 
 
+class SanitizeMapTests(unittest.TestCase):
+    """sanitize_map() returns both the pseudonymized text and the raw->pseudo map."""
+
+    @staticmethod
+    def _fake_pipe(spans):
+        # Mimics a HuggingFace token-classification pipeline: called with a list of
+        # windows, returns one list of span dicts per window. Short inputs are a
+        # single window, so we return the same spans for the whole (short) text.
+        def pipe(windows, batch_size=None):
+            return [spans for _ in windows]
+
+        return pipe
+
+    def test_sanitize_map_returns_aliases_that_rehydrate_reverses(self):
+        with tempfile.TemporaryDirectory() as d:
+            s = _sanitizer(Path(d))
+            text = "Schmidt Foundation grant"
+            # "Schmidt Foundation" spans chars 0..18 (before " grant").
+            s._pipeline = self._fake_pipe(
+                [{"start": 0, "end": 18, "entity_group": "person", "score": 0.99}]
+            )
+            sanitized, aliases = s.sanitize_map(text)
+
+            self.assertEqual(aliases, {"Schmidt Foundation": "[PERSON_1]"})
+            self.assertEqual(sanitized, "[PERSON_1] grant")
+            # The alias map is the same key rehydrate() uses to reverse the draft.
+            restored, n = s.rehydrate(sanitized)
+            self.assertEqual(restored, text)
+            self.assertEqual(n, 1)
+
+    def test_sanitize_delegates_to_sanitize_map(self):
+        with tempfile.TemporaryDirectory() as d:
+            s = _sanitizer(Path(d))
+            s._pipeline = self._fake_pipe(
+                [{"start": 0, "end": 4, "entity_group": "person", "score": 0.99}]
+            )
+            self.assertEqual(s.sanitize("Omar writes code"), "[PERSON_1] writes code")
+
+
 class RehydrateCliTests(unittest.TestCase):
     """Exercise cmd_rehydrate end-to-end against a real entity map."""
 

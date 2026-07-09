@@ -51,9 +51,15 @@ class _FakeSanitizer:
         self.loaded = True
 
     def sanitize(self, text: str) -> str:
+        return self.sanitize_map(text)[0]
+
+    def sanitize_map(self, text: str) -> tuple[str, dict[str, str]]:
+        aliases: dict[str, str] = {}
         for raw, pseudo in self._mapping.items():
+            if raw in text:
+                aliases[raw] = pseudo
             text = text.replace(raw, pseudo)
-        return text
+        return text, aliases
 
 
 async def _call(mcp, name: str, args: dict) -> dict:
@@ -239,6 +245,40 @@ class SanitizationTests(_Base):
         self.assertIn("[PERSON_1]", text)
         self.assertNotIn("Schmidt", text)
         self.assertNotIn("Omar", text)
+
+    async def test_query_aliases_bridge_task_terms_to_pseudo_ids(self):
+        # The returned propositions are pseudonymized, so "Schmidt" from the
+        # agent's task shows up as "[ORG_1]" in the context. gather_context echoes
+        # a query_aliases map (real -> pseudo) for the entities *in the topic* so
+        # the agent can tell which pseudonymized propositions concern it.
+        import gum.sanitize as sanitize_mod
+
+        fake = _FakeSanitizer({"Schmidt": "[ORG_1]", "Omar": "[PERSON_1]"})
+        original = sanitize_mod.get_sanitizer
+        sanitize_mod.get_sanitizer = lambda: fake
+        try:
+            await self._seed(
+                _prop("Omar is applying for a Schmidt Foundation grant", 9),
+            )
+            mcp = build_mcp(self.gum, sanitize=True)
+            result = await _call(
+                mcp, "gather_context", {"topic": "grant proposal for Schmidt"}
+            )
+        finally:
+            sanitize_mod.get_sanitizer = original
+
+        self.assertEqual(result["query_aliases"], {"Schmidt": "[ORG_1]"})
+        # The alias must match how the entity appears in the returned context.
+        self.assertIn("[ORG_1]", result["propositions"][0]["text"])
+
+    async def test_query_aliases_absent_when_unsanitized(self):
+        # With no sanitizer there are no pseudo-IDs to bridge; the map is empty.
+        await self._seed(_prop("Omar is applying for a Schmidt grant", 9))
+        mcp = build_mcp(self.gum, sanitize=False)
+
+        result = await _call(mcp, "gather_context", {"topic": "Schmidt grant"})
+
+        self.assertEqual(result["query_aliases"], {})
 
 
 class ToolAdvertisingTests(_Base):
