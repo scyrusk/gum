@@ -279,25 +279,35 @@ class Sanitizer:
                     )
                 )
 
-        # Keep confident spans, tagged with our category, ordered by position.
-        kept = [
-            (start, end, cat)
-            for start, end, cat, score in spans
+        # privacy-filter tags with BIOES, which HuggingFace's "simple" aggregation
+        # does not fully coalesce — so one real entity ("Alice Smith", a split
+        # email/phone, or even a single name the tokenizer broke into subwords like
+        # "Sau"+"vik") comes back as several adjacent spans, each scored on its own.
+        # Merge runs of the same category separated only by whitespace, carrying the
+        # run's MAX score, and only THEN apply the confidence threshold.
+        #
+        # Doing the merge before the threshold is the load-bearing part: privacy-
+        # filter routinely scores one subword of a name below min_score (e.g. "Sau"
+        # at 0.44 while "vik" scores 0.87). Filtering per-subword first would drop
+        # that fragment on its own and leave a piece of the real name sitting next
+        # to its [PERSON_N] replacement ("Sau[PERSON_27]") — a partial-identity
+        # leak, and the same way a surname escapes as "[PERSON] Das". Folding the
+        # fragment into the confident span beside it closes that. Merging only ever
+        # grows a span and raises its score, so it can never reduce redaction.
+        spans.sort(key=lambda x: x[0])
+        runs: list[list] = []
+        for start, end, cat, score in spans:
+            if runs and cat == runs[-1][2] and not text[runs[-1][1]:start].strip():
+                runs[-1][1] = max(end, runs[-1][1])
+                runs[-1][3] = max(score, runs[-1][3])
+            else:
+                runs.append([start, end, cat, score])
+
+        merged = [
+            [start, end, cat]
+            for start, end, cat, score in runs
             if score >= self._min_score
         ]
-        kept.sort(key=lambda x: x[0])
-
-        # privacy-filter tags with BIOES, which HuggingFace's "simple" aggregation
-        # does not fully coalesce — so a multi-token entity ("Alice Smith", a split
-        # email/phone) comes back as several adjacent spans. Merge runs of the same
-        # category separated only by whitespace so each real entity maps to ONE
-        # consistent pseudo-ID instead of a garbled string of fragments.
-        merged: list[list] = []
-        for start, end, cat in kept:
-            if merged and cat == merged[-1][2] and not text[merged[-1][1]:start].strip():
-                merged[-1][1] = max(end, merged[-1][1])
-            else:
-                merged.append([start, end, cat])
 
         # Replace right-to-left so each replacement leaves earlier offsets valid.
         for start, end, cat in sorted(merged, key=lambda x: x[0], reverse=True):
