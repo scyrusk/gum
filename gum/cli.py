@@ -467,7 +467,7 @@ def cmd_rehydrate(args) -> None:
     restored PII back through a channel a frontier model reads: only a count of
     substitutions is reported.
     """
-    from gum.sanitize import get_sanitizer
+    from gum.sanitize import find_pseudo_ids, get_sanitizer
 
     src = args.input
     if src and src != "-":
@@ -488,6 +488,20 @@ def cmd_rehydrate(args) -> None:
         print(f"Rehydrated {n} pseudo-ID(s) → {dest}", file=sys.stderr)
     else:
         sys.stdout.write(restored)
+
+    # Any pseudo-ID still present after rehydration had no entry in the local
+    # entity map — typically one the frontier model invented — so it stays as a
+    # placeholder in the user's artifact. Flag it so the leftover isn't shipped
+    # silently. Pseudo-IDs are not PII, so naming them on stderr is safe.
+    leftover = find_pseudo_ids(restored)
+    if leftover:
+        print(
+            f"Warning: {len(leftover)} pseudo-ID(s) could not be restored and "
+            f"remain in the output: {', '.join(leftover)}. They have no entry in "
+            "the local entity map (the model may have invented them); check them "
+            "by hand.",
+            file=sys.stderr,
+        )
 
 
 def cmd_reset_cache(args) -> None:

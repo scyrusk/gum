@@ -19,7 +19,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
-from gum.sanitize import EntityMap, Sanitizer, _PSEUDO_ID_RE
+from gum.sanitize import EntityMap, Sanitizer, _PSEUDO_ID_RE, find_pseudo_ids
 
 
 def _sanitizer(tmp: Path) -> Sanitizer:
@@ -88,6 +88,20 @@ class RehydrateTests(unittest.TestCase):
         self.assertIsNone(_PSEUDO_ID_RE.fullmatch("[person_1]"))
         self.assertIsNone(_PSEUDO_ID_RE.fullmatch("[PERSON]"))
         self.assertIsNone(_PSEUDO_ID_RE.fullmatch("[link]"))
+
+
+class FindPseudoIdsTests(unittest.TestCase):
+    def test_returns_distinct_ids_in_first_seen_order(self):
+        text = "[PERSON_2] met [ORG_1] and [PERSON_2] again, cc [EMAIL_3]."
+        self.assertEqual(
+            find_pseudo_ids(text), ["[PERSON_2]", "[ORG_1]", "[EMAIL_3]"]
+        )
+
+    def test_ignores_non_pseudo_bracketed_text(self):
+        self.assertEqual(find_pseudo_ids("[the docs](x) and [TODO]"), [])
+
+    def test_empty(self):
+        self.assertEqual(find_pseudo_ids(""), [])
 
 
 class SanitizeMapTests(unittest.TestCase):
@@ -159,6 +173,48 @@ class RehydrateCliTests(unittest.TestCase):
             # Status goes to stderr and reports only a count — never the PII.
             self.assertIn("Rehydrated 2", err.getvalue())
             self.assertNotIn("Schmidt", err.getvalue())
+
+    def test_warns_about_unresolved_leftover_pseudo_ids(self):
+        from gum.cli import cmd_rehydrate
+
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            self._seed(tmp)  # only [ORG_1] / [PERSON_1] exist in the map
+            draft = tmp / "draft.md"
+            # [PERSON_9] was never minted — the model invented it.
+            draft.write_text("From [PERSON_1] of [ORG_1], re [PERSON_9].")
+
+            args = SimpleNamespace(input=str(draft), output=None)
+            with mock.patch("gum.sanitize.get_sanitizer", lambda: _sanitizer(tmp)):
+                err = io.StringIO()
+                with redirect_stderr(err):
+                    cmd_rehydrate(args)
+
+            # The known IDs are restored; the invented one stays as a placeholder.
+            self.assertEqual(
+                draft.read_text(), "From Omar Khan of Schmidt Foundation, re [PERSON_9]."
+            )
+            log = err.getvalue()
+            self.assertIn("Rehydrated 2", log)
+            self.assertIn("could not be restored", log)
+            self.assertIn("[PERSON_9]", log)
+
+    def test_no_warning_when_everything_resolves(self):
+        from gum.cli import cmd_rehydrate
+
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            self._seed(tmp)
+            draft = tmp / "draft.md"
+            draft.write_text("To [ORG_1] from [PERSON_1].")
+
+            args = SimpleNamespace(input=str(draft), output=None)
+            with mock.patch("gum.sanitize.get_sanitizer", lambda: _sanitizer(tmp)):
+                err = io.StringIO()
+                with redirect_stderr(err):
+                    cmd_rehydrate(args)
+
+            self.assertNotIn("could not be restored", err.getvalue())
 
     def test_stdin_to_stdout(self):
         from gum.cli import cmd_rehydrate

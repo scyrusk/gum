@@ -79,6 +79,8 @@ some_command | gum rehydrate    # stdin → stdout
 
 `rehydrate` is pure lookup against the local entity map (`~/.cache/gum/entities.db`) — no model loads, and it does **not** need the `[sanitize]` extra. It only reports a *count* of substitutions (never the restored values), so it is safe to run from an agent's shell without re-exposing the PII that sanitization protected — the rehydrated content is written to the file for you, not printed back where a frontier model would read it. Run it only as a trusted, local tail of the workflow; feeding rehydrated text back to an off-device model defeats the point of sanitizing in the first place.
 
+If any placeholder in the artifact has no entry in the entity map — usually a pseudo-ID the model *invented* rather than one that came from the GUM — `rehydrate` leaves it verbatim and prints a **warning** naming the leftover IDs (e.g. `[PERSON_9]`), so an unresolved placeholder is never shipped silently. Pseudo-IDs are not PII, so the warning is safe to see; review those spots by hand before using the document.
+
 ## Sanitizing output for off-device / frontier models
 
 If you want to feed GUM's observations and propositions to a model that runs **off your machine** (e.g. a frontier model behind the MCP), you can have GUM pseudonymize PII on the way out. Detected entities (names, emails, phone numbers, addresses, etc.) are replaced with **consistent pseudo-IDs** — the same real person always reads as `[PERSON_1]`, so the downstream model can still reason that "an email to person X" and "a follow-up text to person X" concern the same person, without ever seeing the real identity.

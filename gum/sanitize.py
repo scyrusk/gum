@@ -171,6 +171,24 @@ class EntityMap:
 _PSEUDO_ID_RE = re.compile(r"\[[A-Z]+_\d+\]")
 
 
+def find_pseudo_ids(text: str) -> list[str]:
+    """Return the distinct pseudo-IDs (``[CATEGORY_N]``) in *text*, first-seen order.
+
+    Run on the *output* of :meth:`Sanitizer.rehydrate`, this surfaces the
+    placeholders that could not be restored to a real value — either invented by
+    a frontier model or absent from the local entity map — so a caller can warn
+    the user that the finished artifact still carries them. Pseudo-IDs are not PII
+    (they are the opaque stand-ins sanitization produced), so listing them is safe
+    even on a channel a model could read.
+    """
+    seen: list[str] = []
+    for match in _PSEUDO_ID_RE.finditer(text or ""):
+        pid = match.group(0)
+        if pid not in seen:
+            seen.append(pid)
+    return seen
+
+
 class Sanitizer:
     """Detects PII spans with a local model and replaces them with pseudo-IDs.
 
