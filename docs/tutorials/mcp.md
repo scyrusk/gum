@@ -63,7 +63,7 @@ Point your MCP client at the command directly (this is the JSON block Claude Des
 }
 ```
 
-It exposes two tools: `gather_context(topic, limit)` (relevance-ranked propositions for a task) and `recent_context(limit)` (a snapshot of recent activity). Sanitization requires the extra (`pip install 'gum-ai[sanitize]'`); for a fully-local, trusted agent you can serve raw propositions with `gum mcp --no-sanitize`.
+It exposes three tools: `gather_context(topic, limit)` (relevance-ranked propositions for a task), `recent_context(limit)` (a snapshot of recent activity), and `inspect_proposition(proposition_id, limit)` (the raw observations backing a proposition, so the agent can ground a draft in the underlying evidence rather than the one-line summary). Sanitization requires the extra (`pip install 'gum-ai[sanitize]'`); for a fully-local, trusted agent you can serve raw propositions with `gum mcp --no-sanitize`.
 
 ## Sanitizing output for off-device / frontier models
 

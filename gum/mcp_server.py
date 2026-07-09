@@ -29,7 +29,7 @@ from mcp.server.fastmcp import FastMCP
 
 # Reuse the exact serialization + egress-sanitization the REST API uses so the
 # two machine-facing surfaces expose propositions identically.
-from .api import _serialize_proposition
+from .api import _serialize_observation, _serialize_proposition
 from .gum import gum
 
 _INSTRUCTIONS = (
@@ -42,8 +42,11 @@ _INSTRUCTIONS = (
     "short description of the task to retrieve the relevant propositions, then "
     "ground your work in them. Use `recent_context` to see what the user has "
     "been doing lately. Higher `confidence` (1-10) means the model is more "
-    "certain. Content may be pseudonymized (e.g. [PERSON_1]); treat each "
-    "pseudo-ID as a stable stand-in for one real entity."
+    "certain. Each proposition carries an `id`; call `inspect_proposition` with "
+    "it to see the raw observations the model inferred it from when you need the "
+    "underlying evidence to ground your work. Content may be pseudonymized "
+    "(e.g. [PERSON_1]); treat each pseudo-ID as a stable stand-in for one real "
+    "entity."
 )
 
 
@@ -116,6 +119,40 @@ def build_mcp(gum_instance: gum, *, sanitize: bool = True) -> FastMCP:
             "count": len(props),
             "propositions": [
                 await _serialize_proposition(p, sanitizer) for p in props
+            ],
+            "sanitized": sanitizer is not None,
+        }
+
+    @mcp.tool(
+        description=(
+            "Fetch the raw observations that back a single proposition, so you "
+            "can ground your work in the underlying evidence rather than the "
+            "one-line summary. Pass the `id` of a proposition returned by "
+            "`gather_context` or `recent_context`. Returns the proposition plus "
+            "its supporting observations (what the user actually did or wrote), "
+            "newest first. `found` is false if that proposition no longer exists."
+        )
+    )
+    async def inspect_proposition(
+        proposition_id: int, limit: int = 5
+    ) -> dict[str, Any]:
+        limit = max(1, min(int(limit), 20))
+        result = await gum_instance.proposition_with_observations(
+            proposition_id, limit=limit
+        )
+        if result is None:
+            return {
+                "found": False,
+                "proposition_id": proposition_id,
+                "evidence": [],
+                "sanitized": sanitizer is not None,
+            }
+        prop, obs = result
+        return {
+            "found": True,
+            "proposition": await _serialize_proposition(prop, sanitizer),
+            "evidence": [
+                await _serialize_observation(o, sanitizer) for o in obs
             ],
             "sanitized": sanitizer is not None,
         }

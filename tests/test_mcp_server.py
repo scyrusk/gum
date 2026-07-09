@@ -15,7 +15,7 @@ import unittest
 import uuid
 
 from gum import gum as Gum
-from gum.models import Proposition
+from gum.models import Observation, Proposition
 from gum.mcp_server import build_mcp
 
 
@@ -27,6 +27,14 @@ def _prop(text: str, confidence: int) -> Proposition:
         decay=5,
         revision_group=uuid.uuid4().hex,
         version=1,
+    )
+
+
+def _obs(content: str) -> Observation:
+    return Observation(
+        observer_name="Screen",
+        content=content,
+        content_type="input_text",
     )
 
 
@@ -117,6 +125,64 @@ class RecentContextTests(_Base):
         self.assertFalse(result["sanitized"])
 
 
+class InspectPropositionTests(_Base):
+    async def _seed_prop_with_evidence(self, prop: Proposition, *contents: str) -> int:
+        async with self.gum._session() as s:
+            for c in contents:
+                prop.observations.add(_obs(c))
+            s.add(prop)
+            await s.flush()
+            return prop.id
+
+    async def test_inspect_returns_supporting_observations(self):
+        # The provenance path: an agent finds a relevant proposition, then drills
+        # into the raw evidence to ground its work.
+        pid = await self._seed_prop_with_evidence(
+            _prop("Omar studies privacy-preserving ML", 8),
+            "Omar typed 'differential privacy budget' into a paper draft",
+            "Omar opened a Schmidt Foundation grant portal",
+        )
+        mcp = build_mcp(self.gum, sanitize=False)
+
+        result = await _call(mcp, "inspect_proposition", {"proposition_id": pid})
+
+        self.assertTrue(result["found"])
+        self.assertEqual(result["proposition"]["id"], pid)
+        contents = [o["content"] for o in result["evidence"]]
+        self.assertEqual(len(contents), 2)
+        self.assertTrue(any("differential privacy" in c for c in contents))
+
+    async def test_inspect_missing_proposition_reports_not_found(self):
+        mcp = build_mcp(self.gum, sanitize=False)
+
+        result = await _call(mcp, "inspect_proposition", {"proposition_id": 424242})
+
+        self.assertFalse(result["found"])
+        self.assertEqual(result["evidence"], [])
+
+    async def test_inspect_pseudonymizes_evidence(self):
+        import gum.sanitize as sanitize_mod
+
+        fake = _FakeSanitizer({"Schmidt": "[ORG_1]", "Omar": "[PERSON_1]"})
+        original = sanitize_mod.get_sanitizer
+        sanitize_mod.get_sanitizer = lambda: fake
+        try:
+            pid = await self._seed_prop_with_evidence(
+                _prop("Omar studies privacy", 8),
+                "Omar opened a Schmidt Foundation grant portal",
+            )
+            mcp = build_mcp(self.gum, sanitize=True)
+            result = await _call(mcp, "inspect_proposition", {"proposition_id": pid})
+        finally:
+            sanitize_mod.get_sanitizer = original
+
+        self.assertTrue(result["sanitized"])
+        content = result["evidence"][0]["content"]
+        self.assertIn("[ORG_1]", content)
+        self.assertNotIn("Schmidt", content)
+        self.assertNotIn("Omar", content)
+
+
 class SanitizationTests(_Base):
     async def test_pii_is_pseudonymized_on_egress(self):
         # The whole point of the gumcp: an external agent must never see raw
@@ -149,7 +215,9 @@ class ToolAdvertisingTests(_Base):
     async def test_tools_are_advertised_to_clients(self):
         mcp = build_mcp(self.gum, sanitize=False)
         names = {t.name for t in await mcp.list_tools()}
-        self.assertEqual(names, {"gather_context", "recent_context"})
+        self.assertEqual(
+            names, {"gather_context", "recent_context", "inspect_proposition"}
+        )
 
 
 if __name__ == "__main__":
