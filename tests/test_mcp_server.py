@@ -16,7 +16,7 @@ import uuid
 
 from gum import gum as Gum
 from gum.models import Observation, Proposition
-from gum.mcp_server import build_mcp
+from gum.mcp_server import build_mcp, _focus_terms
 
 
 def _prop(text: str, confidence: int) -> Proposition:
@@ -109,6 +109,34 @@ class GatherContextTests(_Base):
         result = await _call(mcp, "gather_context", {"topic": "task", "limit": 999})
 
         self.assertLessEqual(result["count"], 50)
+
+    async def test_instruction_verbs_do_not_pollute_retrieval(self):
+        # An agent passes a whole task instruction. The imperative verb "draft"
+        # must not drag in an unrelated proposition just because the user also
+        # happens to draft other things; retrieval runs on the substantive terms.
+        await self._seed(
+            _prop("Omar is applying for a Schmidt Foundation research grant", 9),
+            _prop("Omar frequently drafts and sends emails every morning", 6),
+        )
+        mcp = build_mcp(self.gum, sanitize=False)
+
+        result = await _call(
+            mcp,
+            "gather_context",
+            {"topic": "draft a grant proposal for the Schmidt Foundation"},
+        )
+
+        # The task instruction is reduced to its content words before searching.
+        self.assertEqual(result["search_terms"], "grant proposal schmidt foundation")
+        texts = [p["text"] for p in result["propositions"]]
+        self.assertTrue(any("Schmidt Foundation" in t for t in texts))
+        self.assertFalse(any("drafts and sends emails" in t for t in texts))
+
+    async def test_all_stopword_topic_falls_back_to_raw_terms(self):
+        # A topic that is nothing but stopwords/verbs must still search on
+        # something rather than degrading to an empty (match-everything) query.
+        self.assertEqual(_focus_terms("please help me write it"), "please help me write it")
+        self.assertEqual(_focus_terms("Schmidt grant"), "schmidt grant")
 
 
 class RecentContextTests(_Base):
