@@ -154,6 +154,19 @@ def parse_args():
     p_review.add_argument("--user-name", "-u", type=str)
     p_review.add_argument("--text-model", "-m", type=str)
 
+    p_mcp = sub.add_parser(
+        "mcp",
+        help="Serve the GUM over MCP (stdio) so a local agent can gather sanitized context",
+    )
+    p_mcp.add_argument("--user-name", "-u", type=str)
+    p_mcp.add_argument("--text-model", "-m", type=str)
+    p_mcp.add_argument(
+        "--no-sanitize",
+        action="store_true",
+        help="Serve RAW propositions (default is fail-closed PII sanitization). "
+        "Only for a fully-local, trusted agent.",
+    )
+
     sub.add_parser("tray", help="Launch the macOS menu-bar app (needs the [tray] extra)")
 
     sub.add_parser("reset-cache", help="Delete the GUM cache (~/.cache/gum) and exit")
@@ -407,6 +420,21 @@ async def cmd_review(args) -> None:
     await api_task
 
 
+def cmd_mcp(args) -> None:
+    """Serve the GUM over MCP (stdio) for a local executing agent.
+
+    stdio is the MCP transport: the client (Claude Desktop, Codex, …) launches
+    this process and speaks JSON-RPC over stdin/stdout, so NOTHING may be printed
+    to stdout here — the DB is connected lazily inside the server's own loop and
+    ``run()`` owns the event loop.
+    """
+    from gum.mcp_server import run_stdio
+
+    g = gum(_user_name(args) or "default", _text_model(args))
+    sanitize = not getattr(args, "no_sanitize", False)
+    run_stdio(g, sanitize=sanitize)
+
+
 def cmd_reset_cache(args) -> None:
     cache_dir = os.path.expanduser("~/.cache/gum/")
     if os.path.exists(cache_dir):
@@ -443,6 +471,8 @@ def cli() -> None:
         asyncio.run(cmd_observations(args))
     elif command == "review":
         asyncio.run(cmd_review(args))
+    elif command == "mcp":
+        cmd_mcp(args)
     elif command == "tray":
         from gum.tray import run as run_tray
         run_tray()  # runs the AppKit event loop on the main thread

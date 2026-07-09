@@ -24,7 +24,8 @@ dependencies = [
     "greenlet",
     "persist-queue",
     "fastapi>=0.110.0",
-    "uvicorn[standard]>=0.29.0"
+    "uvicorn[standard]>=0.29.0",
+    "mcp>=1.0.0"
 ]
 requires-python = ">=3.10"
 
