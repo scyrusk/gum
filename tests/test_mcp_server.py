@@ -14,6 +14,8 @@ import tempfile
 import unittest
 import uuid
 
+from mcp.shared.memory import create_connected_server_and_client_session
+
 from gum import gum as Gum
 from gum.models import Observation, Proposition
 from gum.mcp_server import build_mcp, _focus_terms
@@ -275,6 +277,63 @@ class WithUserContextPromptTests(_Base):
         self.assertIn("Schmidt Foundation", text)
         self.assertIn("gather_context", text)
         self.assertIn("inspect_proposition", text)
+
+
+class ClientSessionE2ETests(_Base):
+    """Drive the server the way a real MCP client (Claude/Codex) does.
+
+    The other tests call ``mcp.call_tool`` in-process, which skips the actual
+    client<->server protocol: the initialize handshake, the over-the-wire tool
+    and prompt listings, structured-content serialization, and prompt expansion.
+    Here we connect a real ``ClientSession`` to the server over in-memory streams
+    so the whole plumbing an external agent relies on is exercised end-to-end.
+    """
+
+    async def test_agent_can_discover_and_call_over_the_protocol(self):
+        await self._seed(
+            _prop("Omar is applying for a Schmidt Foundation research grant on privacy", 9),
+            _prop("Omar prefers dark roast coffee in the morning", 6),
+        )
+        mcp = build_mcp(self.gum, sanitize=False)
+
+        async with create_connected_server_and_client_session(mcp) as client:
+            init = await client.initialize()
+            self.assertEqual(init.serverInfo.name, "gum-context")
+
+            # Tools and the prompt are advertised across the wire.
+            tools = {t.name for t in (await client.list_tools()).tools}
+            self.assertEqual(
+                tools, {"gather_context", "recent_context", "inspect_proposition"}
+            )
+            prompts = {p.name for p in (await client.list_prompts()).prompts}
+            self.assertIn("with_user_context", prompts)
+
+            # gather_context returns structured content the agent can parse.
+            called = await client.call_tool(
+                "gather_context", {"topic": "draft a grant proposal for Schmidt"}
+            )
+            self.assertFalse(called.isError)
+            self.assertEqual(called.structuredContent["count"], 1)
+            self.assertFalse(called.structuredContent["sanitized"])
+            prop = called.structuredContent["propositions"][0]
+            self.assertIn("Schmidt Foundation", prop["text"])
+            pid = prop["id"]
+
+            # The provenance drill-down round-trips too (no evidence seeded).
+            inspected = await client.call_tool(
+                "inspect_proposition", {"proposition_id": pid}
+            )
+            self.assertTrue(inspected.structuredContent["found"])
+            self.assertEqual(inspected.structuredContent["proposition"]["id"], pid)
+
+            # The workflow prompt expands with the task threaded through.
+            expanded = await client.get_prompt(
+                "with_user_context",
+                {"task": "draft a grant proposal for the Schmidt Foundation"},
+            )
+            text = expanded.messages[0].content.text
+            self.assertIn("Schmidt Foundation", text)
+            self.assertIn("gather_context", text)
 
 
 if __name__ == "__main__":
