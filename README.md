@@ -83,7 +83,7 @@ pip install "gum-ai[tray]"      # one-time: adds rumps
 gum tray                        # 🧠 appears in the menu bar (💤 when stopped)
 ```
 
-From the menu you can **Start / Stop GUM**, **Search GUM…** (results in a pop-up), skim **Recent Propositions** (click one for its full reasoning and confidence), **Open Review UI**, or **Open Logs**. It drives the same daemon and localhost API as the CLI, so it works alongside everything above.
+From the menu you can **Start / Stop GUM**, **Search GUM…** (results in a pop-up), skim **Recent Propositions** (click one for its full reasoning and confidence), **Open GUMBO Assistant** (the proactive assistant, see below), **Open Review UI**, or **Open Logs**. It drives the same daemon and localhost API as the CLI, so it works alongside everything above.
 
 #### Launch it at login
 
@@ -141,9 +141,24 @@ While the GUM is running it serves a **localhost-only REST API** (default `http:
 curl "http://127.0.0.1:8422/query?q=email&limit=5"
 curl "http://127.0.0.1:8422/recent?limit=5"
 curl "http://127.0.0.1:8422/observations?limit=5"
+
+# GUMBO proactive assistant (paper §4.3): scored, mixed-initiative suggestions,
+# feedback, "Start Chat", and the browsable Memory of raw propositions.
+curl "http://127.0.0.1:8422/suggestions?focus=wedding%20planning&limit=5"
+curl "http://127.0.0.1:8422/memory?q=email&limit=20"
 ```
 
 Or use it from Python directly (`from gum import gum; await gum(...).query("email")`), or wire up the [MCP server](docs/tutorials/mcp.md) for Claude Desktop.
+
+### 8. GUMBO: a proactive assistant
+
+The running daemon also serves **GUMBO**, the paper's proactive assistant (§4.3), as a
+desktop-style page at `http://127.0.0.1:8422/gumbo` (or **Open GUMBO Assistant** in the
+tray). It reads your high-confidence propositions and asks the local text model for
+concrete suggestions, scores them with the mixed-initiative expected-utility decision so
+only the worthwhile ones surface, and lets you thumbs-up/down them, **Start Chat** about
+one, and browse/curate your **Memory** of raw propositions. See the
+[GUMBO tutorial](docs/tutorials/gumbo.md) for the full REST API and configuration.
 
 ### How often does it observe?
 

@@ -62,5 +62,6 @@ nav:
     - Reflection: tutorials/reflection.md
   - API Reference:
     - Core API: api-reference/core.md
+    - GUMBO: api-reference/gumbo.md
     - Models: api-reference/models.md
     - Observers: api-reference/observers.md
