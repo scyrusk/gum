@@ -67,6 +67,18 @@ It exposes three tools: `gather_context(topic, limit)` (relevance-ranked proposi
 
 It also exposes one **prompt**, `with_user_context(task)`, which packages the whole workflow — gather context, optionally inspect the backing evidence, then execute — for a task you give it. Clients that render MCP prompts (e.g. Claude Desktop's slash-command menu) surface it as a one-shot action, so you can pick *"with_user_context"* and type *"draft a grant proposal for the Schmidt Foundation"* to reliably trigger the context-gathering even in clients that don't act on the server's free-text instructions.
 
+#### Rehydrating the finished artifact
+
+Because the context arrives pseudonymized, an artifact the agent produces from it still carries the placeholders (`[PERSON_1]`, `[ORG_1]`, …). The final, **on-device** step restores the real values so *you* get a usable document:
+
+```bash
+gum rehydrate draft.md          # overwrite in place
+gum rehydrate draft.md -o final.md
+some_command | gum rehydrate    # stdin → stdout
+```
+
+`rehydrate` is pure lookup against the local entity map (`~/.cache/gum/entities.db`) — no model loads, and it does **not** need the `[sanitize]` extra. It only reports a *count* of substitutions (never the restored values), so it is safe to run from an agent's shell without re-exposing the PII that sanitization protected — the rehydrated content is written to the file for you, not printed back where a frontier model would read it. Run it only as a trusted, local tail of the workflow; feeding rehydrated text back to an off-device model defeats the point of sanitizing in the first place.
+
 ## Sanitizing output for off-device / frontier models
 
 If you want to feed GUM's observations and propositions to a model that runs **off your machine** (e.g. a frontier model behind the MCP), you can have GUM pseudonymize PII on the way out. Detected entities (names, emails, phone numbers, addresses, etc.) are replaced with **consistent pseudo-IDs** — the same real person always reads as `[PERSON_1]`, so the downstream model can still reason that "an email to person X" and "a follow-up text to person X" concern the same person, without ever seeing the real identity.

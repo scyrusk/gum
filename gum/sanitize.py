@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import os
+import re
 import sqlite3
 import threading
 from datetime import datetime, timezone
@@ -148,6 +149,27 @@ class EntityMap:
             self._conn.commit()
             return pseudo
 
+    def raw_for(self, pseudo_id: str) -> str | None:
+        """Return the original text a *pseudo_id* was minted for, or None.
+
+        The inverse of :meth:`pseudo_for`: this reads the re-identification key so
+        a fully-local, trusted step can turn ``[PERSON_1]`` back into the real
+        name. Pseudo-IDs are globally unique (``[CATEGORY_N]``), so no category is
+        needed to look one up.
+        """
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT raw_text FROM entity_map WHERE pseudo_id=?",
+                (pseudo_id,),
+            ).fetchone()
+        return row[0] if row else None
+
+
+# A minted pseudo-ID is always ``[CATEGORY_N]`` with an uppercase category and a
+# 1-based index (see EntityMap.pseudo_for). Matching that exact shape avoids
+# touching unrelated bracketed text (e.g. Markdown ``[link]``) during rehydration.
+_PSEUDO_ID_RE = re.compile(r"\[[A-Z]+_\d+\]")
+
 
 class Sanitizer:
     """Detects PII spans with a local model and replaces them with pseudo-IDs.
@@ -259,6 +281,35 @@ class Sanitizer:
             pseudo = self._entities.pseudo_for(cat, text[start:end])
             text = text[:start] + pseudo + text[end:]
         return text
+
+    def rehydrate(self, text: str) -> tuple[str, int]:
+        """Replace every known pseudo-ID in *text* with its original value.
+
+        The inverse of :meth:`sanitize`, and the final step of the
+        sanitized-context workflow: an agent gathers pseudonymized context, a
+        frontier model drafts an artifact still carrying ``[PERSON_1]`` /
+        ``[ORG_1]`` placeholders, and this turns them back into real names so the
+        *user* gets a usable document. It is pure DB lookup against the local
+        entity map — no model is loaded — and must only be run in a trusted,
+        on-device step (never fed back to a frontier model, or the PII the
+        pseudonymization protected would leak).
+
+        Pseudo-IDs with no entry in the map (e.g. one the model invented) are left
+        verbatim. Returns ``(rehydrated_text, n_substitutions)``.
+        """
+        if not text:
+            return text, 0
+        count = 0
+
+        def _restore(match: re.Match) -> str:
+            nonlocal count
+            raw = self._entities.raw_for(match.group(0))
+            if raw is None:
+                return match.group(0)
+            count += 1
+            return raw
+
+        return _PSEUDO_ID_RE.sub(_restore, text), count
 
 
 _SINGLETON: Sanitizer | None = None
