@@ -318,6 +318,21 @@ class WithUserContextPromptTests(_Base):
         self.assertIn("gather_context", text)
         self.assertIn("inspect_proposition", text)
 
+    async def test_prompt_closes_the_loop_with_rehydration(self):
+        # The last mile of the motivating flow: a pseudonymized draft is unusable
+        # to the user until `gum rehydrate` restores real names on-device, and the
+        # agent must not guess those names itself. The prompt has to say so, or the
+        # workflow dead-ends with [ORG_1]-laden text in the chat.
+        mcp = build_mcp(self.gum, sanitize=False)
+        result = await mcp.get_prompt(
+            "with_user_context",
+            {"task": "draft a grant proposal for the Schmidt Foundation"},
+        )
+        text = result.messages[0].content.text
+        self.assertIn("gum rehydrate", text)
+        # It must steer the agent away from inventing the real values.
+        self.assertIn("guess", text.lower())
+
 
 class ClientSessionE2ETests(_Base):
     """Drive the server the way a real MCP client (Claude/Codex) does.
