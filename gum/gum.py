@@ -20,6 +20,7 @@ from .db_utils import (
     get_related_observations,
     search_propositions_bm25,
     get_recent_propositions,
+    count_observations,
     get_recent_observations,
     get_next_unreviewed_proposition,
     add_proposition_feedback,
@@ -32,6 +33,7 @@ from .llm import (
     structured_completion,
     resolve_api_base,
     keep_models_warm,
+    release_models,
     keep_warm_enabled,
     resolve_keep_alive,
     resolve_keep_warm_interval,
@@ -152,6 +154,17 @@ class gum:
         self._text_idle_unload = resolve_text_idle_unload()
         self.update_handlers: list[Callable[[Observer, Update], None]] = [self._default_handler]
 
+    def _vision_warm_targets(self) -> list[tuple[str, str]]:
+        """The observers' resident models (e.g. the screen vision model)."""
+        targets: list[tuple[str, str]] = []
+        for obs in self.observers:
+            targets.extend(obs.warm_targets)
+        return targets
+
+    def _all_warm_targets(self) -> list[tuple[str, str]]:
+        """Every local model the GUM keeps warm: observer vision + text model."""
+        return self._vision_warm_targets() + [(self._api_base, self.model)]
+
     def start_update_loop(self):
         """Start the asynchronous update loop for processing observer updates."""
         if self._loop_task is None:
@@ -169,9 +182,7 @@ class gum:
         # cost and only runs on batches, so it's released after a quiet spell
         # (GUM_TEXT_IDLE_UNLOAD) and reloaded on the next batch.
         if self._warm_task is None and keep_warm_enabled():
-            vision_targets: list[tuple[str, str]] = []
-            for obs in self.observers:
-                vision_targets.extend(obs.warm_targets)
+            vision_targets = self._vision_warm_targets()
             text_targets = [(self._api_base, self.model)]
 
             gate = self._text_idle_unload
@@ -209,8 +220,11 @@ class gum:
                 pass
             self._batch_task = None
 
-        # Stop the keep-alive pinger; the models then unload on their own once
-        # their finite keep_alive window lapses.
+        # Stop the keep-alive pinger. Cancelling it alone would leave the models
+        # pinned until their finite keep_alive window lapses (up to ~15m), so
+        # eagerly release them here — a keep_alive=0 ping unloads them from VRAM
+        # right away. This runs even when the pinger was disabled: models loaded
+        # by normal inference otherwise linger on Ollama's default timer.
         if self._warm_task:
             self._warm_task.cancel()
             try:
@@ -218,6 +232,11 @@ class gum:
             except asyncio.CancelledError:
                 pass
             self._warm_task = None
+
+        try:
+            await release_models(self._all_warm_targets(), logger=self.logger)
+        except Exception:  # pragma: no cover - shutdown must not raise
+            self.logger.debug("keep-warm: model release on shutdown failed", exc_info=True)
 
         if self.batcher:
             await self.batcher.stop()
@@ -844,16 +863,37 @@ class gum:
         self,
         *,
         limit: int = 10,
+        offset: int = 0,
+        ascending: bool = False,
         start_time: datetime | None = None,
         end_time: datetime | None = None,
     ) -> list[Observation]:
-        """Return the most recent observations ordered by created_at descending."""
+        """Return observations in the window, ordered by created_at.
+
+        Defaults to newest-first. ``ascending`` plus ``offset`` lets callers page
+        chronologically through a large time window instead of loading it in one shot.
+        """
         async with self._session() as session:
             return await get_recent_observations(
                 session,
                 limit=limit,
+                offset=offset,
+                ascending=ascending,
                 start_time=start_time,
                 end_time=end_time,
+            )
+
+    async def count_observations(
+        self,
+        *,
+        start_time: datetime | None = None,
+        end_time: datetime | None = None,
+    ) -> tuple[int, int]:
+        """Return ``(row_count, total_content_chars)`` for observations in a window
+        without loading any rows — lets a caller size a window before streaming it."""
+        async with self._session() as session:
+            return await count_observations(
+                session, start_time=start_time, end_time=end_time
             )
 
     # ── proposition review / feedback ─────────────────────────────────────────

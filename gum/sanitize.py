@@ -23,6 +23,21 @@ DEFAULT_DB_PATH = "~/.cache/gum/entities.db"
 DEFAULT_MODEL = "openai/privacy-filter"
 DEFAULT_MIN_SCORE = 0.5
 
+# A token-classification forward pass costs O(seq_len^2) in activation memory, and
+# the privacy-filter pipeline does NOT truncate on its own (and truncation would be
+# unacceptable here — it silently drops, and thus leaks, any PII past the cutoff).
+# A single ~50k-char screen observation is ~12k tokens and ballooned the process to
+# tens of GB. So sanitize() feeds the model in windows kept well under its 512-token
+# limit (~4 chars/token) and stitches the detected spans back by a global offset.
+# Tunable: smaller windows = flatter memory but more (cheap) forward passes.
+MAX_PIPE_CHARS = 1200
+
+# Windows are pushed through the pipeline this many at a time. Batching keeps a long
+# observation from becoming dozens of serial forward passes, while the fixed batch
+# size (rather than "all windows at once") keeps peak memory bounded regardless of
+# how large the input is.
+PIPE_BATCH_SIZE = 16
+
 # privacy-filter emits labels for person, email, phone, address, account number,
 # url, date, and secret. `aggregation_strategy="simple"` strips the BIOES prefixes,
 # but the exact spelling of each group varies (e.g. "private_person", "phone_number"),
@@ -49,6 +64,27 @@ def _category_for(entity_group: str) -> str:
         if token in _CATEGORY_MAP:
             return _CATEGORY_MAP[token]
     return "ENTITY"
+
+
+def _iter_windows(text: str, budget: int):
+    """Yield ``(offset, window)`` pairs covering *text* in ≤ *budget*-char slices.
+
+    Each window breaks on the last newline (else space) before the budget so a PII
+    token is not split across a boundary; a run with no whitespace (e.g. one long
+    token) is cut hard rather than allowed to overflow the model's context.
+    """
+    n = len(text)
+    i = 0
+    while i < n:
+        end = min(i + budget, n)
+        if end < n:
+            brk = text.rfind("\n", i, end)
+            if brk <= i:
+                brk = text.rfind(" ", i, end)
+            if brk > i:
+                end = brk
+        yield i, text[i:end]
+        i = end
 
 
 class EntityMap:
@@ -169,14 +205,32 @@ class Sanitizer:
         if not text:
             return text
         pipe = self._ensure_pipeline()
+        # Run inference in bounded windows (see MAX_PIPE_CHARS) so one oversized
+        # observation can't blow up the O(seq_len^2) forward pass, and push the
+        # windows through the pipeline in batches (PIPE_BATCH_SIZE) so a long
+        # observation isn't dozens of serial forward passes. Short text is a single
+        # window, so behavior is unchanged for the common case. Each span's offsets
+        # are then lifted back into the full-text coordinate space.
+        windows = list(_iter_windows(text, MAX_PIPE_CHARS))
         with self._infer_lock:
-            spans = pipe(text)
+            results = list(pipe([w for _, w in windows], batch_size=PIPE_BATCH_SIZE))
+        spans: list[tuple] = []
+        for (base, _window), window_spans in zip(windows, results):
+            for sp in window_spans:
+                spans.append(
+                    (
+                        sp["start"] + base,
+                        sp["end"] + base,
+                        _category_for(sp.get("entity_group", "")),
+                        float(sp.get("score", 0.0)),
+                    )
+                )
 
         # Keep confident spans, tagged with our category, ordered by position.
         kept = [
-            (sp["start"], sp["end"], _category_for(sp.get("entity_group", "")))
-            for sp in spans
-            if float(sp.get("score", 0.0)) >= self._min_score
+            (start, end, cat)
+            for start, end, cat, score in spans
+            if score >= self._min_score
         ]
         kept.sort(key=lambda x: x[0])
 

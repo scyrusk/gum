@@ -433,10 +433,18 @@ async def get_recent_observations(
     session: AsyncSession,
     *,
     limit: int = 10,
+    offset: int = 0,
+    ascending: bool = False,
     start_time: datetime | None = None,
     end_time: datetime | None = None,
 ) -> List[Observation]:
-    """Fetch the most recent observations ordered by created_at desc."""
+    """Fetch observations in the given window, ordered by created_at.
+
+    Defaults to newest-first (descending). Pass ``ascending=True`` for oldest-first,
+    which — together with ``offset`` (skip that many matching rows) — lets a caller
+    page chronologically through a large window (e.g. a full day) without
+    materializing it all at once.
+    """
     if end_time is None:
         end_time = datetime.now(timezone.utc)
     if start_time is not None and start_time.tzinfo is None:
@@ -444,14 +452,52 @@ async def get_recent_observations(
     if end_time.tzinfo is None:
         end_time = end_time.replace(tzinfo=timezone.utc)
 
+    # Order by (created_at, id) so ties on created_at have a stable total order.
+    # Without the id tiebreaker, offset paging could skip or duplicate rows that
+    # share a timestamp across a page boundary (screen observations often do).
+    if ascending:
+        order = (Observation.created_at.asc(), Observation.id.asc())
+    else:
+        order = (Observation.created_at.desc(), Observation.id.desc())
     stmt = (
         select(Observation)
         .where(Observation.created_at <= end_time)
-        .order_by(Observation.created_at.desc())
+        .order_by(*order)
         .limit(limit)
+        .offset(offset)
     )
     if start_time is not None:
         stmt = stmt.where(Observation.created_at >= start_time)
 
     result = await session.execute(stmt)
     return result.scalars().all()
+
+
+async def count_observations(
+    session: AsyncSession,
+    *,
+    start_time: datetime | None = None,
+    end_time: datetime | None = None,
+) -> tuple[int, int]:
+    """Return ``(row_count, total_content_chars)`` for observations in the window.
+
+    Cheap aggregate (no rows loaded) so a caller can size/sample a large window
+    before streaming it — e.g. the daily summary decides how much to sub-sample to
+    stay within a time budget.
+    """
+    if end_time is None:
+        end_time = datetime.now(timezone.utc)
+    if start_time is not None and start_time.tzinfo is None:
+        start_time = start_time.replace(tzinfo=timezone.utc)
+    if end_time.tzinfo is None:
+        end_time = end_time.replace(tzinfo=timezone.utc)
+
+    stmt = select(
+        func.count(Observation.id),
+        func.coalesce(func.sum(func.length(Observation.content)), 0),
+    ).where(Observation.created_at <= end_time)
+    if start_time is not None:
+        stmt = stmt.where(Observation.created_at >= start_time)
+
+    count, chars = (await session.execute(stmt)).one()
+    return int(count), int(chars)

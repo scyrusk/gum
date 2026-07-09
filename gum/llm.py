@@ -398,6 +398,33 @@ async def keep_models_warm(
         await asyncio.sleep(interval)
 
 
+async def release_models(
+    targets: list[tuple[str, str]],
+    *,
+    logger: logging.Logger | None = None,
+) -> None:
+    """Immediately unload each ``(api_base, model)`` from Ollama's memory.
+
+    Sends a native ``/api/generate`` ping with ``keep_alive=0`` so Ollama drops
+    the model from VRAM right away instead of waiting out the remainder of its
+    residency timer. Called on shutdown so stopping the GUM promptly frees the
+    local models (the vision model in particular) rather than leaving them
+    pinned for up to a full keep_alive window after the last ping. Non-Ollama
+    endpoints resolve to nothing and are skipped.
+    """
+    log = logger or logging.getLogger("gum.llm")
+    resolved = resolve_warm_targets(targets)
+    if not resolved:
+        return
+    log.info("keep-warm: releasing %d model(s) from memory on shutdown", len(resolved))
+    for url, model in resolved:
+        try:
+            async with inference_semaphore():
+                await asyncio.to_thread(_native_generate_ping, url, model, 0)
+        except Exception as exc:  # pragma: no cover - network/transport
+            log.debug("keep-warm release failed for %s (%s)", model, exc)
+
+
 def _allow_remote() -> bool:
     return os.getenv("GUM_ALLOW_REMOTE", "").strip().lower() in {"1", "true", "yes", "on"}
 
