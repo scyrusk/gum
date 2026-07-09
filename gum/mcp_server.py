@@ -94,7 +94,10 @@ _INSTRUCTIONS = (
     "it to see the raw observations the model inferred it from when you need the "
     "underlying evidence to ground your work. Content may be pseudonymized "
     "(e.g. [PERSON_1]); treat each pseudo-ID as a stable stand-in for one real "
-    "entity."
+    "entity.\n\n"
+    "The `with_user_context` prompt packages this whole workflow — gather "
+    "context, optionally inspect evidence, then execute — for a given task; "
+    "clients can offer it to the user as a one-shot action."
 )
 
 
@@ -176,6 +179,41 @@ def build_mcp(gum_instance: gum, *, sanitize: bool = True) -> FastMCP:
             ],
             "sanitized": sanitizer is not None,
         }
+
+    @mcp.prompt(
+        name="with_user_context",
+        title="Do a task with the user's GUM context",
+        description=(
+            "Wrap a task so it is carried out with context drawn from the user's "
+            "General User Model. Use this when the task depends on knowing "
+            "something about the user (their projects, collaborators, funders, "
+            "deadlines, writing voice, preferences) — e.g. 'draft a grant "
+            "proposal for the Schmidt Foundation'. Expands into an instruction to "
+            "gather the relevant GUM propositions first, then act on them."
+        ),
+    )
+    def with_user_context(task: str) -> str:
+        # A discoverable entry point for the motivating workflow. Server
+        # `instructions` are advisory and not surfaced by every MCP client, so
+        # this prompt makes "gather context, then execute" a first-class,
+        # user-invocable action that reliably triggers the tool calls.
+        return (
+            f"Task: {task}\n\n"
+            "Before carrying this out, ground yourself in what the user's "
+            "General User Model (GUM) knows about them:\n"
+            f"1. Call `gather_context` with topic \"{task}\" to retrieve the "
+            "relevant propositions (each has a `confidence` from 1-10 — weight "
+            "higher-confidence facts more).\n"
+            "2. For any proposition you intend to rely on but want evidence for, "
+            "call `inspect_proposition` with its `id` to read the underlying "
+            "observations.\n"
+            "3. Then carry out the task, grounded in that context and written in "
+            "the user's voice. Do not invent facts the GUM does not support; if "
+            "the context is thin, say what you would still need.\n\n"
+            "Note: GUM content may be pseudonymized (e.g. [PERSON_1], [ORG_1]); "
+            "treat each pseudo-ID as a stable stand-in for one real entity and "
+            "keep it as-is in anything you produce."
+        )
 
     @mcp.tool(
         description=(

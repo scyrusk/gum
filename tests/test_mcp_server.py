@@ -248,5 +248,34 @@ class ToolAdvertisingTests(_Base):
         )
 
 
+class WithUserContextPromptTests(_Base):
+    async def test_prompt_is_advertised(self):
+        mcp = build_mcp(self.gum, sanitize=False)
+        prompts = await mcp.list_prompts()
+        names = {p.name for p in prompts}
+        self.assertIn("with_user_context", names)
+        prompt = next(p for p in prompts if p.name == "with_user_context")
+        # The task argument is required so a client can collect it from the user.
+        arg_names = {a.name for a in (prompt.arguments or [])}
+        self.assertIn("task", arg_names)
+
+    async def test_prompt_expands_to_context_gathering_instruction(self):
+        mcp = build_mcp(self.gum, sanitize=False)
+        result = await mcp.get_prompt(
+            "with_user_context",
+            {"task": "draft a grant proposal for the Schmidt Foundation"},
+        )
+        self.assertEqual(len(result.messages), 1)
+        msg = result.messages[0]
+        self.assertEqual(msg.role, "user")
+        text = msg.content.text
+        # The task is threaded through and the workflow (gather -> inspect ->
+        # execute) is spelled out so it triggers the tools even in clients that
+        # do not surface the server's free-text instructions.
+        self.assertIn("Schmidt Foundation", text)
+        self.assertIn("gather_context", text)
+        self.assertIn("inspect_proposition", text)
+
+
 if __name__ == "__main__":
     unittest.main()
