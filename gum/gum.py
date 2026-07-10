@@ -51,6 +51,11 @@ from .schemas import (
 from gum.prompts.gum import AUDIT_PROMPT, PROPOSE_PROMPT, REVISE_PROMPT, SIMILAR_PROMPT
 from .batcher import ObservationBatcher
 
+
+class BlacklistReadError(Exception):
+    """Raised when a present blacklist cannot be read safely."""
+
+
 class gum:
     """A class for managing general user models.
 
@@ -438,7 +443,14 @@ class gum:
             .replace("{feedback_examples}", await self._build_feedback_examples(update.content))
             .replace("{inputs}", update.content)
         )
-        prompt += self._blacklist_prompt()
+        try:
+            prompt += self._blacklist_prompt()
+        except BlacklistReadError:
+            # A configured blacklist is a privacy boundary. If the file exists
+            # but cannot be read, do not make a proposition-writing model call
+            # without its rules. A missing file still deliberately means that
+            # filtering is disabled.
+            return []
 
         result = await structured_completion(
             self.client,
@@ -452,10 +464,10 @@ class gum:
     def _blacklist_prompt(self) -> str:
         """Return model instructions for the current line-based blacklist.
 
-        Blank lines and lines beginning with ``#`` are ignored.  Missing files
-        mean no blacklist, while other read errors are logged and leave the
-        prompt unchanged.  The file is deliberately re-read on every call so a
-        running daemon observes edits before its next batch.
+        Blank lines and lines beginning with ``#`` are ignored. Missing files
+        mean no blacklist, while other read errors fail closed by suppressing
+        the proposition-writing call. The file is deliberately re-read on every
+        call so a running daemon observes edits before its next batch.
         """
         try:
             with open(self.blacklist_file, encoding="utf-8") as blacklist:
@@ -466,13 +478,14 @@ class gum:
                 ]
         except FileNotFoundError:
             return ""
-        except OSError as exc:
+        except (OSError, UnicodeError) as exc:
             self.logger.warning(
-                "Could not read proposition blacklist %s: %s",
+                "Could not read proposition blacklist %s; suppressing "
+                "proposition generation: %s",
                 self.blacklist_file,
                 exc,
             )
-            return ""
+            raise BlacklistReadError from exc
 
         if not rules:
             return ""
@@ -646,7 +659,10 @@ proposition would violate a rule, return an empty `propositions` list.
         """
         body = await self._build_revision_body(similar_cluster, related_obs)
         prompt = self.revise_prompt.replace("{body}", body)
-        prompt += self._blacklist_prompt()
+        try:
+            prompt += self._blacklist_prompt()
+        except BlacklistReadError:
+            return []
         result = await structured_completion(
             self.client,
             self.model,

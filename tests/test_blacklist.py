@@ -92,6 +92,38 @@ class PropositionBlacklistTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("Proposition Content Blacklist", first_prompt)
         self.assertIn("Exclude financial credentials.", second_prompt)
 
+    async def test_unreadable_blacklist_suppresses_proposition_writes(self):
+        self.blacklist.write_text("Exclude passwords.\n", encoding="utf-8")
+
+        with (
+            mock.patch("builtins.open", side_effect=PermissionError("denied")),
+            mock.patch("gum.gum.structured_completion") as completion,
+        ):
+            proposed = await self.gum._construct_propositions(
+                Update(content="password visible", content_type="input_text")
+            )
+            revised = await self.gum._revise_propositions(
+                [
+                    Observation(
+                        observer_name="screen",
+                        content="password visible",
+                        content_type="input_text",
+                    )
+                ],
+                [
+                    Proposition(
+                        text="existing proposition",
+                        reasoning="existing evidence",
+                        confidence=5,
+                        decay=5,
+                    )
+                ],
+            )
+
+        self.assertEqual(proposed, [])
+        self.assertEqual(revised, [])
+        completion.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()
