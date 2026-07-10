@@ -67,6 +67,8 @@ class gum:
         audit_prompt (str, optional): Custom prompt for auditing.
         data_directory (str, optional): Directory for storing data. Defaults to "~/.cache/gum".
         db_name (str, optional): Name of the database file. Defaults to "gum.db".
+        blacklist_file (str, optional): One proposition-content rule per line. Defaults to
+            ``blacklist.txt`` in the data directory, or ``GUM_BLACKLIST_FILE`` when set.
 
         verbosity (int, optional): Logging verbosity level. Defaults to logging.INFO.
         audit_enabled (bool, optional): Whether to enable auditing. Defaults to False.
@@ -90,6 +92,7 @@ class gum:
         min_batch_size: int = 5,
         max_batch_size: int = 50,
         batch_timeout: float | None = None,
+        blacklist_file: str | None = None,
     ):
         # basic paths
         data_directory = os.path.expanduser(data_directory)
@@ -135,6 +138,14 @@ class gum:
         self.Session = None
         self._db_name        = db_name
         self._data_directory = data_directory
+        # Rules are read immediately before each proposition-writing model call,
+        # so users can edit the file without restarting the daemon.  An explicit
+        # constructor path wins over the environment; otherwise keep the file
+        # alongside the rest of GUM's local data.
+        configured_blacklist = blacklist_file or os.getenv("GUM_BLACKLIST_FILE")
+        self.blacklist_file = os.path.expanduser(
+            configured_blacklist or os.path.join(data_directory, "blacklist.txt")
+        )
 
         # Initialize batcher if enabled
         self.batcher = ObservationBatcher(
@@ -427,6 +438,7 @@ class gum:
             .replace("{feedback_examples}", await self._build_feedback_examples(update.content))
             .replace("{inputs}", update.content)
         )
+        prompt += self._blacklist_prompt()
 
         result = await structured_completion(
             self.client,
@@ -436,6 +448,48 @@ class gum:
             logger=self.logger,
         )
         return result.propositions
+
+    def _blacklist_prompt(self) -> str:
+        """Return model instructions for the current line-based blacklist.
+
+        Blank lines and lines beginning with ``#`` are ignored.  Missing files
+        mean no blacklist, while other read errors are logged and leave the
+        prompt unchanged.  The file is deliberately re-read on every call so a
+        running daemon observes edits before its next batch.
+        """
+        try:
+            with open(self.blacklist_file, encoding="utf-8") as blacklist:
+                rules = [
+                    line.strip()
+                    for line in blacklist
+                    if line.strip() and not line.lstrip().startswith("#")
+                ]
+        except FileNotFoundError:
+            return ""
+        except OSError as exc:
+            self.logger.warning(
+                "Could not read proposition blacklist %s: %s",
+                self.blacklist_file,
+                exc,
+            )
+            return ""
+
+        if not rules:
+            return ""
+
+        formatted_rules = "\n".join(f"{index}. {rule}" for index, rule in enumerate(rules, 1))
+        return f"""
+
+# Proposition Content Blacklist
+
+The user has defined the following content rules. These rules take priority over
+requests elsewhere in this prompt to generate, preserve, add, merge, or reach a
+minimum number of propositions. Do not output a proposition if either its
+proposition text or its reasoning would violate any rule. If every possible
+proposition would violate a rule, return an empty `propositions` list.
+
+{formatted_rules}
+"""
 
     async def _build_feedback_examples(self, query_text: str = "") -> str:
         """Format the user's judgments as a calibration block for the propose
@@ -592,6 +646,7 @@ class gum:
         """
         body = await self._build_revision_body(similar_cluster, related_obs)
         prompt = self.revise_prompt.replace("{body}", body)
+        prompt += self._blacklist_prompt()
         result = await structured_completion(
             self.client,
             self.model,
