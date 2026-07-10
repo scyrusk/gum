@@ -145,10 +145,22 @@ class PropositionBlacklistTests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertEqual([item.proposition for item in result], ["Omar uses a dark editor theme"])
-        compliance_prompt = completion.call_args_list[1].args[2][0]["content"]
-        self.assertIn("strict proposition-content compliance checker", compliance_prompt)
-        self.assertIn("Do not generate propositions about passwords.", compliance_prompt)
-        self.assertNotIn("empty `propositions` list", compliance_prompt)
+        compliance_messages = completion.call_args_list[1].args[2]
+        self.assertEqual(
+            [message["role"] for message in compliance_messages], ["system", "user"]
+        )
+        compliance_instructions = compliance_messages[0]["content"]
+        candidate_data = compliance_messages[1]["content"]
+        self.assertIn(
+            "strict proposition-content compliance checker", compliance_instructions
+        )
+        self.assertIn(
+            "Do not generate propositions about passwords.", compliance_instructions
+        )
+        self.assertNotIn("empty `propositions` list", compliance_instructions)
+        self.assertNotIn("Omar uses a password manager", compliance_instructions)
+        self.assertIn("Omar uses a password manager", candidate_data)
+        self.assertNotIn("Do not generate propositions about passwords.", candidate_data)
 
     async def test_failed_compliance_check_suppresses_model_output(self):
         self.blacklist.write_text("Exclude passwords.\n", encoding="utf-8")
