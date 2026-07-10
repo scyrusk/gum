@@ -44,6 +44,43 @@ The MCP should then be enabled in the Claude app!
 !!! tip "Running fully local"
     The MCP reads the same local SQLite model (`~/.cache/gum/gum.db`) keyed by `USER_NAME`, so set the **same `USER_NAME`** you gave `gum start`. With the Ollama setup, both the GUM and the MCP operate entirely on-device. (If you prefer a plain HTTP interface over MCP, the running GUM also serves a localhost REST API at `http://127.0.0.1:8422`.)
 
+### Option 3: Built-in `gum mcp` (sanitized by default)
+
+The GUM ships its own MCP server so a local executing agent (Claude Desktop, Codex, …) can pull **sanitized** context on demand — for example, ask your agent to *"draft a grant proposal for the Schmidt Foundation"* and it will call the `gather_context` tool to acquire the relevant propositions from your model before writing, without you pasting anything.
+
+Unlike the external `gumcp` above, this server pseudonymizes PII **on egress and fail-closed** (it will not start if the sanitizer can't load), so raw identities never leave the machine even when the agent relays context to a frontier model.
+
+Point your MCP client at the command directly (this is the JSON block Claude Desktop / Codex use under the hood):
+
+```json
+{
+  "mcpServers": {
+    "gum-context": {
+      "command": "gum",
+      "args": ["mcp", "--user-name", "Omar Shaikh"]
+    }
+  }
+}
+```
+
+It exposes three tools: `gather_context(topic, limit)` (relevance-ranked propositions for a task), `recent_context(limit)` (a snapshot of recent activity), and `inspect_proposition(proposition_id, limit)` (the raw observations backing a proposition, so the agent can ground a draft in the underlying evidence rather than the one-line summary). `gather_context` accepts a whole task instruction as its `topic` — it strips instruction verbs and stopwords (e.g. *"**draft** a grant proposal **for the** …"*) so the search runs on the substantive terms and doesn't drag in propositions that merely share a common word; the terms actually searched are echoed back in the response's `search_terms` field. Because the returned propositions are pseudonymized, an entity you named in the task (e.g. *"Schmidt"*) appears in the context under a pseudo-ID (e.g. `[ORG_1]`); `gather_context` therefore also returns a `query_aliases` map (real name → pseudo-ID) for the entities in your topic, so the agent can tell which pseudonymized propositions actually concern the thing it was asked about. This exposes nothing new — the values come from the agent's own task — it just bridges the task to the sanitized context. Sanitization requires the extra (`pip install 'gum-ai[sanitize]'`); for a fully-local, trusted agent you can serve raw propositions with `gum mcp --no-sanitize`.
+
+It also exposes one **prompt**, `with_user_context(task)`, which packages the whole workflow — gather context, optionally inspect the backing evidence, execute, then hand off for rehydration — for a task you give it. Clients that render MCP prompts (e.g. Claude Desktop's slash-command menu) surface it as a one-shot action, so you can pick *"with_user_context"* and type *"draft a grant proposal for the Schmidt Foundation"* to reliably trigger the context-gathering even in clients that don't act on the server's free-text instructions. The prompt also closes the loop: because the context is pseudonymized, the finished draft still carries `[PERSON_1]` / `[ORG_1]` placeholders, so the prompt instructs the agent **not** to guess the real values but to save the artifact to a file and tell you to run `gum rehydrate <file>` (see below) as the trusted, on-device final step.
+
+#### Rehydrating the finished artifact
+
+Because the context arrives pseudonymized, an artifact the agent produces from it still carries the placeholders (`[PERSON_1]`, `[ORG_1]`, …). The final, **on-device** step restores the real values so *you* get a usable document:
+
+```bash
+gum rehydrate draft.md          # overwrite in place
+gum rehydrate draft.md -o final.md
+some_command | gum rehydrate    # stdin → stdout
+```
+
+`rehydrate` is pure lookup against the local entity map (`~/.cache/gum/entities.db`) — no model loads, and it does **not** need the `[sanitize]` extra. It only reports a *count* of substitutions (never the restored values), so it is safe to run from an agent's shell without re-exposing the PII that sanitization protected — the rehydrated content is written to the file for you, not printed back where a frontier model would read it. Run it only as a trusted, local tail of the workflow; feeding rehydrated text back to an off-device model defeats the point of sanitizing in the first place.
+
+If any placeholder in the artifact has no entry in the entity map — usually a pseudo-ID the model *invented* rather than one that came from the GUM — `rehydrate` leaves it verbatim and prints a **warning** naming the leftover IDs (e.g. `[PERSON_9]`), so an unresolved placeholder is never shipped silently. Pseudo-IDs are not PII, so the warning is safe to see; review those spots by hand before using the document.
+
 ## Sanitizing output for off-device / frontier models
 
 If you want to feed GUM's observations and propositions to a model that runs **off your machine** (e.g. a frontier model behind the MCP), you can have GUM pseudonymize PII on the way out. Detected entities (names, emails, phone numbers, addresses, etc.) are replaced with **consistent pseudo-IDs** — the same real person always reads as `[PERSON_1]`, so the downstream model can still reason that "an email to person X" and "a follow-up text to person X" concern the same person, without ever seeing the real identity.
@@ -69,8 +106,8 @@ gum start --sanitize        # or set GUM_SANITIZE=1
 curl http://127.0.0.1:8422/health   # -> {"sanitized": true, ...}
 ```
 
-!!! warning "The default MCP reads the database directly, bypassing sanitization"
-    As noted above, `gumcp` reads `~/.cache/gum/gum.db` **directly** — so `gum start --sanitize` (which sanitizes the *REST API*, not the raw DB) does **not** automatically sanitize what the MCP returns. To get sanitized data to an off-device model today, either (a) use the CLI `-s` export path above, or (b) point/configure your MCP client to consume the sanitized **REST API** (`http://127.0.0.1:8422`) instead of the raw database. Sanitizing the DB reads directly (a materialized pseudonymized mirror) is a planned follow-up.
+!!! warning "The external `gumcp` reads the database directly, bypassing sanitization"
+    The external `gumcp` (Options 1–2) reads `~/.cache/gum/gum.db` **directly** — so `gum start --sanitize` (which sanitizes the *REST API*, not the raw DB) does **not** automatically sanitize what *that* MCP returns. To get sanitized data to an off-device model with it, either (a) use the CLI `-s` export path above, or (b) point your MCP client at the sanitized **REST API** (`http://127.0.0.1:8422`). The built-in **`gum mcp`** server (Option 3) sidesteps this entirely: it reads the DB directly *and* pseudonymizes every proposition on the way out, fail-closed and on by default.
 
 The entity ↔ pseudo-ID map (the re-identification key) is stored separately in `~/.cache/gum/entities.db`, isolated from the main model so it can be locked down or excluded from any export. Tune detection with `GUM_SANITIZE_MIN_SCORE` and pick the model with `GUM_SANITIZE_MODEL` (see `.env.example`).
 

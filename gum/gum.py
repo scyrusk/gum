@@ -926,6 +926,25 @@ class gum:
                 session, start_time=start_time, end_time=end_time
             )
 
+    async def proposition_with_observations(
+        self, proposition_id: int, *, limit: int = 5
+    ) -> tuple[Proposition, list[Observation]] | None:
+        """Return a proposition and the observations backing it, or None.
+
+        This is the provenance path an external agent uses to *ground* a
+        proposition: ``query``/``recent`` surface the natural-language summary,
+        and this drills into the raw evidence (what the user actually did or
+        wrote) that the model inferred it from, newest-first and capped at
+        ``limit``. Returns None if the proposition no longer exists so callers
+        can report "not found" rather than an empty result.
+        """
+        async with self._session() as session:
+            prop = await session.get(Proposition, proposition_id)
+            if prop is None:
+                return None
+            obs = await get_related_observations(session, proposition_id, limit=limit)
+            return prop, obs
+
     # ── proposition review / feedback ─────────────────────────────────────────
     async def next_for_review(
         self, exclude_ids: set[int] | None = None

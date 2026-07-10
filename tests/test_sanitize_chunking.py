@@ -125,5 +125,83 @@ class SanitizeChunkingTests(unittest.TestCase):
             self.assertEqual(out, "hello [PERSON_1] world")
 
 
+class ScriptedPipe:
+    """Fake pipeline returning a fixed span-list for a single-window input.
+
+    Unlike FakePipe (which detects a needle), this replays exactly the (start,
+    end, entity_group, score) spans it was given, so a test can reproduce the way
+    the real privacy-filter model splits one entity into several subword spans with
+    different confidences. Assumes the text fits in one window.
+    """
+
+    def __init__(self, spans: list[dict]):
+        self._spans = spans
+
+    def __call__(self, inputs, **kwargs):
+        if isinstance(inputs, str):
+            return self._spans
+        return [self._spans for _ in inputs]
+
+
+class SubwordFragmentTests(unittest.TestCase):
+    """Merging same-category adjacent spans BEFORE the score threshold, so a
+    low-confidence subword of a name is never dropped on its own and left leaking a
+    fragment of the real identity next to its pseudo-ID (e.g. "Sau[PERSON_1]")."""
+
+    def _sanitizer(self, tmp: Path, spans: list[dict]) -> Sanitizer:
+        s = Sanitizer(entity_map=EntityMap(db_path=str(tmp / "entities.db")))
+        s._pipeline = ScriptedPipe(spans)
+        return s
+
+    def test_low_confidence_subword_fragment_is_not_leaked(self):
+        # "Sauvik ..." split as "Sau"(0.44, below 0.5) + "vik"(0.87). The old code
+        # dropped "Sau" per-subword and left "Sau[PERSON_1]".
+        text = "Sauvik is busy."
+        spans = [
+            {"start": 0, "end": 3, "entity_group": "person", "score": 0.44},
+            {"start": 3, "end": 6, "entity_group": "person", "score": 0.87},
+        ]
+        with tempfile.TemporaryDirectory() as d:
+            out = self._sanitizer(Path(d), spans).sanitize(text)
+        self.assertNotIn("Sau", out)
+        self.assertEqual(out, "[PERSON_1] is busy.")
+
+    def test_low_confidence_surname_is_not_leaked(self):
+        # "Sauvik Das": surname " Das" scores below threshold on its own.
+        text = "Sauvik Das met them."
+        spans = [
+            {"start": 0, "end": 6, "entity_group": "person", "score": 0.99},
+            {"start": 6, "end": 10, "entity_group": "person", "score": 0.30},
+        ]
+        with tempfile.TemporaryDirectory() as d:
+            out = self._sanitizer(Path(d), spans).sanitize(text)
+        self.assertNotIn("Das", out)
+        self.assertEqual(out, "[PERSON_1] met them.")
+
+    def test_whole_run_below_threshold_is_still_dropped(self):
+        # Merging only elevates a run to its MAX score, so a run where every
+        # subword is below threshold stays un-redacted — no over-redaction.
+        text = "maybe a name here."
+        spans = [
+            {"start": 0, "end": 5, "entity_group": "person", "score": 0.20},
+            {"start": 5, "end": 7, "entity_group": "person", "score": 0.10},
+        ]
+        with tempfile.TemporaryDirectory() as d:
+            out = self._sanitizer(Path(d), spans).sanitize(text)
+        self.assertEqual(out, text)
+
+    def test_adjacent_different_categories_are_not_merged(self):
+        # A confident PERSON next to a low-confidence EMAIL fragment must not pull
+        # the email into the person span; different categories stay separate.
+        text = "AliceX@y"  # PERSON "Alice" then EMAIL-ish "X@y"
+        spans = [
+            {"start": 0, "end": 5, "entity_group": "person", "score": 0.99},
+            {"start": 5, "end": 8, "entity_group": "email", "score": 0.20},
+        ]
+        with tempfile.TemporaryDirectory() as d:
+            out = self._sanitizer(Path(d), spans).sanitize(text)
+        self.assertEqual(out, "[PERSON_1]X@y")
+
+
 if __name__ == "__main__":
     unittest.main()

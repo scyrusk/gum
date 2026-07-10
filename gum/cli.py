@@ -154,6 +154,37 @@ def parse_args():
     p_review.add_argument("--user-name", "-u", type=str)
     p_review.add_argument("--text-model", "-m", type=str)
 
+    p_mcp = sub.add_parser(
+        "mcp",
+        help="Serve the GUM over MCP (stdio) so a local agent can gather sanitized context",
+    )
+    p_mcp.add_argument("--user-name", "-u", type=str)
+    p_mcp.add_argument("--text-model", "-m", type=str)
+    p_mcp.add_argument(
+        "--no-sanitize",
+        action="store_true",
+        help="Serve RAW propositions (default is fail-closed PII sanitization). "
+        "Only for a fully-local, trusted agent.",
+    )
+
+    p_rehydrate = sub.add_parser(
+        "rehydrate",
+        help="Restore real values for pseudo-IDs in a file the agent produced "
+        "from sanitized GUM context (the inverse of egress sanitization)",
+    )
+    p_rehydrate.add_argument(
+        "input",
+        nargs="?",
+        help="File to rehydrate. Reads stdin when omitted or '-'.",
+    )
+    p_rehydrate.add_argument(
+        "-o",
+        "--output",
+        type=str,
+        help="Write result here. Defaults to overwriting INPUT in place; "
+        "with stdin input, writes to stdout.",
+    )
+
     sub.add_parser("tray", help="Launch the macOS menu-bar app (needs the [tray] extra)")
 
     sub.add_parser("reset-cache", help="Delete the GUM cache (~/.cache/gum) and exit")
@@ -407,6 +438,72 @@ async def cmd_review(args) -> None:
     await api_task
 
 
+def cmd_mcp(args) -> None:
+    """Serve the GUM over MCP (stdio) for a local executing agent.
+
+    stdio is the MCP transport: the client (Claude Desktop, Codex, …) launches
+    this process and speaks JSON-RPC over stdin/stdout, so NOTHING may be printed
+    to stdout here — the DB is connected lazily inside the server's own loop and
+    ``run()`` owns the event loop.
+    """
+    from gum.mcp_server import run_stdio
+
+    g = gum(_user_name(args) or "default", _text_model(args))
+    sanitize = not getattr(args, "no_sanitize", False)
+    run_stdio(g, sanitize=sanitize)
+
+
+def cmd_rehydrate(args) -> None:
+    """Restore real values for pseudo-IDs in an agent-produced artifact.
+
+    This is the local, trusted tail of the sanitized-context workflow: the MCP
+    server hands out pseudonymized context ([PERSON_1], [ORG_1], …), a frontier
+    model drafts something that still carries those placeholders, and this swaps
+    them back for real names so the *user* gets a usable document. It is pure
+    lookup against the local entity map — no model loads — so it is fast and works
+    without the [sanitize] extra.
+
+    By design it writes to a file (or stdout for stdin input), never leaking the
+    restored PII back through a channel a frontier model reads: only a count of
+    substitutions is reported.
+    """
+    from gum.sanitize import find_pseudo_ids, get_sanitizer
+
+    src = args.input
+    if src and src != "-":
+        with open(os.path.expanduser(src), "r", encoding="utf-8") as fh:
+            text = fh.read()
+        dest = args.output or src
+    else:
+        text = sys.stdin.read()
+        dest = args.output  # None → stdout
+
+    restored, n = get_sanitizer().rehydrate(text)
+
+    if dest:
+        with open(os.path.expanduser(dest), "w", encoding="utf-8") as fh:
+            fh.write(restored)
+        # Status only — never the restored PII — so this is safe to run from an
+        # agent shell without re-exposing what sanitization protected.
+        print(f"Rehydrated {n} pseudo-ID(s) → {dest}", file=sys.stderr)
+    else:
+        sys.stdout.write(restored)
+
+    # Any pseudo-ID still present after rehydration had no entry in the local
+    # entity map — typically one the frontier model invented — so it stays as a
+    # placeholder in the user's artifact. Flag it so the leftover isn't shipped
+    # silently. Pseudo-IDs are not PII, so naming them on stderr is safe.
+    leftover = find_pseudo_ids(restored)
+    if leftover:
+        print(
+            f"Warning: {len(leftover)} pseudo-ID(s) could not be restored and "
+            f"remain in the output: {', '.join(leftover)}. They have no entry in "
+            "the local entity map (the model may have invented them); check them "
+            "by hand.",
+            file=sys.stderr,
+        )
+
+
 def cmd_reset_cache(args) -> None:
     cache_dir = os.path.expanduser("~/.cache/gum/")
     if os.path.exists(cache_dir):
@@ -443,6 +540,10 @@ def cli() -> None:
         asyncio.run(cmd_observations(args))
     elif command == "review":
         asyncio.run(cmd_review(args))
+    elif command == "mcp":
+        cmd_mcp(args)
+    elif command == "rehydrate":
+        cmd_rehydrate(args)
     elif command == "tray":
         from gum.tray import run as run_tray
         run_tray()  # runs the AppKit event loop on the main thread
