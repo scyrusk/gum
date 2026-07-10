@@ -124,6 +124,49 @@ class PropositionBlacklistTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(revised, [])
         completion.assert_not_called()
 
+    async def test_blocked_revision_preserves_existing_proposition(self):
+        self.blacklist.write_text(
+            "Do not generate propositions about passwords.\n", encoding="utf-8"
+        )
+        async with self.gum._session() as session:
+            existing = Proposition(
+                text="Omar uses a password manager",
+                reasoning="A password manager was visible",
+                confidence=8,
+                decay=5,
+                revision_group="existing-group",
+                version=1,
+            )
+            observation = Observation(
+                observer_name="screen",
+                content="password settings were visible",
+                content_type="input_text",
+            )
+            session.add_all([existing, observation])
+            await session.flush()
+            existing_id = existing.id
+
+        with mock.patch(
+            "gum.gum.structured_completion", side_effect=self._empty_result
+        ):
+            async with self.gum._session() as session:
+                existing = await session.get(Proposition, existing_id)
+                new_observation = Observation(
+                    observer_name="screen",
+                    content="another password screen",
+                    content_type="input_text",
+                )
+                session.add(new_observation)
+                await session.flush()
+                await self.gum._handle_similar(
+                    session, [existing], [new_observation]
+                )
+
+        async with self.gum._session() as session:
+            preserved = await session.get(Proposition, existing_id)
+            self.assertIsNotNone(preserved)
+            self.assertEqual(preserved.text, "Omar uses a password manager")
+
 
 if __name__ == "__main__":
     unittest.main()

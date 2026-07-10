@@ -744,6 +744,12 @@ proposition would violate a rule, return an empty `propositions` list.
         # Generate revised propositions
         revised_items = await self._revise_propositions(list(rel_obs), similar)
 
+        # An empty revision is a valid blacklist outcome: every possible
+        # replacement may be prohibited. Keep the existing cluster in that case
+        # instead of treating "generate nothing" as "delete everything".
+        if not revised_items:
+            return
+
         # Delete all old similar propositions. We issue a Core bulk DELETE keyed by
         # id and let the DB's ON DELETE CASCADE clear the observation_proposition
         # junction, rather than ORM-deleting each object. The ORM path verifies the
