@@ -447,7 +447,6 @@ class gum:
         )
         try:
             blacklist_prompt = self._blacklist_prompt()
-            prompt += blacklist_prompt
         except BlacklistReadError:
             # A configured blacklist is a privacy boundary. If the file exists
             # but cannot be read, do not make a proposition-writing model call
@@ -458,11 +457,21 @@ class gum:
         result = await structured_completion(
             self.client,
             self.model,
-            [{"role": "user", "content": prompt}],
+            self._proposition_messages(prompt, blacklist_prompt),
             PropositionSchema,
             logger=self.logger,
         )
         return await self._enforce_blacklist(result.propositions, blacklist_prompt)
+
+    @staticmethod
+    def _proposition_messages(prompt: str, blacklist_prompt: str) -> list[dict[str, str]]:
+        """Keep trusted blacklist policy separate from untrusted prompt content."""
+        if blacklist_prompt:
+            return [
+                {"role": "system", "content": blacklist_prompt.strip()},
+                {"role": "user", "content": prompt},
+            ]
+        return [{"role": "user", "content": prompt}]
 
     def _blacklist_prompt(self) -> str:
         """Return model instructions for the current line-based blacklist.
@@ -718,13 +727,12 @@ rule. Do not rewrite candidates and do not include their text in your response.
         prompt = self.revise_prompt.replace("{body}", body)
         try:
             blacklist_prompt = self._blacklist_prompt()
-            prompt += blacklist_prompt
         except BlacklistReadError:
             return []
         result = await structured_completion(
             self.client,
             self.model,
-            [{"role": "user", "content": prompt}],
+            self._proposition_messages(prompt, blacklist_prompt),
             PropositionSchema,
             logger=self.logger,
         )
