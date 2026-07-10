@@ -5,6 +5,8 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+from sqlalchemy import select
+
 from gum import gum as Gum
 from gum.models import Observation, Proposition
 from gum.schemas import (
@@ -170,6 +172,64 @@ class PropositionBlacklistTests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertEqual(result, [])
+
+    async def test_only_compliant_propositions_are_persisted_for_a_batch(self):
+        self.blacklist.write_text(
+            "Do not generate propositions about passwords.\n", encoding="utf-8"
+        )
+        generated = PropositionSchema(
+            propositions=[
+                PropositionItem(
+                    proposition="Omar's password is visible",
+                    reasoning="A password field was shown",
+                    confidence=9,
+                    decay=5,
+                ),
+                PropositionItem(
+                    proposition="Omar uses a dark editor theme",
+                    reasoning="The editor background was dark",
+                    confidence=7,
+                    decay=5,
+                ),
+            ]
+        )
+        batch = [
+            {
+                "id": "batch-observation-1",
+                "observer_name": "screen",
+                "content": "screen content",
+                "content_type": "input_text",
+            }
+        ]
+
+        with (
+            mock.patch(
+                "gum.gum.structured_completion",
+                side_effect=[
+                    generated,
+                    BlacklistComplianceSchema(allowed_indices=[1]),
+                ],
+            ),
+            mock.patch.object(self.gum.batcher, "ack_batch") as ack_batch,
+        ):
+            await self.gum._process_batch(batch)
+
+        ack_batch.assert_called_once_with(batch)
+
+        async with self.gum._session() as session:
+            persisted = list((await session.scalars(select(Proposition))).all())
+
+        self.assertEqual(
+            [proposition.text for proposition in persisted],
+            ["Omar uses a dark editor theme"],
+        )
+        self.assertNotIn(
+            "password",
+            " ".join(
+                f"{proposition.text} {proposition.reasoning}"
+                for proposition in persisted
+            ).lower(),
+        )
 
     async def test_unreadable_blacklist_suppresses_proposition_writes(self):
         self.blacklist.write_text("Exclude passwords.\n", encoding="utf-8")
