@@ -461,7 +461,7 @@ class gum:
             PropositionSchema,
             logger=self.logger,
         )
-        return await self._enforce_blacklist(result.propositions, blacklist_prompt)
+        return await self._enforce_blacklist(result.propositions)
 
     @staticmethod
     def _proposition_messages(prompt: str, blacklist_prompt: str) -> list[dict[str, str]]:
@@ -517,16 +517,26 @@ proposition would violate a rule, return an empty `propositions` list.
 """
 
     async def _enforce_blacklist(
-        self, items: list[PropositionItem], blacklist_prompt: str
+        self, items: list[PropositionItem]
     ) -> list[PropositionItem]:
         """Keep only outputs independently judged compliant with active rules.
 
         The generation prompt remains the first line of defense. This structured
         second pass prevents a model response that ignored those instructions
         from being persisted. A failed compliance check is treated as allowing
-        nothing because the blacklist is a privacy boundary.
+        nothing because the blacklist is a privacy boundary. Rules are re-read
+        here so edits made while the generation call was in flight apply before
+        any returned proposition can cross the persistence boundary.
         """
-        if not blacklist_prompt or not items:
+        if not items:
+            return items
+
+        try:
+            blacklist_prompt = self._blacklist_prompt()
+        except BlacklistReadError:
+            return []
+
+        if not blacklist_prompt:
             return items
 
         candidates = [
@@ -736,7 +746,7 @@ rule. Do not rewrite candidates and do not include their text in your response.
             PropositionSchema,
             logger=self.logger,
         )
-        return await self._enforce_blacklist(result.propositions, blacklist_prompt)
+        return await self._enforce_blacklist(result.propositions)
 
     async def _generate_and_search(
         self, session: AsyncSession, update: Update
