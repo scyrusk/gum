@@ -62,6 +62,21 @@ gum review                      # open a browser GUI to judge propositions True/
 >
 > **Idle behaviour.** The vision model is kept warm continuously (it runs on nearly every interaction). The larger text model runs only on batches, so it is released from memory after ~10 min with no new observations (`GUM_TEXT_IDLE_UNLOAD`, seconds) and reloaded on the next batch — a cooler, lighter idle in exchange for a one-time reload. Set `GUM_TEXT_IDLE_UNLOAD=0` to keep it always resident.
 
+#### Blacklist proposition content
+
+To prevent the text model from generating propositions about sensitive topics, create `~/.cache/gum/blacklist.txt` with one natural-language rule per line:
+
+```text
+# Lines beginning with # are comments.
+Do not generate propositions related to passwords or authentication secrets.
+Do not generate propositions related to credit cards or bank account details.
+Do not generate propositions containing adult or explicit content.
+```
+
+Blank lines and comments are ignored. The file is read before every proposition-generation and revision call, so changes apply to the next batch without restarting `gum`. When all possible propositions would violate a rule, the model is instructed to generate none. The blacklist controls newly generated and revised propositions; it does not remove propositions already stored in `gum.db`.
+
+Set `GUM_BLACKLIST_FILE` in `.env` if you want to keep the file elsewhere. If the configured file does not exist, blacklist filtering is disabled.
+
 ### 5. Review propositions to improve the model
 
 `gum review` opens a small browser GUI that shows you one proposition at a time — along with the observations that led to it — and asks whether it's **Accurate**, **Somewhat** accurate, or **Inaccurate** about you. You can add an optional free-text **note** with any rating to give the model context (e.g. "only when I'm coding, not for writing"). Keyboard: `t` / `s` / `f` for the three ratings, `k` to skip. It walks your most recent unreviewed propositions first.

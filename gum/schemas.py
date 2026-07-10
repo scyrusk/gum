@@ -37,6 +37,14 @@ class PropositionSchema(BaseModel):
     )
     model_config = ConfigDict(extra="forbid")
 
+class BlacklistComplianceSchema(BaseModel):
+    allowed_indices: List[int] = Field(
+        ...,
+        description="Zero-based indices of propositions that comply with every blacklist rule",
+    )
+
+    model_config = ConfigDict(extra="forbid")
+
 class Update(BaseModel):
     content: str = Field(..., description="The content of the update")
     content_type: Literal["input_text", "input_image"] = Field(..., description="The type of the update")
