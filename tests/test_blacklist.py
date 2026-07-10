@@ -7,7 +7,12 @@ from unittest import mock
 
 from gum import gum as Gum
 from gum.models import Observation, Proposition
-from gum.schemas import PropositionSchema, Update
+from gum.schemas import (
+    BlacklistComplianceSchema,
+    PropositionItem,
+    PropositionSchema,
+    Update,
+)
 
 
 class PropositionBlacklistTests(unittest.IsolatedAsyncioTestCase):
@@ -65,14 +70,27 @@ class PropositionBlacklistTests(unittest.IsolatedAsyncioTestCase):
             observer_name="screen", content="screen content", content_type="input_text"
         )
 
+        generated = PropositionSchema(
+            propositions=[
+                PropositionItem(
+                    proposition="Omar visits adult websites",
+                    reasoning="Adult content was visible",
+                    confidence=8,
+                    decay=5,
+                )
+            ]
+        )
         with mock.patch(
-            "gum.gum.structured_completion", side_effect=self._empty_result
+            "gum.gum.structured_completion",
+            side_effect=[generated, BlacklistComplianceSchema(allowed_indices=[])],
         ) as completion:
-            await self.gum._revise_propositions([observation], [existing])
+            result = await self.gum._revise_propositions([observation], [existing])
 
-        prompt = completion.call_args.args[2][0]["content"]
+        prompt = completion.call_args_list[0].args[2][0]["content"]
         self.assertIn("Do not generate propositions about adult content.", prompt)
         self.assertIn("These rules take priority", prompt)
+        self.assertEqual(result, [])
+        self.assertEqual(completion.call_count, 2)
 
     async def test_rules_are_reloaded_and_missing_file_is_allowed(self):
         with mock.patch(
@@ -91,6 +109,67 @@ class PropositionBlacklistTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertNotIn("Proposition Content Blacklist", first_prompt)
         self.assertIn("Exclude financial credentials.", second_prompt)
+
+    async def test_noncompliant_model_output_is_removed_by_second_pass(self):
+        self.blacklist.write_text(
+            "Do not generate propositions about passwords.\n", encoding="utf-8"
+        )
+        generated = PropositionSchema(
+            propositions=[
+                PropositionItem(
+                    proposition="Omar uses a password manager",
+                    reasoning="A password manager was visible",
+                    confidence=8,
+                    decay=5,
+                ),
+                PropositionItem(
+                    proposition="Omar uses a dark editor theme",
+                    reasoning="The editor background was dark",
+                    confidence=7,
+                    decay=5,
+                ),
+            ]
+        )
+
+        with mock.patch(
+            "gum.gum.structured_completion",
+            side_effect=[
+                generated,
+                BlacklistComplianceSchema(allowed_indices=[1]),
+            ],
+        ) as completion:
+            result = await self.gum._construct_propositions(
+                Update(content="screen content", content_type="input_text")
+            )
+
+        self.assertEqual([item.proposition for item in result], ["Omar uses a dark editor theme"])
+        compliance_prompt = completion.call_args_list[1].args[2][0]["content"]
+        self.assertIn("strict proposition-content compliance checker", compliance_prompt)
+        self.assertIn("Do not generate propositions about passwords.", compliance_prompt)
+        self.assertNotIn("empty `propositions` list", compliance_prompt)
+
+    async def test_failed_compliance_check_suppresses_model_output(self):
+        self.blacklist.write_text("Exclude passwords.\n", encoding="utf-8")
+        generated = PropositionSchema(
+            propositions=[
+                PropositionItem(
+                    proposition="Omar prefers dark mode",
+                    reasoning="A dark interface was visible",
+                    confidence=7,
+                    decay=5,
+                )
+            ]
+        )
+
+        with mock.patch(
+            "gum.gum.structured_completion",
+            side_effect=[generated, RuntimeError("validator unavailable")],
+        ):
+            result = await self.gum._construct_propositions(
+                Update(content="screen content", content_type="input_text")
+            )
+
+        self.assertEqual(result, [])
 
     async def test_unreadable_blacklist_suppresses_proposition_writes(self):
         self.blacklist.write_text("Exclude passwords.\n", encoding="utf-8")
