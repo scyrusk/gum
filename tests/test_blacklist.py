@@ -306,6 +306,72 @@ class PropositionBlacklistTests(unittest.IsolatedAsyncioTestCase):
             self.assertIsNotNone(preserved)
             self.assertEqual(preserved.text, "Omar uses a password manager")
 
+    async def test_only_compliant_revisions_replace_existing_propositions(self):
+        self.blacklist.write_text(
+            "Do not generate propositions about passwords.\n", encoding="utf-8"
+        )
+        async with self.gum._session() as session:
+            existing = Proposition(
+                text="Omar configures development tools",
+                reasoning="A settings screen was visible",
+                confidence=6,
+                decay=5,
+                revision_group="existing-group",
+                version=1,
+            )
+            observation = Observation(
+                observer_name="screen",
+                content="updated settings screen",
+                content_type="input_text",
+            )
+            session.add_all([existing, observation])
+            await session.flush()
+            existing_id = existing.id
+            observation_id = observation.id
+
+        revised = PropositionSchema(
+            propositions=[
+                PropositionItem(
+                    proposition="Omar stores passwords in a development tool",
+                    reasoning="A password setting was visible",
+                    confidence=8,
+                    decay=5,
+                ),
+                PropositionItem(
+                    proposition="Omar uses a dark editor theme",
+                    reasoning="The settings screen showed a dark theme",
+                    confidence=7,
+                    decay=5,
+                ),
+            ]
+        )
+        with mock.patch(
+            "gum.gum.structured_completion",
+            side_effect=[
+                revised,
+                BlacklistComplianceSchema(allowed_indices=[1]),
+            ],
+        ):
+            async with self.gum._session() as session:
+                existing = await session.get(Proposition, existing_id)
+                observation = await session.get(Observation, observation_id)
+                await self.gum._handle_similar(session, [existing], [observation])
+
+        async with self.gum._session() as session:
+            persisted = list((await session.scalars(select(Proposition))).all())
+
+        self.assertEqual(
+            [proposition.text for proposition in persisted],
+            ["Omar uses a dark editor theme"],
+        )
+        self.assertNotIn(
+            "password",
+            " ".join(
+                f"{proposition.text} {proposition.reasoning}"
+                for proposition in persisted
+            ).lower(),
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
