@@ -169,6 +169,41 @@ class CommitmentVerdictSchema(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
+ReversibilityClass = Literal["read_only", "reversible", "irreversible"]
+
+
+class RiskAssessmentSchema(BaseModel):
+    """Safety classification of the action a GUMBO suggestion would require.
+
+    Produced by the execution bridge's risk-assessment LLM call (see
+    gum.executor.Executor.assess_risk). The executor uses ``reversibility`` and
+    ``risk`` to gate auto-dispatch: only read-only/reversible, low-risk actions on
+    a high-confidence suggestion may run automatically; everything else stays
+    proposal-only, held for the user's explicit approval.
+    """
+
+    reversibility: ReversibilityClass = Field(
+        ...,
+        description=(
+            "How undoable the action is: 'read_only' (only reads/searches/drafts, "
+            "changes nothing relied upon), 'reversible' (changes something trivially "
+            "undone, e.g. a local draft file), or 'irreversible' (effects that cannot "
+            "be cleanly undone or that reach outside the machine, e.g. sending a "
+            "message, a purchase, deleting data)."
+        ),
+    )
+    risk: int = Field(
+        ...,
+        description=(
+            "How much harm a wrong or unwanted action could cause the user, from 1 "
+            "(trivial, easily ignored) to 10 (severe, hard to recover from)."
+        ),
+    )
+    rationale: str = Field(..., description="One sentence justifying the classification")
+
+    model_config = ConfigDict(extra="forbid")
+
+
 def get_schema(json_schema):
     return {
         "type": "json_schema",
