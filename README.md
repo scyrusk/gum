@@ -53,6 +53,10 @@ gum observations                # list the most recent raw observations (--full 
 gum observations --date 7/7/2026  # all observations from a given Eastern-time day
 gum observations --date 7/7/2026 -o day.txt   # write results to a file (exports full content)
 
+gum agenda                      # ranked radar of your open commitments & deadlines
+gum agenda --window 7           # only commitments due within 7 days (overdue/undated always shown)
+gum agenda --json               # machine-readable JSON (add -s / --sanitize to pseudonymize PII)
+
 gum review                      # open a browser GUI to judge propositions True/False (see below)
 ```
 

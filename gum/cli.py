@@ -136,6 +136,22 @@ def parse_args():
     p_recent.add_argument("--sanitize", "-s", action="store_true",
                           help="Replace PII with consistent pseudo-IDs before output")
 
+    p_agenda = sub.add_parser(
+        "agenda",
+        help="Show a ranked radar of your open commitments and deadlines",
+    )
+    p_agenda.add_argument("--limit", "-l", type=int, default=10,
+                          help="Max commitments to show (default 10)")
+    p_agenda.add_argument("--window", "-w", type=int, default=None, metavar="DAYS",
+                          help="Only show commitments due within this many days "
+                          "(overdue and undated ones are always kept)")
+    p_agenda.add_argument("--json", action="store_true",
+                          help="Emit the radar as JSON for machines")
+    p_agenda.add_argument("--user-name", "-u", type=str)
+    p_agenda.add_argument("--text-model", "-m", type=str)
+    p_agenda.add_argument("--sanitize", "-s", action="store_true",
+                          help="Replace PII with consistent pseudo-IDs before output")
+
     p_obs = sub.add_parser("observations", help="List raw observations (all of a day with --date)")
     p_obs.add_argument("--limit", "-l", type=int, default=None,
                        help="Max results (default 10; all-day when --date is set)")
@@ -350,6 +366,54 @@ async def cmd_recent(args) -> None:
         print("-" * 80)
 
 
+def _due_label(days: int | None) -> str:
+    """Human-readable deadline tag for a commitment, e.g. 'overdue 3d'."""
+    if days is None:
+        return "no date"
+    if days < 0:
+        return f"overdue {abs(days)}d"
+    if days == 0:
+        return "due today"
+    return f"in {days}d"
+
+
+async def cmd_agenda(args) -> None:
+    """Print a ranked radar of the user's open commitments and deadlines."""
+    from gum.agenda import build_agenda
+
+    g = gum(_user_name(args) or "default", _text_model(args))
+    await g.connect_db()
+    commitments = await build_agenda(g, limit=args.limit, window_days=args.window)
+
+    # The model-written text fields (title/source/proposition_text) carry PII;
+    # scrub them before they leave the process when sanitization is on. The
+    # numeric/date fields never do, so they pass through untouched.
+    sanitize = _sanitize_enabled(args)
+    for c in commitments:
+        c.title = await _scrub(c.title, sanitize)
+        c.source = await _scrub(c.source, sanitize)
+        c.proposition_text = await _scrub(c.proposition_text, sanitize)
+
+    if args.json:
+        import json
+        print(json.dumps([c.to_dict() for c in commitments], indent=2))
+        return
+
+    if not commitments:
+        print("\nNothing on the radar — no open commitments detected.")
+        return
+
+    print(f"\nCommitment radar — {len(commitments)} open item(s), most urgent first:")
+    for c in commitments:
+        conf = f"{c.confidence}/10" if c.confidence is not None else "?/10"
+        print(f"\n  [{_due_label(c.days_until_due)}] {c.title}")
+        due = c.due_date or "unscheduled"
+        print(f"      due {due} · {c.source} · {c.status_guess} · "
+              f"confidence {conf} · urgency {c.urgency:.2f}")
+        print(f"      from: {c.proposition_text}")
+    print("-" * 80)
+
+
 async def cmd_observations(args) -> None:
     start_utc = end_utc = None
     if args.date:
@@ -536,6 +600,8 @@ def cli() -> None:
         asyncio.run(cmd_query(args))
     elif command == "recent":
         asyncio.run(cmd_recent(args))
+    elif command == "agenda":
+        asyncio.run(cmd_agenda(args))
     elif command == "observations":
         asyncio.run(cmd_observations(args))
     elif command == "review":
