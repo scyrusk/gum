@@ -584,6 +584,20 @@ class Executor:
                 )
         finally:
             shutil.rmtree(cwd, ignore_errors=True)
+
+        # The off-device agent works only with persistent pseudo-IDs, but the
+        # artifact the user reviews locally must be usable as-is. Restore known
+        # IDs through the SAME sanitizer/entity map that pseudonymized the
+        # outbound prompt. ``rehydrate`` is a pure local SQLite lookup (no model
+        # load and no egress), and this restored text is created only after the
+        # backend has returned, so it can never flow back into that dispatch.
+        # Failed/partial output stays untouched: it is diagnostic rather than a
+        # reviewable deliverable.
+        if result.ok and self.sanitize:
+            sanitizer = self._get_sanitizer()
+            restored, _ = await asyncio.to_thread(sanitizer.rehydrate, result.output)
+            result = AgentResult(ok=True, output=restored, error=result.error)
+
         status = STATUS_PENDING_APPROVAL if result.ok else STATUS_FAILED
         return ExecutionOutcome(
             suggestion=suggestion,

@@ -236,6 +236,14 @@ class _FakeSanitizer:
             text = text.replace(raw, pseudo)
         return text, aliases
 
+    def rehydrate(self, text: str) -> tuple[str, int]:
+        count = 0
+        for raw, pseudo in self._mapping.items():
+            occurrences = text.count(pseudo)
+            text = text.replace(pseudo, raw)
+            count += occurrences
+        return text, count
+
 
 def _prop(text: str, confidence: int) -> Proposition:
     return Proposition(
@@ -418,6 +426,40 @@ class DispatchFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("[PERSON_1]", task)
         self.assertNotIn("Schmidt", task)
         self.assertNotIn("Omar", task)
+
+    async def test_returned_draft_is_rehydrated_only_after_backend_returns(self):
+        # The cloud-facing prompt and result use stable pseudo-IDs; only the
+        # pending-approval artifact shown locally restores their real values.
+        fake = _FakeSanitizer({"Schmidt": "[ORG_1]", "Omar": "[PERSON_1]"})
+        backend = _RecordingBackend(
+            AgentResult(
+                ok=True,
+                output="Hi [PERSON_1],\n\nHere is the [ORG_1] proposal draft.",
+            )
+        )
+        ex = Executor(self.gum, backend=backend, sanitizer=fake)
+        sug = _suggestion(
+            title="Draft the Schmidt grant proposal",
+            description="Prepare a first draft for Omar.",
+            probability_useful=9,
+        )
+
+        with self._patch_assessment("read_only", 1):
+            outcome = await ex.dispatch(sug)
+
+        self.assertEqual(outcome.status, STATUS_PENDING_APPROVAL)
+        # Nothing raw crossed the backend boundary.
+        self.assertNotIn("Schmidt", backend.calls[0]["task"])
+        self.assertNotIn("Omar", backend.calls[0]["task"])
+        self.assertEqual(
+            backend._result.output,
+            "Hi [PERSON_1],\n\nHere is the [ORG_1] proposal draft.",
+        )
+        # The local review surface receives the restored, usable artifact.
+        self.assertEqual(
+            outcome.result.output,
+            "Hi Omar,\n\nHere is the Schmidt proposal draft.",
+        )
 
     async def _seed_prop(self, text: str, confidence: int) -> None:
         async with self.gum._session() as s:

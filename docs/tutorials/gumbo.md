@@ -74,6 +74,13 @@ behalf. Four independent guardrails enforce this:
     *proposal-only* rather than dispatched un-grounded or un-sanitized, and (like a
     failed risk assessment) it never aborts the rest of an `execute()` batch.
 
+    On return, the direction reverses only for the local review artifact: the
+    executor runs the successful draft through `Sanitizer.rehydrate()` using
+    that same persistent entity map, so the CLI and local REST review surface
+    show a usable draft with real names restored. This is an on-device database
+    lookup performed after the agent exits; the restored text is never sent back
+    to the agent or any other cloud model.
+
 ## Turning it on
 
 ```bash
