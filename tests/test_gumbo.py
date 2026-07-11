@@ -386,5 +386,49 @@ class GumboExecuteTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(outcomes), 1)
 
 
+class SuggestionItemBoundsTests(unittest.TestCase):
+    """The four suggestion scores are contractually 1–10; the schema enforces it.
+
+    These scores are gate inputs to the execution bridge: ``probability_useful``
+    is read raw by ``Executor.is_auto_dispatchable`` (a malformed high value like
+    100 would clear the ``probability_useful < min_probability`` confidence bar on
+    a bogus score), and ``benefit``/``cost_if_wrong``/``cost_if_missed`` feed the
+    ``expected_utility``/``should_surface`` decision the gate also depends on
+    (only ``p`` is clamped there, so an out-of-range ``benefit`` could flip
+    ``should_surface``). Enforcing the range rejects a malformed score at
+    validation — driving ``structured_completion``'s retries — instead of letting
+    it sail through the auto-dispatch gate, mirroring ``RiskAssessmentSchema.risk``.
+    """
+
+    def _item(self, **overrides):
+        fields = dict(
+            title="t", description="d", rationale="r",
+            probability_useful=9, benefit=9, cost_if_wrong=2, cost_if_missed=7,
+        )
+        fields.update(overrides)
+        return SuggestionItem(**fields)
+
+    def test_in_range_scores_are_accepted(self):
+        for score in (1, 5, 10):
+            self._item(
+                probability_useful=score, benefit=score,
+                cost_if_wrong=score, cost_if_missed=score,
+            )
+
+    def test_out_of_range_scores_are_rejected(self):
+        from pydantic import ValidationError
+
+        for field in ("probability_useful", "benefit", "cost_if_wrong", "cost_if_missed"):
+            for score in (0, -1, 11, 99):
+                with self.assertRaises(ValidationError):
+                    self._item(**{field: score})
+
+    def test_json_schema_carries_the_bounds_for_the_model(self):
+        props = SuggestionItem.model_json_schema()["properties"]
+        for field in ("probability_useful", "benefit", "cost_if_wrong", "cost_if_missed"):
+            self.assertEqual(props[field]["minimum"], 1, field)
+            self.assertEqual(props[field]["maximum"], 10, field)
+
+
 if __name__ == "__main__":
     unittest.main()

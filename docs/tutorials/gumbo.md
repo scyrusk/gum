@@ -33,9 +33,12 @@ behalf. Four independent guardrails enforce this:
    action is read-only/reversible, and its risk is low (`GUM_EXECUTOR_MAX_RISK`,
    default 3). The classifier is biased toward the *less-safe* reading under
    uncertainty, so an ambiguous action stays proposal-only. Anything that misses
-   the gate is held for review and no agent runs. The risk score is contractually
-   bounded to 1–10, so a local-model reply with an out-of-range score is treated as
-   a malformed assessment. If the classifier itself cannot complete (a failed or
+   the gate is held for review and no agent runs. Every score the gate reads is
+   contractually bounded to 1–10 — the assessed `risk`, and the suggestion's own
+   `P(useful)` and the `benefit`/`cost` scores behind its worth-surfacing decision
+   — so a local-model reply with an out-of-range score is rejected as malformed
+   (driving a retry) instead of a bogus value like `P(useful)=100` sailing through
+   the confidence bar. If the classifier itself cannot complete (a failed or
    malformed local-model call, including a persistently out-of-range score), that
    suggestion fails *closed* to proposal-only rather than dispatching — and one
    un-assessable suggestion never aborts the rest of an `execute()` batch.

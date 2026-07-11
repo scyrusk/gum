@@ -85,22 +85,28 @@ class SuggestionItem(BaseModel):
     The four score fields feed the mixed-initiative expected-utility decision
     (Horvitz [36]) that GUMBO uses to decide whether a suggestion is worth
     surfacing — see gum.gumbo.expected_utility. All scores are on a 1 (low) to
-    10 (high) scale so the local text model has a consistent, easy target.
+    10 (high) scale so the local text model has a consistent, easy target, and
+    that range is enforced (ge=1/le=10) rather than merely documented: these
+    scores are gate inputs to the execution bridge — ``probability_useful`` is
+    read raw by Executor.is_auto_dispatchable and the rest feed the
+    ``should_surface`` decision it also depends on — so a malformed out-of-range
+    value must be rejected (driving structured_completion's retries) instead of
+    sailing through the auto-dispatch gate, mirroring RiskAssessmentSchema.risk.
     """
     title: str = Field(..., description="Short imperative title, e.g. 'Draft the wedding-travel budget'")
     description: str = Field(..., description="What GUMBO proposes to do or has already drafted on the user's behalf")
     rationale: str = Field(..., description="Why this is relevant right now, grounded in the provided propositions")
     probability_useful: int = Field(
-        ..., description="How likely the user finds any value in this suggestion, P(useful), from 1 (low) to 10 (high)"
+        ..., ge=1, le=10, description="How likely the user finds any value in this suggestion, P(useful), from 1 (low) to 10 (high)"
     )
     benefit: int = Field(
-        ..., description="Benefit to the user if the suggestion is completed, from 1 (low) to 10 (high)"
+        ..., ge=1, le=10, description="Benefit to the user if the suggestion is completed, from 1 (low) to 10 (high)"
     )
     cost_if_wrong: int = Field(
-        ..., description="Cost of interrupting the user with this if it is not useful (false positive), from 1 to 10"
+        ..., ge=1, le=10, description="Cost of interrupting the user with this if it is not useful (false positive), from 1 to 10"
     )
     cost_if_missed: int = Field(
-        ..., description="Cost to the user of never seeing this if it is useful (false negative), from 1 to 10"
+        ..., ge=1, le=10, description="Cost to the user of never seeing this if it is useful (false negative), from 1 to 10"
     )
 
     model_config = ConfigDict(extra="forbid")

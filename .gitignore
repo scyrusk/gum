@@ -120,3 +120,4 @@ cython_debug/
 
 # Local scratch
 tmp/
+docs/specs
