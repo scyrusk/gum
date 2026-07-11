@@ -475,6 +475,32 @@ class DispatchFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("assessment failed", outcome.reason)
         self.assertEqual(backend.calls, [])  # the agent was never invoked
 
+    async def test_grounding_failure_fails_closed_without_dispatching(self):
+        # The gate cleared, but building the grounded, pseudonymized prompt fails
+        # (a transient retrieval error, or the fail-closed egress sanitizer refusing
+        # to load). We must NOT dispatch an un-grounded/un-sanitized prompt to the
+        # off-device backend, and must NOT propagate — one setup failure must not
+        # abort a whole execute() batch. It fails closed to proposal-only, keeping
+        # the assessment the gate already obtained.
+        backend = _RecordingBackend(AgentResult(ok=True, output="should not run"))
+        ex = Executor(self.gum, backend=backend, sanitize=False)
+        sug = _suggestion(probability_useful=10)
+
+        async def boom(self_, suggestion):
+            raise RuntimeError("sanitizer PII model unavailable")
+
+        with self._patch_assessment("read_only", 1), mock.patch.object(
+            Executor, "assemble_context", boom
+        ):
+            outcome = await ex.dispatch(sug)
+
+        self.assertEqual(outcome.status, STATUS_PROPOSAL_ONLY)
+        self.assertFalse(outcome.dispatched)
+        self.assertIsNotNone(outcome.assessment)  # the gate ran and cleared
+        self.assertIsNone(outcome.result)
+        self.assertIn("could not build grounded prompt", outcome.reason)
+        self.assertEqual(backend.calls, [])  # the off-device agent was never invoked
+
     async def test_missing_backend_stays_proposal_only(self):
         ex = Executor(self.gum, sanitize=False)  # no backend configured
         sug = _suggestion(probability_useful=9)

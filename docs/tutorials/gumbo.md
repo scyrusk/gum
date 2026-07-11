@@ -60,7 +60,11 @@ behalf. Four independent guardrails enforce this:
     suggestion text (which may embed real names or projects) and your own name —
     which the agent instruction would otherwise stamp in verbatim — are run
     through the *same* sanitizer, so they reach the backend only as the same
-    stable pseudo-IDs (`[PERSON_1]`, `[ORG_1]`) the context uses.
+    stable pseudo-IDs (`[PERSON_1]`, `[ORG_1]`) the context uses. If that grounding
+    cannot be built for a suggestion — a transient retrieval error, or the
+    fail-closed sanitizer refusing to load its PII model — that suggestion is held
+    *proposal-only* rather than dispatched un-grounded or un-sanitized, and (like a
+    failed risk assessment) it never aborts the rest of an `execute()` batch.
 
 ## Turning it on
 

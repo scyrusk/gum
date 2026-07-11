@@ -528,8 +528,28 @@ class Executor:
                 reason="no agent backend configured",
             )
 
-        context = await self.assemble_context(suggestion)
-        task = await self._build_task(suggestion, context)
+        try:
+            context = await self.assemble_context(suggestion)
+            task = await self._build_task(suggestion, context)
+        except Exception as exc:  # fail closed if grounding/sanitization can't build
+            # The gate cleared, but before we can dispatch we must assemble the
+            # GUM grounding and pseudonymize the whole prompt for the off-device
+            # backend. If that setup fails — a transient retrieval/DB error, or the
+            # fail-closed egress sanitizer refusing to load its PII model — we must
+            # NOT hand the backend an un-grounded or un-sanitized prompt. Hold THIS
+            # suggestion proposal-only (assessment preserved; agent never touched)
+            # rather than raising, so one setup failure can't abort a whole
+            # execute() batch of other suggestions.
+            self.logger.warning(
+                "executor: could not build grounded prompt for suggestion %r; "
+                "holding proposal-only (%s)", suggestion.title, exc,
+            )
+            return ExecutionOutcome(
+                suggestion=suggestion,
+                status=STATUS_PROPOSAL_ONLY,
+                assessment=assessment,
+                reason=f"held for review: could not build grounded prompt ({exc})",
+            )
         # Each dispatch gets its OWN ephemeral subdirectory under the workspace root,
         # torn down when the run finishes. A single shared cwd would leak one agent
         # run's scratch files and state into the next dispatch's sandbox and let
