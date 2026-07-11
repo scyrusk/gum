@@ -19,13 +19,16 @@ import os
 import re
 import time
 from dataclasses import asdict, dataclass
-from typing import Any, Callable, Iterable
+from typing import TYPE_CHECKING, Any, Callable, Iterable
 
 from .gum import gum
 from .llm import structured_completion, text_completion
 from .models import Proposition
 from .prompts.gumbo import CHAT_SYSTEM_PROMPT, SUGGESTIONS_PROMPT
 from .schemas import SuggestionSchema
+
+if TYPE_CHECKING:
+    from .executor import Executor, ExecutionOutcome
 
 # Only propositions the GUM is fairly sure about should seed suggestions — a
 # suggestion built on a shaky inference is worse than no suggestion. 7/10 keeps
@@ -61,6 +64,13 @@ def _env_float(name: str, default: float) -> float:
         return float(os.getenv(name, str(default)))
     except (TypeError, ValueError):
         return default
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in ("1", "true", "yes", "on")
 
 
 _TOKEN_RE = re.compile(r"[a-z0-9]+")
@@ -187,6 +197,8 @@ class Gumbo:
         num_suggestions: int | None = None,
         dedup_threshold: float | None = None,
         surface_interval: float | None = None,
+        execution_enabled: bool | None = None,
+        executor: "Executor | None" = None,
         clock: Callable[[], float] = time.monotonic,
         logger: logging.Logger | None = None,
     ) -> None:
@@ -218,6 +230,16 @@ class Gumbo:
             TokenBucket(1, self.surface_interval, clock=clock)
             if self.surface_interval > 0 else None
         )
+        # The execution bridge (spec #4) is default-OFF: unless the user explicitly
+        # opts in, :meth:`execute` is a no-op and GUMBO only ever *proposes*. When
+        # enabled, a pre-configured Executor may be injected; otherwise one is built
+        # lazily on first use (with the shipped sandboxed `claude` CLI backend) so
+        # constructing a Gumbo stays cheap and pulls in nothing execution-related.
+        self.execution_enabled = (
+            execution_enabled if execution_enabled is not None
+            else _env_bool("GUMBO_EXECUTION_ENABLED", False)
+        )
+        self._executor = executor
         self.logger = logger or logging.getLogger("gum.gumbo")
 
     # ── proposition selection ────────────────────────────────────────────────
@@ -350,6 +372,56 @@ class Gumbo:
                 len(worthy), granted,
             )
         return worthy[:granted]
+
+    # ── execution (opt-in, spec #4) ──────────────────────────────────────────
+    def _get_executor(self) -> "Executor":
+        """Return the execution bridge, lazily building the default one.
+
+        Deferred so importing/constructing a Gumbo pulls in nothing from
+        :mod:`gum.executor` (and, through it, the sandboxed CLI backend) until the
+        user actually opts into execution. An injected executor (constructor arg)
+        wins; otherwise the shipped :class:`ClaudeCLIBackend` is wired up so an
+        enabled bridge can genuinely act.
+        """
+        if self._executor is None:
+            from .executor import ClaudeCLIBackend, Executor
+
+            self._executor = Executor(
+                self.gum,
+                backend=ClaudeCLIBackend(logger=self.logger),
+                logger=self.logger,
+            )
+        return self._executor
+
+    async def execute(
+        self,
+        focus: str | None = None,
+        *,
+        seen: Iterable[str] | None = None,
+    ) -> list["ExecutionOutcome"]:
+        """Attempt to *act on* the surface-worthy suggestions (spec #4).
+
+        The opt-in companion to :meth:`surface`: default-OFF, and a no-op returning
+        ``[]`` unless execution was explicitly enabled (constructor flag or
+        ``GUMBO_EXECUTION_ENABLED``). It runs the SAME rate-limited pipeline as
+        surfacing — reusing :meth:`surface`, so the token bucket still caps how many
+        suggestions the user is bothered with, and thus how many can act, per
+        interval — then hands each surfaced suggestion to the :class:`Executor`.
+        The executor gates every one (high-confidence AND reversible AND low-risk)
+        and only then dispatches it to a sandboxed agent. Each returned
+        :class:`ExecutionOutcome` is a reviewable artifact held for the user's
+        approval; nothing irreversible is committed here.
+        """
+        if not self.execution_enabled:
+            return []
+        worthy = await self.surface(focus, seen=seen)
+        if not worthy:
+            return []
+        executor = self._get_executor()
+        outcomes: list["ExecutionOutcome"] = []
+        for suggestion in worthy:
+            outcomes.append(await executor.dispatch(suggestion))
+        return outcomes
 
     # ── conversation ─────────────────────────────────────────────────────────
     async def chat(

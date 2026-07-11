@@ -299,5 +299,92 @@ class GumboEngineTests(unittest.IsolatedAsyncioTestCase):
         sc.assert_not_called()  # no model call when there's nothing to ground on
 
 
+class _RecordingExecutor:
+    """Test double for the execution bridge: records what it was asked to run."""
+
+    def __init__(self):
+        self.dispatched: list = []
+
+    async def dispatch(self, suggestion):
+        self.dispatched.append(suggestion)
+        return {"suggestion": suggestion.title, "status": "pending_approval"}
+
+
+class GumboExecuteTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.gum = Gum("Omar", "dummy-model", data_directory=self._tmp.name, db_name="test.db")
+        await self.gum.connect_db()
+        async with self.gum._session() as s:
+            s.add_all([
+                _prop("Omar is going to a friend's wedding in Chicago", 8),
+                _prop("Omar doesn't own suitable formal wear", 7),
+            ])
+
+    async def asyncTearDown(self):
+        if self.gum.engine is not None:
+            await self.gum.engine.dispose()
+        self._tmp.cleanup()
+
+    def _one_surfaced_completion(self):
+        async def fake_completion(client, model, messages, schema, **kwargs):
+            return SuggestionSchema(suggestions=[
+                SuggestionItem(
+                    title="Rent a suit in Chicago",
+                    description="Find a suit rental shop near the wedding venue.",
+                    rationale="Wedding + no formal wear.",
+                    probability_useful=9, benefit=9, cost_if_wrong=2, cost_if_missed=7,
+                ),
+            ])
+        return fake_completion
+
+    async def test_execute_off_by_default_is_a_noop(self):
+        # Default-OFF: execute() dispatches nothing and never touches the executor,
+        # even when a worthy suggestion exists.
+        executor = _RecordingExecutor()
+        engine = Gumbo(self.gum, min_confidence=7, executor=executor)
+        self.assertFalse(engine.execution_enabled)
+        with mock.patch("gum.gumbo.structured_completion", side_effect=self._one_surfaced_completion()):
+            outcomes = await engine.execute()
+        self.assertEqual(outcomes, [])
+        self.assertEqual(executor.dispatched, [])
+
+    async def test_execute_dispatches_worthy_suggestions_when_enabled(self):
+        executor = _RecordingExecutor()
+        engine = Gumbo(
+            self.gum, min_confidence=7, execution_enabled=True, executor=executor,
+        )
+        with mock.patch("gum.gumbo.structured_completion", side_effect=self._one_surfaced_completion()):
+            outcomes = await engine.execute()
+        self.assertEqual(len(outcomes), 1)
+        self.assertEqual([s.title for s in executor.dispatched], ["Rent a suit in Chicago"])
+        self.assertEqual(outcomes[0]["status"], "pending_approval")
+
+    async def test_execute_preserves_token_bucket_rate_limit(self):
+        # execute() runs the same rate-limited pipeline as surface(): the token
+        # bucket that caps surfacing also caps how many suggestions can act.
+        t = [0.0]
+        executor = _RecordingExecutor()
+        engine = Gumbo(
+            self.gum, min_confidence=7, execution_enabled=True, executor=executor,
+            surface_interval=60, clock=lambda: t[0],
+        )
+        with mock.patch("gum.gumbo.structured_completion", side_effect=self._one_surfaced_completion()):
+            first = await engine.execute()
+            self.assertEqual(len(first), 1)
+            # A second call within the same interval is throttled — nothing dispatched.
+            self.assertEqual(await engine.execute(), [])
+        self.assertEqual(len(executor.dispatched), 1)
+
+    async def test_execute_env_flag_enables_bridge(self):
+        executor = _RecordingExecutor()
+        with mock.patch.dict("os.environ", {"GUMBO_EXECUTION_ENABLED": "1"}):
+            engine = Gumbo(self.gum, min_confidence=7, executor=executor)
+        self.assertTrue(engine.execution_enabled)
+        with mock.patch("gum.gumbo.structured_completion", side_effect=self._one_surfaced_completion()):
+            outcomes = await engine.execute()
+        self.assertEqual(len(outcomes), 1)
+
+
 if __name__ == "__main__":
     unittest.main()
