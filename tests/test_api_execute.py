@@ -9,8 +9,8 @@
 # recording double, so these tests drive the FastAPI app end-to-end through a
 # TestClient while staying fully offline and deterministic. The point is to prove
 # the endpoint is default-OFF, dispatches a high-confidence reversible suggestion
-# to a held-for-approval draft, keeps a risky one proposal-only, and pseudonymizes
-# its text under --sanitize.
+# to a held-for-approval draft, keeps a risky one proposal-only, and preserves the
+# executor's locally rehydrated review artifact under --sanitize.
 
 from __future__ import annotations
 
@@ -173,14 +173,16 @@ class ExecuteEndpointTests(unittest.IsolatedAsyncioTestCase):
         # Gate declined before any dispatch: the backend never ran.
         self.assertEqual(backend.calls, [])
 
-    def test_execute_scrubs_output_under_sanitize(self):
-        # A fake sanitizer that reveals the API-layer scrub ran over the draft.
+    def test_execute_preserves_rehydrated_output_under_sanitize(self):
+        # The API sanitizer must not undo the executor's local rehydration of the
+        # artifact shown for approval.
         class _FakeSanitizer:
             def load(self):
                 pass
 
             def sanitize(self, text):
-                return text.replace("Omar", "[PERSON_1]")
+                return (text.replace("Omar", "[PERSON_1]")
+                        .replace("Chicago", "[LOCATION_1]"))
 
         backend = _RecordingBackend(output="DRAFT for Omar: checklist ready")
         with mock.patch("gum.sanitize.get_sanitizer", return_value=_FakeSanitizer()):
@@ -191,8 +193,11 @@ class ExecuteEndpointTests(unittest.IsolatedAsyncioTestCase):
             with TestClient(app) as client:
                 resp = client.post("/suggestions/execute")
         outcome = resp.json()["outcomes"][0]
-        # The model-written draft is pseudonymized on the way out.
-        self.assertEqual(outcome["result"]["output"], "DRAFT for [PERSON_1]: checklist ready")
+        self.assertEqual(outcome["result"]["output"], "DRAFT for Omar: checklist ready")
+        self.assertEqual(
+            outcome["suggestion"]["title"],
+            "Draft a checklist for the [LOCATION_1] trip",
+        )
 
     def test_execute_env_flag_enables(self):
         backend = _RecordingBackend()

@@ -163,8 +163,11 @@ gate-rejected one comes back `proposal_only` with no `result`. Approve/reject a
 draft by POSTing the suggestion to the existing `/suggestions/feedback` route
 (`vote: "up" | "down"`) — the same feedback plumbing the CLI review path uses, so
 the accept/reject signal flows back into the GUM either way. Under
-`gum start --sanitize` the model-written text in each outcome is pseudonymized on
-the way out, exactly like the rest of the API.
+`gum start --sanitize`, suggestion and diagnostic metadata remains pseudonymized
+like the rest of the API, but a successful draft is the local review artifact:
+its entities stay rehydrated so the user can review the usable deliverable. The
+feedback route receives suggestion metadata and the vote, never that restored
+draft text.
 
 ## Configuration
 

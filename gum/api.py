@@ -173,10 +173,12 @@ async def _serialize_outcome(outcome: "ExecutionOutcome", sanitizer) -> dict[str
 
     The gate fields (reversibility class, numeric risk, status) carry no PII and
     pass through unchanged; the model-written text — the suggestion's title/
-    description/rationale, the risk rationale, the failure reason, and the agent's
-    draft output/error — is pseudonymized when a sanitizer is active. The grounding
-    ``context`` is already egress-pseudonymized by the executor itself (its own
-    fail-closed sanitizer), so it is not scrubbed a second time here.
+    description/rationale, the risk rationale, failure reason, and backend error —
+    is pseudonymized when a sanitizer is active. A successful agent ``output`` is
+    deliberately *not* scrubbed here: the executor has already rehydrated that
+    local-only review artifact so this approval surface shows the user real entity
+    names. The grounding ``context`` is already egress-pseudonymized by the executor
+    itself (its own fail-closed sanitizer), so it is not scrubbed a second time here.
     """
     data = outcome.to_dict()
     sug = data.get("suggestion") or {}
@@ -189,7 +191,6 @@ async def _serialize_outcome(outcome: "ExecutionOutcome", sanitizer) -> dict[str
         )
     data["reason"] = await _scrub(data.get("reason"), sanitizer)
     if data.get("result"):
-        data["result"]["output"] = await _scrub(data["result"].get("output"), sanitizer)
         data["result"]["error"] = await _scrub(data["result"].get("error"), sanitizer)
     return data
 
