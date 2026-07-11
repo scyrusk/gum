@@ -25,6 +25,7 @@ from gum.executor import (
     RiskAssessment,
 )
 from gum.gumbo import Suggestion, expected_utility
+from gum.models import Proposition
 from gum.schemas import RiskAssessmentSchema
 
 
@@ -176,6 +177,101 @@ class ExecutorGateTests(unittest.IsolatedAsyncioTestCase):
         # And the default accepts the same case, confirming the knob is what moved.
         default = Executor(self.gum)
         self.assertTrue(default.is_auto_dispatchable(sug, assessment))
+
+
+class _FakeSanitizer:
+    """Deterministic stand-in for the PII model (no torch/transformers needed)."""
+
+    def __init__(self, mapping: dict[str, str]):
+        self._mapping = mapping
+
+    def sanitize(self, text: str) -> str:
+        return self.sanitize_map(text)[0]
+
+    def sanitize_map(self, text: str) -> tuple[str, dict[str, str]]:
+        aliases: dict[str, str] = {}
+        for raw, pseudo in self._mapping.items():
+            if raw in text:
+                aliases[raw] = pseudo
+            text = text.replace(raw, pseudo)
+        return text, aliases
+
+
+def _prop(text: str, confidence: int) -> Proposition:
+    return Proposition(
+        text=text,
+        reasoning=f"because of {text}",
+        confidence=confidence,
+        decay=5,
+        revision_group=uuid.uuid4().hex,
+        version=1,
+    )
+
+
+class AssembleContextTests(unittest.IsolatedAsyncioTestCase):
+    """The executor grounds a dispatched task on the SAME assembly the MCP uses.
+
+    Spec #4 forbids a second grounding path, so these assert that
+    ``assemble_context`` retrieves the relevant, high-confidence propositions and
+    pseudonymizes them on egress (the backend shells out to an off-device agent).
+    """
+
+    async def asyncSetUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.gum = Gum(
+            "Omar", "dummy-model", data_directory=self._tmp.name, db_name="test.db"
+        )
+        await self.gum.connect_db()
+
+    async def asyncTearDown(self):
+        if self.gum.engine is not None:
+            await self.gum.engine.dispose()
+        self._tmp.cleanup()
+
+    async def _seed(self, *props: Proposition) -> None:
+        async with self.gum._session() as s:
+            s.add_all(list(props))
+
+    async def test_context_grounds_on_the_suggestion(self):
+        await self._seed(
+            _prop("Omar is applying for a Schmidt Foundation research grant", 9),
+            # A topically-unrelated fact sharing no query terms with the task.
+            _prop("Weekend mountain hikes are a favorite pastime", 6),
+        )
+        ex = Executor(self.gum, sanitize=False)
+        sug = _suggestion(
+            title="Draft the Schmidt Foundation grant proposal",
+            description="Prepare a first draft of the research grant application.",
+        )
+        block = await ex.assemble_context(sug)
+        self.assertIn("Schmidt Foundation research grant", block)
+        # The unrelated proposition is not retrieved for this task.
+        self.assertNotIn("mountain hikes", block)
+
+    async def test_context_is_pseudonymized_for_off_device_dispatch(self):
+        # sanitize defaults ON, fail-closed; here we inject a deterministic fake
+        # so no PII model is required. The backend gets pseudo-IDs, never raw PII.
+        await self._seed(
+            _prop("Omar is applying for a Schmidt Foundation research grant", 9),
+        )
+        fake = _FakeSanitizer({"Schmidt": "[ORG_1]", "Omar": "[PERSON_1]"})
+        ex = Executor(self.gum, sanitizer=fake)
+        sug = _suggestion(
+            title="Draft the Schmidt grant proposal",
+            description="Prepare a first draft for Omar.",
+        )
+        block = await ex.assemble_context(sug)
+        self.assertIn("[ORG_1]", block)
+        self.assertNotIn("Schmidt", block)
+        self.assertNotIn("Omar", block)
+        self.assertIn("pseudonymized", block.lower())
+
+    async def test_thin_gum_yields_honest_empty_context(self):
+        # Nothing confident to ground on → an honest "no context" block, not an
+        # empty string, so the backend prompt reads correctly.
+        ex = Executor(self.gum, sanitize=False)
+        block = await ex.assemble_context(_suggestion())
+        self.assertIn("no confident context", block.lower())
 
 
 if __name__ == "__main__":

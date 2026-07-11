@@ -19,8 +19,9 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import Protocol, runtime_checkable
+from typing import Any, Protocol, runtime_checkable
 
+from .context import gather_context, render_context
 from .gumbo import Suggestion, _env_int
 from .llm import structured_completion
 from .prompts.gumbo import RISK_ASSESSMENT_PROMPT
@@ -35,6 +36,11 @@ DEFAULT_MIN_PROBABILITY = 8
 # Kept deliberately low: the whole point of the bridge is that only near-harmless,
 # reversible actions ever run without the user first saying yes.
 DEFAULT_MAX_RISK = 3
+# How many GUM propositions to ground a dispatched task on. The backend agent
+# gets these as context (the same assembly the MCP hands local agents); a handful
+# of the most relevant, high-confidence facts is enough to ground the work
+# without bloating the agent's prompt.
+DEFAULT_CONTEXT_LIMIT = 10
 
 # Classifications the gate is willing to run automatically. "irreversible" is
 # never in this set by construction — those actions are always proposal-only.
@@ -112,6 +118,9 @@ class Executor:
         backend: AgentBackend | None = None,
         min_probability: int | None = None,
         max_risk: int | None = None,
+        context_limit: int | None = None,
+        sanitize: bool = True,
+        sanitizer: Any = None,
         logger: logging.Logger | None = None,
     ) -> None:
         self.gum = gum_instance
@@ -124,6 +133,19 @@ class Executor:
             max_risk if max_risk is not None
             else _env_int("GUM_EXECUTOR_MAX_RISK", DEFAULT_MAX_RISK)
         )
+        self.context_limit = (
+            context_limit if context_limit is not None
+            else _env_int("GUM_EXECUTOR_CONTEXT_LIMIT", DEFAULT_CONTEXT_LIMIT)
+        )
+        # The shipped backend shells the task out to the local `claude` CLI, i.e.
+        # a frontier model off the device, so the GUM context that grounds it must
+        # be pseudonymized on the way out — same fail-closed default as the MCP
+        # server. A fully-local, trusted backend can opt out with sanitize=False.
+        # An explicit *sanitizer* (a test double, or a pre-loaded instance) skips
+        # lazy loading; otherwise it is loaded the first time context is assembled
+        # so constructing an Executor stays cheap and import-light.
+        self.sanitize = sanitize
+        self._sanitizer = sanitizer
         self.logger = logger or logging.getLogger("gum.executor")
 
     async def assess_risk(self, suggestion: Suggestion) -> RiskAssessment:
@@ -150,6 +172,42 @@ class Executor:
             risk=result.risk,
             rationale=result.rationale,
         )
+
+    def _get_sanitizer(self) -> Any:
+        """Return the egress sanitizer for grounding context, or None if disabled.
+
+        Loaded lazily and fail-closed: the first call constructs and loads the
+        PII model, so if its dependencies are missing this raises rather than
+        silently handing raw identities to an off-device agent. Constructing an
+        Executor stays cheap because this is deferred until context is assembled.
+        """
+        if not self.sanitize:
+            return None
+        if self._sanitizer is None:
+            from .sanitize import get_sanitizer
+
+            self._sanitizer = get_sanitizer()
+            self._sanitizer.load()
+        return self._sanitizer
+
+    async def assemble_context(self, suggestion: Suggestion) -> str:
+        """Build the GUM-grounded prompt block for *suggestion*'s dispatched task.
+
+        Reuses the exact same assembly the MCP server's ``gather_context`` tool
+        uses (:func:`gum.context.gather_context`) — retrieval on the substantive
+        terms plus fail-closed egress pseudonymization — so the execution bridge
+        does not fork a second grounding path (spec #4). Returns a text block a
+        backend can embed in the agent's instructions; the suggestion's own
+        title/description seed the retrieval topic.
+        """
+        topic = f"{suggestion.title}. {suggestion.description}".strip()
+        result = await gather_context(
+            self.gum,
+            topic,
+            sanitizer=self._get_sanitizer(),
+            limit=self.context_limit,
+        )
+        return render_context(result)
 
     def is_auto_dispatchable(
         self, suggestion: Suggestion, assessment: RiskAssessment
