@@ -334,6 +334,19 @@ async def _scrub(text: str, enabled: bool) -> str:
     return await asyncio.to_thread(get_sanitizer().sanitize, text)
 
 
+async def _scrub_fragment(text: str, enabled: bool) -> str:
+    """Pseudonymize a short, context-free field (a bare name, a terse title).
+
+    Routes through the sanitizer's carrier-context path (see
+    :meth:`gum.sanitize.Sanitizer.sanitize_fragment`), which the NER model needs
+    to reliably tag a lone name that a plain :func:`_scrub` would leak.
+    """
+    if not enabled or not text:
+        return text
+    from gum.sanitize import get_sanitizer
+    return await asyncio.to_thread(get_sanitizer().sanitize_fragment, text)
+
+
 async def cmd_query(args) -> None:
     g = gum(_user_name(args) or "default", _text_model(args))
     await g.connect_db()
@@ -387,11 +400,14 @@ async def cmd_agenda(args) -> None:
 
     # The model-written text fields (title/source/proposition_text) carry PII;
     # scrub them before they leave the process when sanitization is on. The
-    # numeric/date fields never do, so they pass through untouched.
+    # numeric/date fields never do, so they pass through untouched. title/source
+    # are terse, context-free fragments (often a bare name) that the NER model
+    # under-detects, so they use the carrier-context _scrub_fragment; the
+    # full-sentence proposition_text uses the plain _scrub.
     sanitize = _sanitize_enabled(args)
     for c in commitments:
-        c.title = await _scrub(c.title, sanitize)
-        c.source = await _scrub(c.source, sanitize)
+        c.title = await _scrub_fragment(c.title, sanitize)
+        c.source = await _scrub_fragment(c.source, sanitize)
         c.proposition_text = await _scrub(c.proposition_text, sanitize)
 
     if args.json:

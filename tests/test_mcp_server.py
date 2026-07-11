@@ -57,6 +57,11 @@ class _FakeSanitizer:
     def sanitize(self, text: str) -> str:
         return self.sanitize_map(text)[0]
 
+    def sanitize_fragment(self, text: str) -> str:
+        # This fake is context-independent, so a fragment scrubs the same as a
+        # sentence; the real Sanitizer wraps the value in a carrier first.
+        return self.sanitize(text)
+
     def sanitize_map(self, text: str) -> tuple[str, dict[str, str]]:
         aliases: dict[str, str] = {}
         for raw, pseudo in self._mapping.items():

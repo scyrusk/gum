@@ -67,6 +67,18 @@ async def _scrub(text: str | None, sanitizer) -> str | None:
     return await asyncio.to_thread(sanitizer.sanitize, text)
 
 
+async def _scrub_fragment(text: str | None, sanitizer) -> str | None:
+    """Pseudonymize a short, context-free field (a bare name, a terse title).
+
+    Uses the sanitizer's carrier-context path (see
+    :meth:`gum.sanitize.Sanitizer.sanitize_fragment`), which the NER model needs
+    to reliably tag a lone name that a plain :func:`_scrub` would leak.
+    """
+    if sanitizer is None or not text:
+        return text
+    return await asyncio.to_thread(sanitizer.sanitize_fragment, text)
+
+
 async def _serialize_proposition(
     prop: Proposition,
     sanitizer,
@@ -113,10 +125,16 @@ async def _serialize_commitment(commitment, sanitizer) -> dict[str, Any]:
     ``proposition_text``) are generated from raw propositions and carry PII, so
     they pass through the sanitizer; the numeric/date/ranking fields never do and
     are emitted unchanged. Mirrors :func:`_serialize_suggestion`.
+
+    ``title`` and ``source`` are terse, context-free fragments (often a bare
+    name), which the NER model under-detects — so they go through the
+    carrier-context :func:`_scrub_fragment` rather than the plain :func:`_scrub`
+    used for the full-sentence ``proposition_text``.
     """
     data = commitment.to_dict()
-    for field in ("title", "source", "proposition_text"):
-        data[field] = await _scrub(data[field], sanitizer)
+    for field in ("title", "source"):
+        data[field] = await _scrub_fragment(data[field], sanitizer)
+    data["proposition_text"] = await _scrub(data["proposition_text"], sanitizer)
     return data
 
 

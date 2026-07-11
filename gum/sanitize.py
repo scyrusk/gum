@@ -39,6 +39,14 @@ MAX_PIPE_CHARS = 1200
 # how large the input is.
 PIPE_BATCH_SIZE = 16
 
+# Carrier sentence for Sanitizer.sanitize_fragment. The NER model has poor recall
+# on a bare, context-free name (a lone "Jacob Willie Agnew" is not tagged, while
+# the same name inside a sentence is), so a short field is ALSO run through the
+# detector inside this carrier and any entity found is redacted from the original.
+# The tokens are PII-free (they never become spans themselves); keep them so.
+_FRAGMENT_CARRIER_PREFIX = "Regarding "
+_FRAGMENT_CARRIER_SUFFIX = ", please follow up."
+
 # privacy-filter emits labels for person, email, phone, address, account number,
 # url, date, and secret. `aggregation_strategy="simple"` strips the BIOES prefixes,
 # but the exact spelling of each group varies (e.g. "private_person", "phone_number"),
@@ -243,6 +251,47 @@ class Sanitizer:
     def sanitize(self, text: str) -> str:
         """Return *text* with every detected PII span replaced by a pseudo-ID."""
         return self.sanitize_map(text)[0]
+
+    def sanitize_fragment(self, text: str) -> str:
+        """Sanitize a short, context-free value (a bare name, a terse title/field).
+
+        The privacy-filter model's recall on a name depends on the surrounding
+        context, and *neither* the bare value nor a carriered one dominates:
+
+        * A lone ``"Jacob Willie Agnew"`` (a commitment's owner/source) passes
+          straight through un-pseudonymized on its own, but the same name inside
+          a sentence is tagged — so a carrier sentence catches it.
+        * A value that already has a leading verb (``"Meet Jacob Willie Agnew"``,
+          a typical title) is caught bare, but wrapping it in a carrier can
+          *under*-detect it (dropping a trailing token) — so the bare pass is
+          better there.
+
+        Short model-written fields arrive as both shapes, so scrubbing them one
+        way leaks PII on a surface that reports itself ``sanitized``. This runs
+        the detector on BOTH the bare value and the value inside a fixed,
+        PII-free carrier sentence, then redacts the union of every raw span
+        either pass found — defense in depth, strictly at least as redacted as a
+        plain :meth:`sanitize`. Pseudo-IDs stay consistent with sentence-context
+        scrubbing because the entity map keys on the entity text, not the carrier.
+        """
+        if not text or not text.strip():
+            return text
+        _, bare = self.sanitize_map(text)
+        _, carried = self.sanitize_map(
+            _FRAGMENT_CARRIER_PREFIX + text + _FRAGMENT_CARRIER_SUFFIX
+        )
+        spans = {**carried, **bare}  # raw span -> pseudo-id, from either pass
+        if not spans:
+            return text
+        out = text
+        # Longest span first so a superstring ("Jacob Willie Agnew") is consumed
+        # before a substring ("Jacob Willie") one pass may have found instead. The
+        # `raw in out` guard skips any span that came back fused with carrier text
+        # (e.g. ", please") and so isn't present in the original.
+        for raw in sorted(spans, key=len, reverse=True):
+            if raw and raw in out:
+                out = out.replace(raw, spans[raw])
+        return out
 
     def sanitize_map(self, text: str) -> tuple[str, dict[str, str]]:
         """Sanitize *text* and also return the ``{raw_span: pseudo_id}`` map of what

@@ -515,6 +515,9 @@ class AgendaEndpointTests(unittest.IsolatedAsyncioTestCase):
         fake_sanitizer = mock.Mock()
         fake_sanitizer.load = mock.Mock()
         fake_sanitizer.sanitize = mock.Mock(side_effect=lambda t: t.replace("Schmidt", "[ORG]"))
+        # title/source use the carrier-context fragment path; this fake is
+        # context-independent so it scrubs a fragment the same as a sentence.
+        fake_sanitizer.sanitize_fragment = mock.Mock(side_effect=lambda t: t.replace("Schmidt", "[ORG]"))
         with mock.patch("gum.sanitize.get_sanitizer", return_value=fake_sanitizer):
             app = create_app(self.gum, sanitize=True)
             with mock.patch("gum.agenda.structured_completion", side_effect=self._fake_completion()):

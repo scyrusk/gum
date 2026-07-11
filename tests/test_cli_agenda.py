@@ -152,11 +152,15 @@ class CmdAgendaTests(unittest.IsolatedAsyncioTestCase):
             called["enabled"] = enabled
             return "[REDACTED]" if enabled else text
 
-        with mock.patch("gum.cli._scrub", side_effect=fake_scrub):
+        # title/source route through _scrub_fragment (carrier-context), the
+        # full-sentence proposition_text through _scrub; both must scrub.
+        with mock.patch("gum.cli._scrub", side_effect=fake_scrub), \
+                mock.patch("gum.cli._scrub_fragment", side_effect=fake_scrub):
             out = await self._run(_args(sanitize=True, json=True))
         self.assertTrue(called["enabled"])
         data = json.loads(out)
         self.assertTrue(all(row["title"] == "[REDACTED]" for row in data))
+        self.assertTrue(all(row["source"] == "[REDACTED]" for row in data))
 
     async def test_empty_radar_message(self):
         async def empty(client, model, messages, schema, **kwargs):
