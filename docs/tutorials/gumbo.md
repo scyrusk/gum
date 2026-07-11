@@ -97,11 +97,47 @@ approval, because no agent ran.
 Without `--review`, `gum execute` just lists the outcomes (useful for a dry run
 to see what *would* be dispatched).
 
+### From the local REST API
+
+The same bridge is exposed over the localhost API (`gum/api.py`) so the web
+suggestion cards — or any local app — can offer an "execute" action alongside the
+existing thumbs up/down. It is the **same** default-OFF opt-in: the route only
+runs when the server is built with `execute=True` (or `GUMBO_EXECUTION_ENABLED=1`);
+otherwise it returns `{"ok": false, "enabled": false}` and touches no agent.
+
+```bash
+# enabled server:
+curl -s -X POST localhost:8422/suggestions/execute \
+     -H 'content-type: application/json' -d '{"focus": "grant writing"}'
+```
+
+```json
+{
+  "ok": true, "enabled": true, "focus": "grant writing", "dispatched": 1,
+  "outcomes": [
+    {
+      "status": "pending_approval",
+      "suggestion": {"title": "Draft a reply to the reviewer thread", "...": "..."},
+      "assessment": {"reversibility": "reversible", "risk": 2, "rationale": "…"},
+      "result": {"ok": true, "output": "Hi all — thanks for the thorough review. …"}
+    }
+  ]
+}
+```
+
+Each `pending_approval` outcome is a draft awaiting the user's decision; a
+gate-rejected one comes back `proposal_only` with no `result`. Approve/reject a
+draft by POSTing the suggestion to the existing `/suggestions/feedback` route
+(`vote: "up" | "down"`) — the same feedback plumbing the CLI review path uses, so
+the accept/reject signal flows back into the GUM either way. Under
+`gum start --sanitize` the model-written text in each outcome is pseudonymized on
+the way out, exactly like the rest of the API.
+
 ## Configuration
 
 | Knob | Default | What it does |
 | --- | --- | --- |
-| `GUMBO_EXECUTION_ENABLED` | `false` | Master opt-in for the Python engine's `execute()` path |
+| `GUMBO_EXECUTION_ENABLED` | `false` | Master opt-in for the `execute()` path — gates both the Python engine and the REST `POST /suggestions/execute` route |
 | `GUM_EXECUTOR_MIN_PROBABILITY` | `8` | Minimum `P(useful)` (1–10) a suggestion needs to auto-dispatch |
 | `GUM_EXECUTOR_MAX_RISK` | `3` | Maximum assessed risk (1–10) allowed to auto-dispatch |
 | `GUM_EXECUTOR_CONTEXT_LIMIT` | `10` | How many propositions ground the dispatched task |
