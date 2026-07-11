@@ -274,11 +274,21 @@ class CommitmentRadar:
             .replace("{propositions}", self._format_propositions(props))
         )
 
+        # Greedy decoding (temperature 0): commitment extraction is a
+        # classification task with one right answer, not a creative one. The
+        # model's default temperature makes the same GUM state yield a different
+        # radar on each refresh — reshuffling a "standing artifact" is confusing —
+        # and the sampling noise is exactly what lets an ongoing-activity
+        # proposition slip through as a false-positive commitment on some runs.
+        # Pinning temperature=0 makes the radar deterministic and picks the
+        # model's most-probable classification, matching the other decision calls
+        # in gum.gum (blacklist compliance, audit).
         result = await structured_completion(
             self.gum.client,
             self.gum.model,
             [{"role": "user", "content": prompt}],
             CommitmentSchema,
+            temperature=0,
             logger=self.logger,
         )
 

@@ -293,6 +293,24 @@ class CommitmentRadarTests(unittest.IsolatedAsyncioTestCase):
                     "days_until_due", "proposition_id", "confidence", "decay"):
             self.assertIn(key, d)
 
+    async def test_build_uses_greedy_decoding(self):
+        # Commitment extraction is a classification task: the same GUM state must
+        # yield the same radar, and the sampling noise of a nonzero temperature is
+        # what lets an ongoing-activity proposition slip through as a false
+        # positive on some runs. Guard that the extraction is pinned to greedy
+        # decoding (temperature=0), matching the other decision calls in gum.gum.
+        captured = {}
+
+        async def fake_completion(client, model, messages, schema, **kwargs):
+            captured["kwargs"] = kwargs
+            return CommitmentSchema(commitments=[])
+
+        radar = CommitmentRadar(self.gum, min_confidence=3)
+        with mock.patch("gum.agenda.structured_completion", side_effect=fake_completion):
+            await radar.build(now=NOW)
+
+        self.assertEqual(captured["kwargs"].get("temperature"), 0)
+
     async def test_build_dedupes_near_duplicate_titles_keeping_most_urgent(self):
         # The GUM re-infers overlapping propositions, so the extractor emits the
         # same commitment twice with cosmetically-different titles and dates.
