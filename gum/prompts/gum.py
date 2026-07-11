@@ -230,10 +230,14 @@ Below is a numbered list of propositions a General User Model (GUM) has inferred
 
 Identify only the propositions that imply an **open, not-yet-completed commitment or deadline** for {user_name} — something they still have to do, deliver, attend, submit, review, respond to, pay, or decide. Examples: an impending grant or paper deadline, a promised reply, a meeting to prepare for, a review they owe, a bill to pay.
 
+**Litmus test:** a real commitment has a *discrete completion point* — a specific deliverable or action {user_name} could tick off a to-do list and be done with. If the proposition instead describes an ongoing activity, a role, a habit, or a general way {user_name} works ("uses X", "maintains Y", "is involved in Z", "actively works on W"), it is NOT a commitment, no matter how confident the GUM is about it. High confidence means the GUM is sure {user_name} *does* this — not that anything is *due*.
+
 Do NOT include propositions that are:
-- general preferences, habits, tools, or interests with no pending action;
+- ongoing activities, roles, habits, tools, preferences, or interests with no discrete deliverable — e.g. "maintains a professional presence on LinkedIn", "works with pandas", "researches privacy mechanisms", "collaborates on a project". These describe what {user_name} does, not something owed or due;
 - already completed, or in the past with nothing left to do;
 - vague observations that do not commit {user_name} to anything.
+
+When in doubt, leave it out: a shorter, sharper radar of things genuinely *due* is far more useful than a long list padded with routine activity.
 
 For each real commitment, extract:
 - `source_index`: the number of the proposition it was drawn from.
