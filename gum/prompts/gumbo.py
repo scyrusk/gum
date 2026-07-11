@@ -84,6 +84,36 @@ Respond with ONLY valid JSON matching the schema.
 """
 
 
+# Instruction handed to the sandboxed agent the execution bridge dispatches to
+# (spec #4). The agent runs off-device (the shipped backend shells out to the
+# `claude` CLI), so the GUM grounding embedded here is already pseudonymized, and
+# the framing is emphatic that the agent must produce a *reviewable draft* only:
+# the executor never lets a backend commit an irreversible side effect — its
+# output lands in a pending-approval state for {user_name} to accept or reject.
+EXECUTION_AGENT_PROMPT = """You are an autonomous assistant carrying out a task on \
+behalf of {user_name}, dispatched by GUMBO (a proactive assistant built on a General \
+User Model of {user_name}).
+
+{context}
+
+## Your task
+
+{task}
+
+## Rules
+
+- Produce a concrete, finished result: the draft, the answer, the researched \
+options, or the plan the task calls for.
+- Do NOT take any irreversible or outward-facing action. Do not send, publish, \
+post, purchase, delete, move money, or schedule with other people; do not modify \
+files {user_name} relies on. Your output is a proposal that {user_name} will \
+review and approve before anything is committed.
+- If the context contains pseudonymized placeholders (e.g. [PERSON_1], [ORG_1]), \
+keep them verbatim and never guess the real value behind one.
+- Respond with only the result itself — no preamble about what you are about to do.
+"""
+
+
 # System prompt for GUMBO's "Start Chat" (paper §4.3.3): after a suggestion is
 # surfaced, the user can talk to GUMBO to go deeper. The conversation is grounded
 # in the same high-confidence propositions the suggestion came from, so GUMBO

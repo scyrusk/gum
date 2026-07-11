@@ -12,6 +12,7 @@
 
 from __future__ import annotations
 
+import os
 import tempfile
 import unittest
 import uuid
@@ -21,6 +22,11 @@ from gum import gum as Gum
 from gum.executor import (
     DEFAULT_MAX_RISK,
     DEFAULT_MIN_PROBABILITY,
+    STATUS_FAILED,
+    STATUS_PENDING_APPROVAL,
+    STATUS_PROPOSAL_ONLY,
+    AgentResult,
+    ClaudeCLIBackend,
     Executor,
     RiskAssessment,
 )
@@ -272,6 +278,160 @@ class AssembleContextTests(unittest.IsolatedAsyncioTestCase):
         ex = Executor(self.gum, sanitize=False)
         block = await ex.assemble_context(_suggestion())
         self.assertIn("no confident context", block.lower())
+
+
+class _RecordingBackend:
+    """A mock AgentBackend that records its inputs and returns a canned result."""
+
+    def __init__(self, result: AgentResult):
+        self._result = result
+        self.calls: list[dict] = []
+
+    async def run(self, task, context, *, cwd, timeout):
+        self.calls.append(
+            {"task": task, "context": context, "cwd": cwd, "timeout": timeout}
+        )
+        return self._result
+
+
+class DispatchFlowTests(unittest.IsolatedAsyncioTestCase):
+    """The end-to-end dispatch flow: gate → ground → run backend → hold artifact.
+
+    The agent backend is mocked so no ``claude`` CLI or model is required. These
+    assert that only gate-clearing suggestions reach the backend, that a run's
+    output lands in a pending-approval outcome, and that a risky suggestion never
+    dispatches.
+    """
+
+    async def asyncSetUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.gum = Gum(
+            "Omar", "dummy-model", data_directory=self._tmp.name, db_name="test.db"
+        )
+        await self.gum.connect_db()
+
+    async def asyncTearDown(self):
+        if self.gum.engine is not None:
+            await self.gum.engine.dispose()
+        self._tmp.cleanup()
+
+    def _patch_assessment(self, reversibility: str, risk: int):
+        async def fake_completion(client, model, messages, schema, **kwargs):
+            return RiskAssessmentSchema(
+                reversibility=reversibility, risk=risk, rationale="stub"
+            )
+
+        return mock.patch(
+            "gum.executor.structured_completion", side_effect=fake_completion
+        )
+
+    async def test_dispatch_runs_backend_and_holds_for_approval(self):
+        backend = _RecordingBackend(AgentResult(ok=True, output="three rental shops: ..."))
+        ex = Executor(self.gum, backend=backend, sanitize=False)
+        sug = _suggestion(probability_useful=9)
+        with self._patch_assessment("read_only", 1):
+            outcome = await ex.dispatch(sug)
+
+        self.assertEqual(outcome.status, STATUS_PENDING_APPROVAL)
+        self.assertTrue(outcome.is_pending_approval)
+        self.assertTrue(outcome.dispatched)
+        self.assertEqual(outcome.result.output, "three rental shops: ...")
+        # The backend actually ran, exactly once, confined to a workspace cwd with
+        # the executor's timeout, and grounded on the assembled task.
+        self.assertEqual(len(backend.calls), 1)
+        call = backend.calls[0]
+        self.assertEqual(call["timeout"], ex.timeout)
+        self.assertTrue(os.path.isdir(call["cwd"]))
+        self.assertIn(sug.title, call["task"])
+        self.assertIn("review", call["task"].lower())
+
+    async def test_risky_suggestion_never_dispatches(self):
+        backend = _RecordingBackend(AgentResult(ok=True, output="should not run"))
+        ex = Executor(self.gum, backend=backend, sanitize=False)
+        sug = _suggestion(title="Email the reviewers", probability_useful=10)
+        with self._patch_assessment("irreversible", 2):
+            outcome = await ex.dispatch(sug)
+
+        self.assertEqual(outcome.status, STATUS_PROPOSAL_ONLY)
+        self.assertFalse(outcome.dispatched)
+        self.assertIsNone(outcome.result)
+        self.assertEqual(backend.calls, [])  # the agent was never invoked
+
+    async def test_backend_failure_lands_failed_not_pending(self):
+        backend = _RecordingBackend(
+            AgentResult(ok=False, output="", error="agent timed out after 120s")
+        )
+        ex = Executor(self.gum, backend=backend, sanitize=False)
+        sug = _suggestion(probability_useful=9)
+        with self._patch_assessment("reversible", 2):
+            outcome = await ex.dispatch(sug)
+
+        self.assertEqual(outcome.status, STATUS_FAILED)
+        self.assertFalse(outcome.is_pending_approval)
+        self.assertIn("timed out", outcome.reason)
+
+    async def test_missing_backend_stays_proposal_only(self):
+        ex = Executor(self.gum, sanitize=False)  # no backend configured
+        sug = _suggestion(probability_useful=9)
+        with self._patch_assessment("read_only", 1):
+            outcome = await ex.dispatch(sug)
+        self.assertEqual(outcome.status, STATUS_PROPOSAL_ONLY)
+        self.assertIn("backend", outcome.reason)
+
+    async def test_outcome_to_dict_is_json_friendly(self):
+        backend = _RecordingBackend(AgentResult(ok=True, output="draft"))
+        ex = Executor(self.gum, backend=backend, sanitize=False)
+        sug = _suggestion(probability_useful=9)
+        with self._patch_assessment("read_only", 1):
+            outcome = await ex.dispatch(sug)
+        d = outcome.to_dict()
+        self.assertEqual(d["status"], STATUS_PENDING_APPROVAL)
+        self.assertEqual(d["suggestion"]["title"], sug.title)
+        self.assertEqual(d["result"]["output"], "draft")
+        self.assertEqual(d["assessment"]["reversibility"], "read_only")
+
+
+class ClaudeCLIBackendTests(unittest.IsolatedAsyncioTestCase):
+    """The shipped backend: subprocess mechanics, sandboxing, and failure modes.
+
+    Uses a stand-in executable (``cat``/a missing binary) instead of the real
+    ``claude`` CLI so these run offline and deterministically.
+    """
+
+    async def test_missing_cli_returns_error_not_raises(self):
+        backend = ClaudeCLIBackend(command="definitely-not-a-real-binary-xyz")
+        with tempfile.TemporaryDirectory() as cwd:
+            result = await backend.run("do it", "ctx", cwd=cwd, timeout=5)
+        self.assertFalse(result.ok)
+        self.assertIn("not found", result.error)
+
+    async def test_captures_stdout_and_feeds_prompt_on_stdin(self):
+        # `cat` echoes stdin to stdout, so it stands in for a CLI that reads the
+        # prompt and prints a result: we can assert the prompt reached the process
+        # and its output was captured.
+        backend = ClaudeCLIBackend(command="cat", extra_args=[])
+        with tempfile.TemporaryDirectory() as cwd:
+            result = await backend.run("draft the reply", "## context block", cwd=cwd, timeout=10)
+        self.assertTrue(result.ok)
+        self.assertIn("draft the reply", result.output)
+        self.assertIn("## context block", result.output)
+
+    async def test_timeout_kills_and_reports(self):
+        # `sleep 30` never produces output; the backend must kill it and report a
+        # timeout rather than hang.
+        backend = ClaudeCLIBackend(command="sleep", extra_args=["30"])
+        with tempfile.TemporaryDirectory() as cwd:
+            result = await backend.run("x", "", cwd=cwd, timeout=0.5)
+        self.assertFalse(result.ok)
+        self.assertIn("timed out", result.error)
+
+    async def test_nonzero_exit_is_a_failure(self):
+        # `false` exits 1 with no output.
+        backend = ClaudeCLIBackend(command="false", extra_args=[])
+        with tempfile.TemporaryDirectory() as cwd:
+            result = await backend.run("x", "", cwd=cwd, timeout=5)
+        self.assertFalse(result.ok)
+        self.assertTrue(result.error)
 
 
 if __name__ == "__main__":

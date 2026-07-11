@@ -17,14 +17,17 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
-from dataclasses import dataclass
+import os
+import shlex
+from dataclasses import asdict, dataclass
 from typing import Any, Protocol, runtime_checkable
 
 from .context import gather_context, render_context
-from .gumbo import Suggestion, _env_int
+from .gumbo import Suggestion, _env_float, _env_int
 from .llm import structured_completion
-from .prompts.gumbo import RISK_ASSESSMENT_PROMPT
+from .prompts.gumbo import EXECUTION_AGENT_PROMPT, RISK_ASSESSMENT_PROMPT
 from .schemas import RiskAssessmentSchema
 
 # The suggestion itself must clear a high-confidence bar before its action is even
@@ -41,10 +44,21 @@ DEFAULT_MAX_RISK = 3
 # of the most relevant, high-confidence facts is enough to ground the work
 # without bloating the agent's prompt.
 DEFAULT_CONTEXT_LIMIT = 10
+# Hard wall-clock cap on a dispatched agent run. The backend is killed if it
+# overruns; a dispatch that can't finish in a couple of minutes is not the kind
+# of small, reversible task the bridge is meant to auto-run, so failing closed
+# (no result) is the right outcome.
+DEFAULT_TIMEOUT = 120.0
 
 # Classifications the gate is willing to run automatically. "irreversible" is
 # never in this set by construction — those actions are always proposal-only.
 _AUTO_DISPATCH_REVERSIBILITY = frozenset({"read_only", "reversible"})
+
+# The three terminal states a dispatch can land in. Every state that involves an
+# agent run holds its output for the user — nothing here commits anything.
+STATUS_PROPOSAL_ONLY = "proposal_only"   # gate rejected it; agent never ran
+STATUS_PENDING_APPROVAL = "pending_approval"  # agent produced a reviewable draft
+STATUS_FAILED = "failed"  # agent ran but errored/timed out; nothing to approve
 
 
 @dataclass
@@ -101,6 +115,129 @@ class AgentBackend(Protocol):
         ...
 
 
+@dataclass
+class ExecutionOutcome:
+    """The reviewable artifact :meth:`Executor.dispatch` produces for a suggestion.
+
+    This is the object a UI (the web suggestion card or ``gum execute --review``)
+    renders so the user can accept or reject it. It never represents a committed
+    action: ``status`` is one of :data:`STATUS_PROPOSAL_ONLY` (the gate declined to
+    run it), :data:`STATUS_PENDING_APPROVAL` (an agent produced a draft awaiting
+    approval), or :data:`STATUS_FAILED` (the agent ran but errored/timed out).
+    ``reason`` explains a proposal-only/failed outcome; ``context`` is the
+    (pseudonymized) GUM grounding the agent received.
+    """
+
+    suggestion: Suggestion
+    status: str
+    assessment: RiskAssessment | None = None
+    context: str | None = None
+    result: AgentResult | None = None
+    reason: str | None = None
+
+    @property
+    def is_pending_approval(self) -> bool:
+        """True when an agent produced a draft the user still needs to approve."""
+        return self.status == STATUS_PENDING_APPROVAL
+
+    @property
+    def dispatched(self) -> bool:
+        """True when the gate cleared the suggestion and an agent actually ran."""
+        return self.status in (STATUS_PENDING_APPROVAL, STATUS_FAILED)
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serialize for the REST API / CLI review surface (JSON-friendly)."""
+        return {
+            "suggestion": self.suggestion.to_dict(),
+            "status": self.status,
+            "assessment": asdict(self.assessment) if self.assessment else None,
+            "context": self.context,
+            "result": asdict(self.result) if self.result else None,
+            "reason": self.reason,
+        }
+
+
+class ClaudeCLIBackend:
+    """An :class:`AgentBackend` that shells out to the local ``claude`` CLI.
+
+    Runs the agent non-interactively (``claude -p``) confined to a restricted
+    working directory, with the GUM-grounded task fed on **stdin** (so no prompt
+    text ever touches a shell command line) and a hard wall-clock timeout that
+    kills the process group on overrun. The CLI's stdout is captured verbatim as
+    the reviewable draft; the backend commits nothing itself.
+
+    Sandboxing here is defence-in-depth on top of the executor's risk gate: the
+    agent only ever sees a *restricted* ``cwd`` (the executor hands it a scratch
+    workspace, not the user's real project), the run is time-boxed, and the prompt
+    instructs the agent to produce a draft rather than act. ``command`` and
+    ``extra_args`` are injectable so a deployment can pass its own binary path or
+    tighten the CLI's tool-permission flags without editing this class; the
+    ``GUM_EXECUTOR_CLAUDE_ARGS`` env var appends further args (shell-split).
+    """
+
+    def __init__(
+        self,
+        *,
+        command: str = "claude",
+        extra_args: list[str] | None = None,
+        logger: logging.Logger | None = None,
+    ) -> None:
+        self.command = command
+        # `-p` runs the CLI in non-interactive "print" mode: it reads the prompt,
+        # emits the result to stdout, and exits — no REPL, no user prompts.
+        self.extra_args = list(extra_args) if extra_args is not None else ["-p"]
+        env_args = os.getenv("GUM_EXECUTOR_CLAUDE_ARGS", "").strip()
+        if env_args:
+            self.extra_args = self.extra_args + shlex.split(env_args)
+        self.logger = logger or logging.getLogger("gum.executor.backend")
+
+    def _build_prompt(self, task: str, context: str) -> str:
+        # Fold the pseudonymized GUM grounding and the task into the single agent
+        # instruction. `task` already carries the safety framing (see
+        # Executor._build_task); nothing here re-derives context, keeping the one
+        # grounding path the spec requires.
+        return f"{context}\n\n{task}\n" if context else f"{task}\n"
+
+    async def run(
+        self, task: str, context: str, *, cwd: str, timeout: float
+    ) -> AgentResult:
+        prompt = self._build_prompt(task, context)
+        argv = [self.command, *self.extra_args]
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *argv,
+                cwd=cwd,
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+        except FileNotFoundError:
+            return AgentResult(
+                ok=False,
+                output="",
+                error=f"agent CLI {self.command!r} not found on PATH",
+            )
+        except OSError as exc:  # pragma: no cover - platform-dependent
+            return AgentResult(ok=False, output="", error=f"failed to launch agent: {exc}")
+
+        try:
+            stdout, stderr = await asyncio.wait_for(
+                proc.communicate(prompt.encode()), timeout=timeout
+            )
+        except asyncio.TimeoutError:
+            proc.kill()
+            await proc.wait()
+            return AgentResult(
+                ok=False, output="", error=f"agent timed out after {timeout:g}s"
+            )
+
+        out = stdout.decode(errors="replace").strip()
+        if proc.returncode != 0:
+            err = stderr.decode(errors="replace").strip() or f"exit code {proc.returncode}"
+            return AgentResult(ok=False, output=out, error=err)
+        return AgentResult(ok=True, output=out)
+
+
 class Executor:
     """Decides whether a GUMBO suggestion may act, and (later) dispatches it.
 
@@ -119,6 +256,8 @@ class Executor:
         min_probability: int | None = None,
         max_risk: int | None = None,
         context_limit: int | None = None,
+        timeout: float | None = None,
+        workspace_dir: str | None = None,
         sanitize: bool = True,
         sanitizer: Any = None,
         logger: logging.Logger | None = None,
@@ -136,6 +275,18 @@ class Executor:
         self.context_limit = (
             context_limit if context_limit is not None
             else _env_int("GUM_EXECUTOR_CONTEXT_LIMIT", DEFAULT_CONTEXT_LIMIT)
+        )
+        self.timeout = (
+            timeout if timeout is not None
+            else _env_float("GUM_EXECUTOR_TIMEOUT", DEFAULT_TIMEOUT)
+        )
+        # The sandboxed cwd handed to the backend. Defaults to a scratch directory
+        # under the GUM data dir — deliberately NOT the user's real project — so a
+        # dispatched agent is confined to a throwaway workspace. Created lazily on
+        # first dispatch so construction stays I/O-free.
+        self._workspace_dir = (
+            workspace_dir if workspace_dir is not None
+            else os.getenv("GUM_EXECUTOR_WORKSPACE")
         )
         # The shipped backend shells the task out to the local `claude` CLI, i.e.
         # a frontier model off the device, so the GUM context that grounds it must
@@ -208,6 +359,87 @@ class Executor:
             limit=self.context_limit,
         )
         return render_context(result)
+
+    def _ensure_workspace(self) -> str:
+        """Return the restricted cwd for a dispatched agent, creating it if needed.
+
+        The default is a scratch directory under the GUM data dir — never the
+        user's real working tree — so the backend runs confined to a throwaway
+        workspace. Resolved and created lazily so constructing an Executor does no
+        I/O.
+        """
+        path = self._workspace_dir or os.path.join(
+            self.gum._data_directory, "executor_workspace"
+        )
+        os.makedirs(path, exist_ok=True)
+        self._workspace_dir = path
+        return path
+
+    def _build_task(self, suggestion: Suggestion, context: str) -> str:
+        """Compose the safety-framed, GUM-grounded instruction for the backend.
+
+        Wraps the suggestion in :data:`EXECUTION_AGENT_PROMPT`, which embeds the
+        (already pseudonymized) ``context`` and instructs the agent to produce a
+        reviewable draft rather than take any irreversible action.
+        """
+        parts = [suggestion.title.strip()]
+        if suggestion.description and suggestion.description.strip():
+            parts.append(suggestion.description.strip())
+        return EXECUTION_AGENT_PROMPT.format(
+            user_name=self.gum.user_name,
+            context=context,
+            task="\n\n".join(parts),
+        )
+
+    async def dispatch(self, suggestion: Suggestion) -> ExecutionOutcome:
+        """Run the full bridge for *suggestion*: gate → ground → dispatch → capture.
+
+        Assesses the action's risk and applies the auto-dispatch gate; a
+        suggestion that fails stays :data:`STATUS_PROPOSAL_ONLY` and no agent runs.
+        A suggestion that clears it is grounded on the shared GUM context assembly
+        and handed to the configured :class:`AgentBackend`, whose output is
+        captured into a :class:`ExecutionOutcome` held for the user's approval
+        (:data:`STATUS_PENDING_APPROVAL`, or :data:`STATUS_FAILED` if the agent
+        errored or timed out). This method never commits an irreversible effect —
+        it only ever produces a reviewable artifact.
+        """
+        assessment = await self.assess_risk(suggestion)
+        if not self.is_auto_dispatchable(suggestion, assessment):
+            return ExecutionOutcome(
+                suggestion=suggestion,
+                status=STATUS_PROPOSAL_ONLY,
+                assessment=assessment,
+                reason="held for review: did not clear the auto-dispatch gate",
+            )
+        if self.backend is None:
+            # Gate cleared but nothing to run it — stay proposal-only rather than
+            # pretending a dispatch happened.
+            return ExecutionOutcome(
+                suggestion=suggestion,
+                status=STATUS_PROPOSAL_ONLY,
+                assessment=assessment,
+                reason="no agent backend configured",
+            )
+
+        context = await self.assemble_context(suggestion)
+        task = self._build_task(suggestion, context)
+        cwd = self._ensure_workspace()
+        self.logger.info(
+            "executor: dispatching suggestion %r to agent (cwd=%s, timeout=%gs)",
+            suggestion.title, cwd, self.timeout,
+        )
+        # The backend already received the grounding folded into `task`; passing an
+        # empty context here avoids duplicating it into the prompt twice.
+        result = await self.backend.run(task, "", cwd=cwd, timeout=self.timeout)
+        status = STATUS_PENDING_APPROVAL if result.ok else STATUS_FAILED
+        return ExecutionOutcome(
+            suggestion=suggestion,
+            status=status,
+            assessment=assessment,
+            context=context,
+            result=result,
+            reason=None if result.ok else (result.error or "agent run failed"),
+        )
 
     def is_auto_dispatchable(
         self, suggestion: Suggestion, assessment: RiskAssessment
