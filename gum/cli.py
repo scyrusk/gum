@@ -170,6 +170,26 @@ def parse_args():
     p_review.add_argument("--user-name", "-u", type=str)
     p_review.add_argument("--text-model", "-m", type=str)
 
+    p_execute = sub.add_parser(
+        "execute",
+        help="Run the GUMBO execution bridge: dispatch high-confidence, reversible "
+        "suggestions to a sandboxed agent and review the drafts for approval (spec #4)",
+    )
+    p_execute.add_argument(
+        "focus",
+        nargs="?",
+        default=None,
+        help="Optional project focus to steer which suggestions are generated",
+    )
+    p_execute.add_argument(
+        "--review",
+        action="store_true",
+        help="Interactively approve or reject each agent-produced draft; the "
+        "decision is recorded as GUMBO feedback (default: just list the outcomes)",
+    )
+    p_execute.add_argument("--user-name", "-u", type=str)
+    p_execute.add_argument("--text-model", "-m", type=str)
+
     p_mcp = sub.add_parser(
         "mcp",
         help="Serve the GUM over MCP (stdio) so a local agent can gather sanitized context",
@@ -520,6 +540,130 @@ async def cmd_review(args) -> None:
     await api_task
 
 
+# The three approve/reject decisions the review surface accepts, and the aliases
+# a user might type for each. "approve"/"reject" map onto the existing suggestion
+# thumbs-up/down feedback; "skip" records nothing.
+_REVIEW_APPROVE = frozenset({"a", "approve", "approved", "y", "yes", "keep"})
+_REVIEW_REJECT = frozenset({"r", "reject", "rejected", "n", "no", "discard"})
+_REVIEW_SKIP = frozenset({"s", "skip", ""})
+
+
+def _render_outcome(outcome, index: int, total: int) -> str:
+    """Format a single ExecutionOutcome for the review surface (no side effects)."""
+    from gum.executor import (
+        STATUS_FAILED,
+        STATUS_PENDING_APPROVAL,
+        STATUS_PROPOSAL_ONLY,
+    )
+
+    s = outcome.suggestion
+    label = {
+        STATUS_PENDING_APPROVAL: "DRAFT — awaiting your approval",
+        STATUS_PROPOSAL_ONLY: "PROPOSAL ONLY — held, no agent ran",
+        STATUS_FAILED: "FAILED — agent errored, nothing to approve",
+    }.get(outcome.status, outcome.status)
+
+    lines = [
+        "",
+        "=" * 80,
+        f"[{index}/{total}] {s.title}   ({label})",
+        "-" * 80,
+        s.description.strip(),
+    ]
+    if outcome.assessment is not None:
+        a = outcome.assessment
+        lines.append(
+            f"risk {a.risk}/10 · {a.reversibility} · P(useful) {s.probability_useful}/10"
+        )
+    if outcome.reason:
+        lines.append(f"note: {outcome.reason}")
+    if outcome.result is not None and outcome.result.output:
+        lines.append("")
+        lines.append("agent draft:")
+        lines.append(outcome.result.output.strip())
+    return "\n".join(lines)
+
+
+async def review_outcomes(
+    gum_instance,
+    outcomes,
+    *,
+    interactive: bool = True,
+    prompt=input,
+    out=print,
+) -> list[dict]:
+    """Present each execution outcome and record approve/reject as GUMBO feedback.
+
+    Renders every :class:`~gum.executor.ExecutionOutcome`; when *interactive*, each
+    draft awaiting approval prompts the user to approve, reject, or skip. Approve
+    and reject are fed back through the GUM's existing
+    :meth:`~gum.gum.gum.add_suggestion_feedback` plumbing — the same accept/reject
+    signal path a suggestion thumbs-up/down uses — so a decision on an *executed*
+    draft trains future propositions just like any other reaction. Nothing is
+    committed; the executor already produced only reviewable drafts. Returns the
+    list of recorded ``{"title", "vote"}`` decisions. *prompt*/*out* are injectable
+    so the loop is drivable in tests without real stdin/stdout.
+    """
+    from gum.executor import STATUS_PENDING_APPROVAL
+
+    total = len(outcomes)
+    recorded: list[dict] = []
+    for i, outcome in enumerate(outcomes, 1):
+        out(_render_outcome(outcome, i, total))
+        if not interactive or outcome.status != STATUS_PENDING_APPROVAL:
+            continue
+        while True:
+            choice = (prompt("approve / reject / skip? [a/r/s] ") or "").strip().lower()
+            if choice in _REVIEW_APPROVE:
+                vote = "up"
+            elif choice in _REVIEW_REJECT:
+                vote = "down"
+            elif choice in _REVIEW_SKIP:
+                vote = None
+            else:
+                out("Please answer a (approve), r (reject), or s (skip).")
+                continue
+            break
+        if vote is None:
+            continue
+        await gum_instance.add_suggestion_feedback(
+            title=outcome.suggestion.title,
+            vote=vote,
+            description=outcome.suggestion.description,
+        )
+        recorded.append({"title": outcome.suggestion.title, "vote": vote})
+        out("Recorded ✓ approved" if vote == "up" else "Recorded ✗ rejected")
+    return recorded
+
+
+async def cmd_execute(args) -> None:
+    """Run the execution bridge and (optionally) review its drafts for approval.
+
+    Invoking this command *is* the explicit opt-in the bridge requires, so it
+    builds a Gumbo with execution enabled even though it is default-OFF everywhere
+    else. Each surface-worthy suggestion is risk-gated and, if it clears the gate,
+    dispatched to the sandboxed agent; the results are drafts held for approval.
+    With ``--review`` the user approves/rejects each draft and the decision flows
+    back through the existing suggestion-feedback plumbing.
+    """
+    from gum.gumbo import Gumbo
+
+    g = gum(_user_name(args) or "default", _text_model(args))
+    await g.connect_db()  # also ensures the feedback table exists
+
+    gumbo = Gumbo(g, execution_enabled=True)
+    outcomes = await gumbo.execute(getattr(args, "focus", None))
+    if not outcomes:
+        print("No surface-worthy suggestions to execute right now.")
+        return
+
+    dispatched = sum(1 for o in outcomes if o.dispatched)
+    print(
+        f"\n{len(outcomes)} suggestion(s) considered; {dispatched} dispatched to the agent."
+    )
+    await review_outcomes(g, outcomes, interactive=getattr(args, "review", False))
+
+
 def cmd_mcp(args) -> None:
     """Serve the GUM over MCP (stdio) for a local executing agent.
 
@@ -624,6 +768,8 @@ def cli() -> None:
         asyncio.run(cmd_observations(args))
     elif command == "review":
         asyncio.run(cmd_review(args))
+    elif command == "execute":
+        asyncio.run(cmd_execute(args))
     elif command == "mcp":
         cmd_mcp(args)
     elif command == "rehydrate":
