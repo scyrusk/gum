@@ -19,6 +19,7 @@ from gum import gum as Gum
 from gum.agenda import (
     Commitment,
     CommitmentRadar,
+    _dedupe_key,
     _parse_due,
     build_agenda,
     urgency_score,
@@ -78,6 +79,22 @@ class UrgencyScoreTests(unittest.TestCase):
         durable = urgency_score(None, confidence=8, decay=10, age_days=10.0)
         fleeting = urgency_score(None, confidence=8, decay=1, age_days=10.0)
         self.assertGreater(durable, fleeting)
+
+
+class DedupeKeyTests(unittest.TestCase):
+    def test_folds_case_and_punctuation(self):
+        self.assertEqual(
+            _dedupe_key("Submit the NSF grant!"),
+            _dedupe_key("submit  the  nsf  grant"),
+        )
+
+    def test_distinct_titles_differ(self):
+        self.assertNotEqual(
+            _dedupe_key("Submit the NSF grant"), _dedupe_key("Pay the electric bill")
+        )
+
+    def test_empty_when_no_alphanumeric_content(self):
+        self.assertEqual(_dedupe_key("  —  !! "), "")
 
 
 def _prop(text: str, confidence: int, *, decay: int = 5, created_at=None) -> object:
@@ -257,6 +274,35 @@ class CommitmentRadarTests(unittest.IsolatedAsyncioTestCase):
         for key in ("title", "due_date", "source", "status_guess", "urgency",
                     "days_until_due", "proposition_id", "confidence", "decay"):
             self.assertIn(key, d)
+
+    async def test_build_dedupes_near_duplicate_titles_keeping_most_urgent(self):
+        # The GUM re-infers overlapping propositions, so the extractor emits the
+        # same commitment twice with cosmetically-different titles and dates.
+        async def fake_completion(client, model, messages, schema, **kwargs):
+            return CommitmentSchema(commitments=[
+                CommitmentItem(source_index=1, title="Submit the NSF grant proposal!",
+                               due_date="2026-07-25", source="NSF",
+                               status_guess="in progress"),
+                CommitmentItem(source_index=1, title="submit the  NSF grant  proposal",
+                               due_date="2026-07-13", source="NSF",
+                               status_guess="in progress"),
+                CommitmentItem(source_index=2, title="Pay the electric bill",
+                               due_date="2026-07-20", source="utility",
+                               status_guess="not started"),
+            ])
+
+        radar = CommitmentRadar(self.gum, min_confidence=3)
+        with mock.patch("gum.agenda.structured_completion", side_effect=fake_completion):
+            commitments = await radar.build(now=NOW)
+
+        titles = [c.title for c in commitments]
+        # The two NSF variants collapse to one; the distinct bill survives.
+        self.assertEqual(len(commitments), 2)
+        self.assertEqual(sum("nsf" in t.lower() for t in titles), 1)
+        self.assertIn("Pay the electric bill", titles)
+        # The surviving NSF instance is the more urgent (sooner-dated) one.
+        nsf = next(c for c in commitments if "nsf" in c.title.lower())
+        self.assertEqual(nsf.due_date, "2026-07-13")
 
     async def test_empty_when_no_candidates(self):
         radar = CommitmentRadar(self.gum, min_confidence=11)  # nothing qualifies

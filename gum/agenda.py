@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from dataclasses import asdict, dataclass
 from datetime import date, datetime, timezone
 from typing import Any
@@ -81,6 +82,21 @@ def _created_dt(prop: Proposition) -> datetime:
     if dt.tzinfo is None:
         return dt.replace(tzinfo=timezone.utc)
     return dt
+
+
+def _dedupe_key(title: str) -> str:
+    """Normalize a commitment title for near-duplicate detection.
+
+    The GUM re-infers overlapping propositions about the same underlying task
+    (several notes each implying "submit the NSF grant"), so the extractor can
+    surface one real-world commitment more than once with slightly reworded
+    titles. Collapsing to lowercase alphanumeric tokens with single spaces folds
+    that cosmetic drift together ("Submit the NSF grant!" == "submit  the  NSF
+    grant") while keeping genuinely different commitments apart. Returns "" when the
+    title has no comparable content, which callers treat as "never a duplicate".
+    """
+    stripped = re.sub(r"[^a-z0-9 ]+", "", title.lower())
+    return re.sub(r"\s+", " ", stripped).strip()
 
 
 def _parse_due(value: str | None) -> date | None:
@@ -282,8 +298,35 @@ class CommitmentRadar:
                 continue
             commitments.append(commitment)
 
-        commitments.sort(key=lambda c: c.urgency, reverse=True)
+        # Rank most-urgent first, with deterministic tie-breaks so equal-urgency
+        # items order sensibly (soonest deadline, then highest confidence, then
+        # oldest proposition) instead of by arbitrary extraction order.
+        def _sort_key(c: Commitment) -> tuple[float, int, int, int]:
+            days = c.days_until_due if c.days_until_due is not None else 10**9
+            return (-c.urgency, days, -(c.confidence or 0), c.proposition_id or 0)
+
+        commitments.sort(key=_sort_key)
+        commitments = self._dedupe(commitments)
         return commitments[: self.limit] if self.limit is not None else commitments
+
+    def _dedupe(self, commitments: list[Commitment]) -> list[Commitment]:
+        """Drop near-duplicate commitments, keeping the most-urgent instance.
+
+        Assumes *commitments* is already ranked, so the first occurrence of each
+        normalized title is the one worth surfacing. Titles that normalize to
+        empty are never treated as duplicates of one another.
+        """
+        seen: set[str] = set()
+        deduped: list[Commitment] = []
+        for c in commitments:
+            key = _dedupe_key(c.title)
+            if key and key in seen:
+                self.logger.debug("agenda: dropping duplicate commitment %r", c.title)
+                continue
+            if key:
+                seen.add(key)
+            deduped.append(c)
+        return deduped
 
     def _build_commitment(
         self, item: CommitmentItem, prop: Proposition, now: datetime
