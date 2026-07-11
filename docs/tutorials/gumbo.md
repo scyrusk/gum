@@ -37,8 +37,11 @@ behalf. Four independent guardrails enforce this:
 3. **A sandboxed agent.** The dispatched agent (the shipped backend shells out to
    the local `claude` CLI) runs in a **restricted scratch workspace** under the
    GUM data directory — never your real project tree — with a hard wall-clock
-   **timeout** that kills the process on overrun. The task prompt instructs the
-   agent to produce a draft, not to act.
+   **timeout** that tears down its whole process tree on overrun. The CLI runs in
+   a read/research-only **permission mode** (`plan` by default), so the tool layer
+   *itself* refuses file edits, `Bash`, and outward-facing actions — the
+   "produce a draft, never act" contract is enforced by the CLI, not merely
+   requested in the prompt (which also instructs the agent to draft, not act).
 4. **Human-in-the-loop approval.** Every result lands in a *pending-approval*
    state. Nothing the agent produced is used until you approve it.
 
@@ -103,6 +106,7 @@ to see what *would* be dispatched).
 | `GUM_EXECUTOR_TIMEOUT` | `120` | Hard wall-clock cap (seconds) on an agent run |
 | `GUM_EXECUTOR_WORKSPACE` | scratch dir under the GUM data dir | The restricted `cwd` handed to the agent |
 | `GUM_EXECUTOR_CLAUDE_ARGS` | — | Extra args appended to the `claude` CLI invocation |
+| `GUM_EXECUTOR_PERMISSION_MODE` | `plan` | The CLI permission mode the agent runs in; set empty to disable (only for a fully-trusted backend) |
 
 !!! warning "Review the code before enabling this"
     The bridge is default-OFF and proposal-only by design, and it cannot take an

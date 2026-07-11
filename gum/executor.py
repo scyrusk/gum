@@ -50,6 +50,12 @@ DEFAULT_CONTEXT_LIMIT = 10
 # of small, reversible task the bridge is meant to auto-run, so failing closed
 # (no result) is the right outcome.
 DEFAULT_TIMEOUT = 120.0
+# The permission mode the shipped backend runs the `claude` CLI in by default.
+# "plan" restricts the agent to reading/researching and returning a proposal —
+# the CLI itself refuses file edits, Bash, and outward-facing tools — which
+# enforces the executor's "reviewable artifact, never act" contract at the tool
+# layer rather than trusting the prompt alone. See ClaudeCLIBackend.
+DEFAULT_PERMISSION_MODE = "plan"
 
 # Classifications the gate is willing to run automatically. "irreversible" is
 # never in this set by construction — those actions are always proposal-only.
@@ -169,13 +175,22 @@ class ClaudeCLIBackend:
     orphaning past the timeout). The CLI's stdout is captured verbatim as the
     reviewable draft; the backend commits nothing itself.
 
-    Sandboxing here is defence-in-depth on top of the executor's risk gate: the
-    agent only ever sees a *restricted* ``cwd`` (the executor hands it a scratch
-    workspace, not the user's real project), the run is time-boxed, and the prompt
-    instructs the agent to produce a draft rather than act. ``command`` and
-    ``extra_args`` are injectable so a deployment can pass its own binary path or
-    tighten the CLI's tool-permission flags without editing this class; the
-    ``GUM_EXECUTOR_CLAUDE_ARGS`` env var appends further args (shell-split).
+    Sandboxing here is defence-in-depth on top of the executor's risk gate:
+
+    - the agent only ever sees a *restricted* ``cwd`` (the executor hands it a
+      scratch workspace, not the user's real project);
+    - the run is time-boxed and its whole process tree torn down on overrun;
+    - the CLI runs in a read/research-only **permission mode** (``plan`` by
+      default), so the tool layer itself refuses file edits, Bash, and
+      outward-facing actions — the executor's "produce a reviewable draft, never
+      act" contract is enforced by the CLI, not merely requested in the prompt.
+
+    ``command`` and ``extra_args`` are injectable so a deployment can pass its own
+    binary path or tighten the CLI's tool-permission flags without editing this
+    class; the ``GUM_EXECUTOR_CLAUDE_ARGS`` env var appends further args
+    (shell-split). ``permission_mode`` is kept a first-class, separate property
+    (env override ``GUM_EXECUTOR_PERMISSION_MODE``; set it empty to disable) so
+    customizing ``extra_args`` can never silently drop the safety posture.
     """
 
     def __init__(
@@ -183,6 +198,7 @@ class ClaudeCLIBackend:
         *,
         command: str = "claude",
         extra_args: list[str] | None = None,
+        permission_mode: str | None = DEFAULT_PERMISSION_MODE,
         logger: logging.Logger | None = None,
     ) -> None:
         self.command = command
@@ -192,7 +208,27 @@ class ClaudeCLIBackend:
         env_args = os.getenv("GUM_EXECUTOR_CLAUDE_ARGS", "").strip()
         if env_args:
             self.extra_args = self.extra_args + shlex.split(env_args)
+        # Read/research-only posture, enforced at the CLI's tool layer rather than
+        # trusted to the prompt. Kept out of `extra_args` so a deployment that
+        # customizes args can't accidentally strip it; an explicit empty override
+        # (``GUM_EXECUTOR_PERMISSION_MODE=``) opts a fully-trusted backend out.
+        env_mode = os.getenv("GUM_EXECUTOR_PERMISSION_MODE")
+        if env_mode is not None:
+            permission_mode = env_mode.strip() or None
+        self.permission_mode = permission_mode
         self.logger = logger or logging.getLogger("gum.executor.backend")
+
+    def _build_argv(self) -> list[str]:
+        """Assemble the CLI argv, always folding in the safety permission mode.
+
+        Split out from :meth:`run` so the invocation — in particular that the
+        read/research-only ``--permission-mode`` is present by default — is unit
+        testable without launching a subprocess.
+        """
+        argv = [self.command, *self.extra_args]
+        if self.permission_mode:
+            argv += ["--permission-mode", self.permission_mode]
+        return argv
 
     def _build_prompt(self, task: str, context: str) -> str:
         # Fold the pseudonymized GUM grounding and the task into the single agent
@@ -226,7 +262,7 @@ class ClaudeCLIBackend:
         self, task: str, context: str, *, cwd: str, timeout: float
     ) -> AgentResult:
         prompt = self._build_prompt(task, context)
-        argv = [self.command, *self.extra_args]
+        argv = self._build_argv()
         try:
             proc = await asyncio.create_subprocess_exec(
                 *argv,

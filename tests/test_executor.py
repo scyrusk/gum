@@ -412,7 +412,7 @@ class ClaudeCLIBackendTests(unittest.IsolatedAsyncioTestCase):
         # `cat` echoes stdin to stdout, so it stands in for a CLI that reads the
         # prompt and prints a result: we can assert the prompt reached the process
         # and its output was captured.
-        backend = ClaudeCLIBackend(command="cat", extra_args=[])
+        backend = ClaudeCLIBackend(command="cat", extra_args=[], permission_mode=None)
         with tempfile.TemporaryDirectory() as cwd:
             result = await backend.run("draft the reply", "## context block", cwd=cwd, timeout=10)
         self.assertTrue(result.ok)
@@ -422,7 +422,7 @@ class ClaudeCLIBackendTests(unittest.IsolatedAsyncioTestCase):
     async def test_timeout_kills_and_reports(self):
         # `sleep 30` never produces output; the backend must kill it and report a
         # timeout rather than hang.
-        backend = ClaudeCLIBackend(command="sleep", extra_args=["30"])
+        backend = ClaudeCLIBackend(command="sleep", extra_args=["30"], permission_mode=None)
         with tempfile.TemporaryDirectory() as cwd:
             result = await backend.run("x", "", cwd=cwd, timeout=0.5)
         self.assertFalse(result.ok)
@@ -448,7 +448,9 @@ class ClaudeCLIBackendTests(unittest.IsolatedAsyncioTestCase):
                     f"sleep 30 >/dev/null 2>&1 & "
                     f"echo $! > {shlex.quote(pidfile)}; wait"
                 )
-                backend = ClaudeCLIBackend(command="sh", extra_args=["-c", script])
+                backend = ClaudeCLIBackend(
+                    command="sh", extra_args=["-c", script], permission_mode=None
+                )
                 result = await backend.run("x", "", cwd=cwd, timeout=0.5)
                 self.assertFalse(result.ok)
                 self.assertIn("timed out", result.error)
@@ -471,11 +473,47 @@ class ClaudeCLIBackendTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_nonzero_exit_is_a_failure(self):
         # `false` exits 1 with no output.
-        backend = ClaudeCLIBackend(command="false", extra_args=[])
+        backend = ClaudeCLIBackend(command="false", extra_args=[], permission_mode=None)
         with tempfile.TemporaryDirectory() as cwd:
             result = await backend.run("x", "", cwd=cwd, timeout=5)
         self.assertFalse(result.ok)
         self.assertTrue(result.error)
+
+    def test_defaults_to_read_only_permission_mode(self):
+        # Defence-in-depth: the shipped backend runs the CLI in a read/research-only
+        # permission mode by default, so the tool layer itself refuses edits/Bash/
+        # outward actions — the "produce a draft, never act" contract is enforced,
+        # not merely requested in the prompt.
+        argv = ClaudeCLIBackend()._build_argv()
+        self.assertEqual(argv, ["claude", "-p", "--permission-mode", "plan"])
+
+    def test_permission_mode_survives_custom_extra_args(self):
+        # A deployment tightening `extra_args` must not accidentally drop the
+        # safety posture: permission mode is a separate, first-class property.
+        argv = ClaudeCLIBackend(extra_args=["--print", "--model", "haiku"])._build_argv()
+        self.assertEqual(argv[-2:], ["--permission-mode", "plan"])
+
+    def test_permission_mode_is_overridable_and_disablable(self):
+        # An explicit mode is honoured; None (a fully-trusted, opted-out backend)
+        # emits no permission flag at all.
+        self.assertIn(
+            "acceptEdits",
+            ClaudeCLIBackend(permission_mode="acceptEdits")._build_argv(),
+        )
+        self.assertNotIn(
+            "--permission-mode", ClaudeCLIBackend(permission_mode=None)._build_argv()
+        )
+
+    def test_permission_mode_env_override(self):
+        with mock.patch.dict(os.environ, {"GUM_EXECUTOR_PERMISSION_MODE": ""}):
+            self.assertNotIn(
+                "--permission-mode", ClaudeCLIBackend()._build_argv()
+            )
+        with mock.patch.dict(os.environ, {"GUM_EXECUTOR_PERMISSION_MODE": "acceptEdits"}):
+            self.assertEqual(
+                ClaudeCLIBackend()._build_argv()[-2:],
+                ["--permission-mode", "acceptEdits"],
+            )
 
 
 if __name__ == "__main__":
