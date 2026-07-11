@@ -662,6 +662,20 @@ class ClaudeCLIBackendTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("do not save the deliverable to a plan file", result.output)
         self.assertIn("captured from stdout", result.output)
 
+    async def test_empty_stdout_is_failed_capture_not_reviewable_draft(self):
+        # Plan mode can exit successfully without placing the artifact on stdout
+        # (for example after routing it to a transient plan file).  The backend
+        # must not turn that into a blank pending-approval draft.
+        backend = ClaudeCLIBackend(
+            command="true", extra_args=[], permission_mode=None
+        )
+        with tempfile.TemporaryDirectory() as cwd:
+            result = await backend.run("Draft the email body", "", cwd=cwd, timeout=10)
+
+        self.assertFalse(result.ok)
+        self.assertEqual(result.output, "")
+        self.assertIn("without returning a deliverable", result.error)
+
     async def test_timeout_kills_and_reports(self):
         # `sleep 30` never produces output; the backend must kill it and report a
         # timeout rather than hang.

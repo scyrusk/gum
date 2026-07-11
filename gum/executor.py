@@ -315,6 +315,18 @@ class ClaudeCLIBackend:
         if proc.returncode != 0:
             err = stderr.decode(errors="replace").strip() or f"exit code {proc.returncode}"
             return AgentResult(ok=False, output=out, error=err)
+        if not out:
+            # A zero exit status only means the CLI process completed; it does not
+            # prove plan mode returned the reviewable artifact we asked for.  In
+            # particular, accepting empty stdout here would create a
+            # pending-approval outcome after the ephemeral sandbox (and anything
+            # written there) is deleted.  Treat the missing delivery as a failed
+            # capture instead of presenting an empty draft as success.
+            return AgentResult(
+                ok=False,
+                output="",
+                error="agent completed without returning a deliverable on stdout",
+            )
         return AgentResult(ok=True, output=out)
 
 
