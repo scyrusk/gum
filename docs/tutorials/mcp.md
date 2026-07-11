@@ -87,6 +87,8 @@ If any placeholder in the artifact has no entry in the entity map — usually a 
 
 If you want to feed GUM's observations and propositions to a model that runs **off your machine** (e.g. a frontier model behind the MCP), you can have GUM pseudonymize PII on the way out. Detected entities (names, emails, phone numbers, addresses, etc.) are replaced with **consistent pseudo-IDs** — the same real person always reads as `[PERSON_1]`, so the downstream model can still reason that "an email to person X" and "a follow-up text to person X" concern the same person, without ever seeing the real identity.
 
+**Calendar dates are preserved, not pseudonymized.** A bare date (`2026-07-20`, `next Friday`) is not a re-identifier on its own, and blanking it to `[DATE_1]` would destroy the exact signal the deadline pipeline exists to surface — the propositions carry their deadlines as absolute `YYYY-MM-DD` dates, so an agent building the `daily_agenda` from the *sanitized* output needs the real date to know what's due when. A privacy-maximizing deployment that would rather pseudonymize dates too can set `GUM_SANITIZE_REDACT_DATES=1`.
+
 First install the extra (it pulls a small local PII-detection model):
 
 ```bash

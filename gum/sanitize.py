@@ -24,6 +24,20 @@ DEFAULT_DB_PATH = "~/.cache/gum/entities.db"
 DEFAULT_MODEL = "openai/privacy-filter"
 DEFAULT_MIN_SCORE = 0.5
 
+# Calendar dates are PRESERVED, not pseudonymized, by default. privacy-filter
+# tags dates ("2026-07-20", "next Friday", "April 2024") with a `date` label, and
+# pseudonymizing them to [DATE_n] destroys the one piece of signal the whole
+# deadline pipeline exists to surface: the propositions carry absolute YYYY-MM-DD
+# deadlines (see PROPOSE_PROMPT's temporal grounding), and an off-device agent
+# building the user's daily agenda from the *sanitized* output would see "[DATE_5]"
+# instead of "2026-07-20" and be unable to reason about what is due when. A bare
+# calendar date is not a re-identifier on its own — the same stance the MCP
+# `today` anchor takes — so keeping it leaks nothing an agent needs protection
+# from while making the pseudonymized output actually usable for scheduling.
+# A privacy-maximizing deployment can restore date-pseudonymization by setting
+# GUM_SANITIZE_REDACT_DATES=1.
+DEFAULT_REDACT_DATES = False
+
 # A token-classification forward pass costs O(seq_len^2) in activation memory, and
 # the privacy-filter pipeline does NOT truncate on its own (and truncation would be
 # unacceptable here — it silently drops, and thus leaks, any PII past the cutoff).
@@ -211,12 +225,23 @@ class Sanitizer:
         model: str | None = None,
         min_score: float | None = None,
         entity_map: EntityMap | None = None,
+        redact_dates: bool | None = None,
     ):
         self._model_name = model or os.getenv("GUM_SANITIZE_MODEL") or DEFAULT_MODEL
         self._min_score = (
             min_score
             if min_score is not None
             else float(os.getenv("GUM_SANITIZE_MIN_SCORE", str(DEFAULT_MIN_SCORE)))
+        )
+        # Whether to pseudonymize detected calendar dates. Off by default so
+        # deadlines survive to a downstream agenda-building agent (see
+        # DEFAULT_REDACT_DATES); a privacy-maximizing deployment opts in via
+        # GUM_SANITIZE_REDACT_DATES=1.
+        self._redact_dates = (
+            redact_dates
+            if redact_dates is not None
+            else os.getenv("GUM_SANITIZE_REDACT_DATES", "0").strip().lower()
+            in ("1", "true", "yes", "on")
         )
         self._entities = entity_map or EntityMap()
         self._pipeline = None
@@ -319,11 +344,20 @@ class Sanitizer:
         spans: list[tuple] = []
         for (base, _window), window_spans in zip(windows, results):
             for sp in window_spans:
+                category = _category_for(sp.get("entity_group", ""))
+                # Preserve calendar dates unless date-redaction is explicitly on:
+                # dropping the span here means it is never merged or replaced, so
+                # the literal date survives as the deadline signal downstream needs
+                # (see DEFAULT_REDACT_DATES). DATE spans never coalesce with an
+                # adjacent PERSON/EMAIL/etc. run (the merge is same-category only),
+                # so skipping them cannot leave a real entity partially exposed.
+                if category == "DATE" and not self._redact_dates:
+                    continue
                 spans.append(
                     (
                         sp["start"] + base,
                         sp["end"] + base,
-                        _category_for(sp.get("entity_group", "")),
+                        category,
                         float(sp.get("score", 0.0)),
                     )
                 )
