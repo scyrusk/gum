@@ -212,3 +212,49 @@ Return **only** JSON in the following format:
     // one object per judgement, go through ALL propositions in the input.
   ]
 }"""
+
+# Commitment & deadline extraction (spec #1, `gum agenda`). The GUM already
+# infers things like "has a major impending deadline"; this prompt turns that
+# latent signal into a structured, dated commitment the radar can rank. Applied
+# with str.replace() (not str.format()) — like the other prompts in this file —
+# because the JSON template below contains literal braces.
+AGENDA_PROMPT = """You are an assistant that maintains a commitment and deadline radar for {user_name}.
+
+Below is a numbered list of propositions a General User Model (GUM) has inferred about {user_name} from observing their computer use. Each proposition shows a confidence score (1 low – 10 high) and the date it was recorded. Today's date is {today}.
+
+## Propositions
+
+{propositions}
+
+# Task
+
+Identify only the propositions that imply an **open, not-yet-completed commitment or deadline** for {user_name} — something they still have to do, deliver, attend, submit, review, respond to, pay, or decide. Examples: an impending grant or paper deadline, a promised reply, a meeting to prepare for, a review they owe, a bill to pay.
+
+Do NOT include propositions that are:
+- general preferences, habits, tools, or interests with no pending action;
+- already completed, or in the past with nothing left to do;
+- vague observations that do not commit {user_name} to anything.
+
+For each real commitment, extract:
+- `source_index`: the number of the proposition it was drawn from.
+- `title`: a short imperative title (e.g. "Submit the NSF grant proposal").
+- `due_date`: the deadline as an absolute ISO date "YYYY-MM-DD". Resolve relative wording ("tomorrow", "next Friday", "by end of week") against the proposition's recorded date and today's date. Use null when no specific date is implied.
+- `source`: who the commitment is owed to or where it came from (a person, organization, or app named in the proposition), or "unknown".
+- `status_guess`: one of "not started", "in progress", "blocked", or "unknown".
+
+Be conservative: include a commitment only when the proposition genuinely implies {user_name} owes or must do something. Returning an empty list is correct when nothing qualifies.
+
+Return **only** JSON in this exact format:
+
+{
+  "commitments": [
+    {
+      "source_index": <integer>,
+      "title": "<short imperative title>",
+      "due_date": "YYYY-MM-DD" or null,
+      "source": "<who or where, or 'unknown'>",
+      "status_guess": "not started" | "in progress" | "blocked" | "unknown"
+    }
+    // one object per open commitment; empty list if none
+  ]
+}"""
