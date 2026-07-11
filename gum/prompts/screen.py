@@ -12,6 +12,8 @@ Include as much relevant detail as possible, but remain concise.
 
 Generate a handful of bullet points and reference *specific* actions the user is taking.
 
+If any dates, times, deadlines, or scheduled events are visible (e.g. a calendar entry, a due date, a meeting time, an email or message saying something is due or happening on a certain day), call them out explicitly and quote the exact wording as shown on screen — these are high-value temporal signals.
+
 Keep in mind that that the content on the screen is what the user is viewing. It may not be what the user is actively doing or what they believe, so practice caution when making assumptions."""
 
 # Single-call prompt that produces BOTH the word-for-word transcription and the
@@ -22,7 +24,11 @@ Keep in mind that that the content on the screen is what the user is viewing. It
 # order with the CURRENT (last) screenshot last; transcription is scoped to that
 # current screen (the earlier frames are near-duplicates a few seconds apart, so
 # re-transcribing them adds output tokens without new information), while the
-# action summary still spans every frame for temporal context.
+# action summary still spans every frame for temporal context. The summary is
+# also asked to surface any on-screen dates/deadlines/scheduled events verbatim,
+# so the (now date-aware) proposition model has explicit temporal signal to
+# ground absolute YYYY-MM-DD deadlines from instead of dropping them upstream —
+# the observation is the first place an on-screen "due Friday" can be lost.
 COMBINED_PROMPT = """You are analyzing a chronological sequence of screenshots of the user's screen. The LAST image is the CURRENT state of the screen; any earlier images are recent prior states, in order.
 
 Respond with EXACTLY two markdown sections, in this order:
@@ -31,4 +37,4 @@ Respond with EXACTLY two markdown sections, in this order:
 Transcribe in markdown ALL the content visible in the CURRENT (last) screenshot. NEVER SUMMARIZE ANYTHING here — transcribe everything EXACTLY, word for word, but don't repeat yourself. ALWAYS include all application names, file paths, and website URLs.
 
 ## Summary
-Provide a detailed but concise description of the actions occurring across the images, in the order they were taken. Generate a handful of bullet points that reference *specific* actions the user is taking. Keep in mind that the content on the screen is what the user is viewing — it may not be what the user is actively doing or what they believe, so practice caution when making assumptions."""
+Provide a detailed but concise description of the actions occurring across the images, in the order they were taken. Generate a handful of bullet points that reference *specific* actions the user is taking. If any dates, times, deadlines, or scheduled events are visible (e.g. a calendar entry, a due date, a meeting time, an email or message saying something is due or happening on a certain day), call them out explicitly in a bullet and quote the exact wording as shown on screen — these are high-value temporal signals for the downstream model. Keep in mind that the content on the screen is what the user is viewing — it may not be what the user is actively doing or what they believe, so practice caution when making assumptions."""
