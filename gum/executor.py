@@ -21,7 +21,9 @@ import asyncio
 import logging
 import os
 import shlex
+import shutil
 import signal
+import tempfile
 from dataclasses import asdict, dataclass
 from typing import Any, Protocol, runtime_checkable
 
@@ -424,13 +426,13 @@ class Executor:
         )
         return render_context(result)
 
-    def _ensure_workspace(self) -> str:
-        """Return the restricted cwd for a dispatched agent, creating it if needed.
+    def _ensure_workspace_root(self) -> str:
+        """Return the base scratch directory dispatched agents are sandboxed under.
 
-        The default is a scratch directory under the GUM data dir — never the
-        user's real working tree — so the backend runs confined to a throwaway
-        workspace. Resolved and created lazily so constructing an Executor does no
-        I/O.
+        The default is a directory under the GUM data dir — never the user's real
+        working tree. Individual dispatches get their *own* ephemeral subdirectory
+        beneath this root (see :meth:`dispatch`); this only resolves and creates
+        the shared parent. Done lazily so constructing an Executor does no I/O.
         """
         path = self._workspace_dir or os.path.join(
             self.gum._data_directory, "executor_workspace"
@@ -487,14 +489,22 @@ class Executor:
 
         context = await self.assemble_context(suggestion)
         task = self._build_task(suggestion, context)
-        cwd = self._ensure_workspace()
+        # Each dispatch gets its OWN ephemeral subdirectory under the workspace root,
+        # torn down when the run finishes. A single shared cwd would leak one agent
+        # run's scratch files and state into the next dispatch's sandbox and let
+        # them accumulate unbounded; a fresh, isolated, self-cleaning directory per
+        # run keeps the "restricted cwd" sandbox guarantee honest across dispatches.
+        cwd = tempfile.mkdtemp(prefix="dispatch-", dir=self._ensure_workspace_root())
         self.logger.info(
             "executor: dispatching suggestion %r to agent (cwd=%s, timeout=%gs)",
             suggestion.title, cwd, self.timeout,
         )
-        # The backend already received the grounding folded into `task`; passing an
-        # empty context here avoids duplicating it into the prompt twice.
-        result = await self.backend.run(task, "", cwd=cwd, timeout=self.timeout)
+        try:
+            # The backend already received the grounding folded into `task`; passing
+            # an empty context here avoids duplicating it into the prompt twice.
+            result = await self.backend.run(task, "", cwd=cwd, timeout=self.timeout)
+        finally:
+            shutil.rmtree(cwd, ignore_errors=True)
         status = STATUS_PENDING_APPROVAL if result.ok else STATUS_FAILED
         return ExecutionOutcome(
             suggestion=suggestion,

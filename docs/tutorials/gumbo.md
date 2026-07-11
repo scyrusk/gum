@@ -36,7 +36,9 @@ behalf. Four independent guardrails enforce this:
    the gate is held for review and no agent runs.
 3. **A sandboxed agent.** The dispatched agent (the shipped backend shells out to
    the local `claude` CLI) runs in a **restricted scratch workspace** under the
-   GUM data directory — never your real project tree — with a hard wall-clock
+   GUM data directory — never your real project tree. Each dispatch gets its own
+   fresh, ephemeral subdirectory that is deleted when the run finishes, so no run's
+   scratch files or state leak into the next. It runs with a hard wall-clock
    **timeout** that tears down its whole process tree on overrun. The CLI runs in
    a read/research-only **permission mode** (`plan` by default), so the tool layer
    *itself* refuses file edits, `Bash`, and outward-facing actions — the
@@ -104,7 +106,7 @@ to see what *would* be dispatched).
 | `GUM_EXECUTOR_MAX_RISK` | `3` | Maximum assessed risk (1–10) allowed to auto-dispatch |
 | `GUM_EXECUTOR_CONTEXT_LIMIT` | `10` | How many propositions ground the dispatched task |
 | `GUM_EXECUTOR_TIMEOUT` | `120` | Hard wall-clock cap (seconds) on an agent run |
-| `GUM_EXECUTOR_WORKSPACE` | scratch dir under the GUM data dir | The restricted `cwd` handed to the agent |
+| `GUM_EXECUTOR_WORKSPACE` | scratch dir under the GUM data dir | Root for the agent's sandbox; each dispatch gets a fresh, auto-deleted subdirectory here |
 | `GUM_EXECUTOR_CLAUDE_ARGS` | — | Extra args appended to the `claude` CLI invocation |
 | `GUM_EXECUTOR_PERMISSION_MODE` | `plan` | The CLI permission mode the agent runs in; set empty to disable (only for a fully-trusted backend) |
 

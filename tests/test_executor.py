@@ -291,8 +291,17 @@ class _RecordingBackend:
         self.calls: list[dict] = []
 
     async def run(self, task, context, *, cwd, timeout):
+        # Record whether the sandbox cwd exists *at call time*: the executor tears
+        # the per-dispatch workspace down once run() returns, so a post-dispatch
+        # os.path.isdir() check would race the cleanup.
         self.calls.append(
-            {"task": task, "context": context, "cwd": cwd, "timeout": timeout}
+            {
+                "task": task,
+                "context": context,
+                "cwd": cwd,
+                "cwd_isdir": os.path.isdir(cwd),
+                "timeout": timeout,
+            }
         )
         return self._result
 
@@ -344,9 +353,48 @@ class DispatchFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(backend.calls), 1)
         call = backend.calls[0]
         self.assertEqual(call["timeout"], ex.timeout)
-        self.assertTrue(os.path.isdir(call["cwd"]))
+        self.assertTrue(call["cwd_isdir"])  # the sandbox existed during the run
         self.assertIn(sug.title, call["task"])
         self.assertIn("review", call["task"].lower())
+        # The per-dispatch sandbox is torn down once the run returns, so nothing
+        # accumulates and no run's scratch state leaks into the next dispatch.
+        self.assertFalse(os.path.exists(call["cwd"]))
+
+    async def test_each_dispatch_gets_an_isolated_cleaned_workspace(self):
+        backend = _RecordingBackend(AgentResult(ok=True, output="draft"))
+        ex = Executor(self.gum, backend=backend, sanitize=False)
+        sug = _suggestion(probability_useful=9)
+        with self._patch_assessment("read_only", 1):
+            await ex.dispatch(sug)
+            await ex.dispatch(sug)
+
+        # Two runs, two *distinct* sandboxes, each removed after its run — so one
+        # dispatch's scratch state can never bleed into the next, and nothing piles
+        # up under the workspace root.
+        cwds = [c["cwd"] for c in backend.calls]
+        self.assertEqual(len(set(cwds)), 2)
+        for c in backend.calls:
+            self.assertTrue(c["cwd_isdir"])
+            self.assertFalse(os.path.exists(c["cwd"]))
+        # Both sandboxes lived under the shared workspace root, which is left empty.
+        root = ex._ensure_workspace_root()
+        for c in cwds:
+            self.assertEqual(os.path.dirname(c), root)
+        self.assertEqual(os.listdir(root), [])
+
+    async def test_workspace_is_cleaned_up_even_when_backend_fails(self):
+        backend = _RecordingBackend(
+            AgentResult(ok=False, output="", error="agent timed out after 120s")
+        )
+        ex = Executor(self.gum, backend=backend, sanitize=False)
+        sug = _suggestion(probability_useful=9)
+        with self._patch_assessment("reversible", 2):
+            outcome = await ex.dispatch(sug)
+
+        self.assertEqual(outcome.status, STATUS_FAILED)
+        # A failed/timed-out run must not leave its sandbox behind.
+        self.assertFalse(os.path.exists(backend.calls[0]["cwd"]))
+        self.assertEqual(os.listdir(ex._ensure_workspace_root()), [])
 
     async def test_risky_suggestion_never_dispatches(self):
         backend = _RecordingBackend(AgentResult(ok=True, output="should not run"))
