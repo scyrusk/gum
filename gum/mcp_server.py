@@ -31,7 +31,11 @@ from mcp.server.fastmcp import FastMCP
 
 # Reuse the exact serialization + egress-sanitization the REST API uses so the
 # two machine-facing surfaces expose propositions identically.
-from .api import _serialize_observation, _serialize_proposition
+from .api import (
+    _serialize_commitment,
+    _serialize_observation,
+    _serialize_proposition,
+)
 from .gum import gum
 
 # An agent calls gather_context with a *task instruction* ("draft a grant
@@ -90,7 +94,9 @@ _INSTRUCTIONS = (
     "collaborators, deadlines, or preferences — call `gather_context` with a "
     "short description of the task to retrieve the relevant propositions, then "
     "ground your work in them. Use `recent_context` to see what the user has "
-    "been doing lately. Higher `confidence` (1-10) means the model is more "
+    "been doing lately. Use `agenda` to see the user's ranked open commitments "
+    "and deadlines before scheduling, drafting, or planning on their behalf. "
+    "Higher `confidence` (1-10) means the model is more "
     "certain. Each proposition carries an `id`; call `inspect_proposition` with "
     "it to see the raw observations the model inferred it from when you need the "
     "underlying evidence to ground your work. Content may be pseudonymized "
@@ -277,6 +283,41 @@ def build_mcp(gum_instance: gum, *, sanitize: bool = True) -> FastMCP:
             "evidence": [
                 await _serialize_observation(o, sanitizer) for o in obs
             ],
+            "sanitized": sanitizer is not None,
+        }
+
+    @mcp.tool(
+        description=(
+            "Return the user's commitment & deadline radar: a ranked list of the "
+            "open commitments and deadlines the General User Model has inferred "
+            "(papers, grants, reviews, meetings, payments, promises), most urgent "
+            "first. Use this to see what is time-critical for the user before "
+            "scheduling, drafting, or planning on their behalf. Each item carries "
+            "a `due_date` (or null if undated), `days_until_due` (negative = "
+            "overdue), a `status_guess`, the model's `confidence` (1-10), and an "
+            "`urgency` rank. Pass `window_days` to only include commitments due "
+            "within that horizon (overdue and undated items are always kept)."
+        )
+    )
+    async def agenda(
+        limit: int = 10, window_days: int | None = None
+    ) -> dict[str, Any]:
+        # Import lazily so the (heavy) agenda engine and its LLM/schema deps only
+        # load when this tool is actually called, mirroring cmd_agenda.
+        from .agenda import build_agenda
+
+        limit = max(1, min(int(limit), 50))
+        window = None if window_days is None else max(0, int(window_days))
+        commitments = await build_agenda(
+            gum_instance, limit=limit, window_days=window
+        )
+        items = [
+            await _serialize_commitment(c, sanitizer) for c in commitments
+        ]
+        return {
+            "count": len(items),
+            "window_days": window,
+            "commitments": items,
             "sanitized": sanitizer is not None,
         }
 

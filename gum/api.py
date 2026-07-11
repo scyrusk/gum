@@ -106,6 +106,20 @@ async def _serialize_suggestion(sug: Suggestion, sanitizer) -> dict[str, Any]:
     return data
 
 
+async def _serialize_commitment(commitment, sanitizer) -> dict[str, Any]:
+    """Serialize a ranked commitment for the machine surfaces (REST/MCP).
+
+    Only the model-written text fields (``title``, ``source``,
+    ``proposition_text``) are generated from raw propositions and carry PII, so
+    they pass through the sanitizer; the numeric/date/ranking fields never do and
+    are emitted unchanged. Mirrors :func:`_serialize_suggestion`.
+    """
+    data = commitment.to_dict()
+    for field in ("title", "source", "proposition_text"):
+        data[field] = await _scrub(data[field], sanitizer)
+    return data
+
+
 async def _serialize_observation(obs: Observation, sanitizer) -> dict[str, Any]:
     return {
         "id": obs.id,

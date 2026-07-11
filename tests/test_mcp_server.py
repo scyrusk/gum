@@ -13,12 +13,15 @@ from __future__ import annotations
 import tempfile
 import unittest
 import uuid
+from datetime import datetime, timezone
+from unittest import mock
 
 from mcp.shared.memory import create_connected_server_and_client_session
 
 from gum import gum as Gum
 from gum.models import Observation, Proposition
 from gum.mcp_server import build_mcp, _focus_terms
+from gum.schemas import CommitmentItem, CommitmentSchema
 
 
 def _prop(text: str, confidence: int) -> Proposition:
@@ -281,12 +284,114 @@ class SanitizationTests(_Base):
         self.assertEqual(result["query_aliases"], {})
 
 
+class AgendaTests(_Base):
+    """The commitment & deadline radar exposed as the `agenda` MCP tool.
+
+    build_agenda runs the text model to extract commitments; we patch
+    ``structured_completion`` so these are deterministic and offline, mirroring
+    the CLI agenda tests. A far-future due date keeps ``days_until_due`` positive
+    regardless of the real "now" the tool uses.
+    """
+
+    def _fake_completion(self):
+        async def fake(client, model, messages, schema, **kwargs):
+            return CommitmentSchema(commitments=[
+                CommitmentItem(source_index=1,
+                               title="Submit the Schmidt grant proposal",
+                               due_date="2999-07-20", source="Schmidt",
+                               status_guess="in progress"),
+                CommitmentItem(source_index=2, title="Send reviewer comments",
+                               due_date=None, source="a colleague",
+                               status_guess="not started"),
+            ])
+        return fake
+
+    async def _seed_commitment_props(self) -> None:
+        await self._seed(
+            _prop("Omar has a grant proposal deadline for the Schmidt Foundation", 9),
+            _prop("Omar promised to send reviewer comments back to a colleague", 7),
+        )
+
+    async def test_agenda_returns_ranked_commitments(self):
+        await self._seed_commitment_props()
+        mcp = build_mcp(self.gum, sanitize=False)
+
+        with mock.patch("gum.agenda.structured_completion",
+                        side_effect=self._fake_completion()):
+            result = await _call(mcp, "agenda", {})
+
+        self.assertEqual(result["count"], 2)
+        self.assertFalse(result["sanitized"])
+        self.assertIsNone(result["window_days"])
+        titles = [c["title"] for c in result["commitments"]]
+        self.assertIn("Submit the Schmidt grant proposal", titles)
+        self.assertIn("Send reviewer comments", titles)
+        # A dated commitment always outranks an undated one.
+        self.assertEqual(result["commitments"][0]["title"],
+                         "Submit the Schmidt grant proposal")
+        self.assertEqual(result["commitments"][0]["due_date"], "2999-07-20")
+        self.assertIsNone(result["commitments"][1]["due_date"])
+
+    async def test_window_excludes_far_future_commitments(self):
+        await self._seed_commitment_props()
+        mcp = build_mcp(self.gum, sanitize=False)
+
+        with mock.patch("gum.agenda.structured_completion",
+                        side_effect=self._fake_completion()):
+            result = await _call(mcp, "agenda", {"window_days": 30})
+
+        # The year-2999 deadline is far outside a 30-day horizon; the undated
+        # commitment has no date and is always kept.
+        self.assertEqual(result["window_days"], 30)
+        titles = [c["title"] for c in result["commitments"]]
+        self.assertEqual(titles, ["Send reviewer comments"])
+
+    async def test_limit_is_clamped(self):
+        await self._seed_commitment_props()
+        mcp = build_mcp(self.gum, sanitize=False)
+
+        with mock.patch("gum.agenda.structured_completion",
+                        side_effect=self._fake_completion()):
+            result = await _call(mcp, "agenda", {"limit": 999})
+
+        self.assertLessEqual(result["count"], 50)
+
+    async def test_agenda_pseudonymizes_text_fields(self):
+        # The radar's title/source/proposition_text are model-written from raw
+        # propositions and carry PII; the MCP surface must scrub them, while the
+        # numeric ranking fields pass through untouched.
+        import gum.sanitize as sanitize_mod
+
+        fake = _FakeSanitizer({"Schmidt": "[ORG_1]", "Omar": "[PERSON_1]"})
+        original = sanitize_mod.get_sanitizer
+        sanitize_mod.get_sanitizer = lambda: fake
+        try:
+            await self._seed_commitment_props()
+            mcp = build_mcp(self.gum, sanitize=True)
+            with mock.patch("gum.agenda.structured_completion",
+                            side_effect=self._fake_completion()):
+                result = await _call(mcp, "agenda", {})
+        finally:
+            sanitize_mod.get_sanitizer = original
+
+        self.assertTrue(result["sanitized"])
+        top = result["commitments"][0]
+        self.assertEqual(top["title"], "Submit the [ORG_1] grant proposal")
+        self.assertEqual(top["source"], "[ORG_1]")
+        self.assertNotIn("Omar", top["proposition_text"])
+        self.assertIn("[PERSON_1]", top["proposition_text"])
+        # Numeric/date fields are not text and must not be mangled.
+        self.assertEqual(top["due_date"], "2999-07-20")
+        self.assertEqual(top["confidence"], 9)
+
+
 class ToolAdvertisingTests(_Base):
     async def test_tools_are_advertised_to_clients(self):
         mcp = build_mcp(self.gum, sanitize=False)
         names = {t.name for t in await mcp.list_tools()}
         self.assertEqual(
-            names, {"gather_context", "recent_context", "inspect_proposition"}
+            names,
+            {"gather_context", "recent_context", "inspect_proposition", "agenda"},
         )
 
 
@@ -358,7 +463,8 @@ class ClientSessionE2ETests(_Base):
             # Tools and the prompt are advertised across the wire.
             tools = {t.name for t in (await client.list_tools()).tools}
             self.assertEqual(
-                tools, {"gather_context", "recent_context", "inspect_proposition"}
+                tools,
+                {"gather_context", "recent_context", "inspect_proposition", "agenda"},
             )
             prompts = {p.name for p in (await client.list_prompts()).prompts}
             self.assertIn("with_user_context", prompts)
