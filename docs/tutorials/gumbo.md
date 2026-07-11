@@ -55,7 +55,12 @@ behalf. Four independent guardrails enforce this:
     hands local agents — retrieval on the substantive terms, then PII
     pseudonymization on egress, fail-closed. The execution bridge does not fork a
     second grounding path, so raw identities never reach an off-device model even
-    when the backend relays context to a frontier model.
+    when the backend relays context to a frontier model. The **whole** dispatched
+    prompt is held to this bar, not just the grounding block: the GUM-generated
+    suggestion text (which may embed real names or projects) and your own name —
+    which the agent instruction would otherwise stamp in verbatim — are run
+    through the *same* sanitizer, so they reach the backend only as the same
+    stable pseudo-IDs (`[PERSON_1]`, `[ORG_1]`) the context uses.
 
 ## Turning it on
 

@@ -360,6 +360,38 @@ class DispatchFlowTests(unittest.IsolatedAsyncioTestCase):
         # accumulates and no run's scratch state leaks into the next dispatch.
         self.assertFalse(os.path.exists(call["cwd"]))
 
+    async def test_dispatched_prompt_is_pseudonymized_for_off_device_backend(self):
+        # The shipped backend ships the whole instruction off-device, so every
+        # identity in it must be pseudonymized on egress — not only the grounding
+        # context, but the two identities the prompt itself reintroduces: the
+        # GUM-generated suggestion text (which may embed real names/projects) and
+        # the user's own name (stamped in by EXECUTION_AGENT_PROMPT). Leaving
+        # either raw leaks it and lets the agent tie a pseudo-ID back to the user.
+        await self._seed_prop("Omar is applying for a Schmidt Foundation grant", 9)
+        fake = _FakeSanitizer({"Schmidt": "[ORG_1]", "Omar": "[PERSON_1]"})
+        backend = _RecordingBackend(AgentResult(ok=True, output="draft"))
+        ex = Executor(self.gum, backend=backend, sanitizer=fake)
+        sug = _suggestion(
+            title="Draft the Schmidt grant proposal",
+            description="Prepare a first draft for Omar.",
+            probability_useful=9,
+        )
+        with self._patch_assessment("read_only", 1):
+            outcome = await ex.dispatch(sug)
+
+        self.assertEqual(outcome.status, STATUS_PENDING_APPROVAL)
+        task = backend.calls[0]["task"]
+        # The suggestion text AND the user's name reach the backend only as their
+        # stable pseudo-IDs — the same ones the grounding context carries.
+        self.assertIn("[ORG_1]", task)
+        self.assertIn("[PERSON_1]", task)
+        self.assertNotIn("Schmidt", task)
+        self.assertNotIn("Omar", task)
+
+    async def _seed_prop(self, text: str, confidence: int) -> None:
+        async with self.gum._session() as s:
+            s.add(_prop(text, confidence))
+
     async def test_each_dispatch_gets_an_isolated_cleaned_workspace(self):
         backend = _RecordingBackend(AgentResult(ok=True, output="draft"))
         ex = Executor(self.gum, backend=backend, sanitize=False)

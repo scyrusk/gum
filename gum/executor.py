@@ -441,20 +441,44 @@ class Executor:
         self._workspace_dir = path
         return path
 
-    def _build_task(self, suggestion: Suggestion, context: str) -> str:
+    async def _build_task(self, suggestion: Suggestion, context: str) -> str:
         """Compose the safety-framed, GUM-grounded instruction for the backend.
 
         Wraps the suggestion in :data:`EXECUTION_AGENT_PROMPT`, which embeds the
         (already pseudonymized) ``context`` and instructs the agent to produce a
         reviewable draft rather than take any irreversible action.
+
+        The shipped backend ships this whole instruction to an **off-device**
+        model, so every identity that reaches it must be pseudonymized on egress —
+        not just the ``context`` block (which :meth:`assemble_context` already
+        pseudonymized), but the two identities this prompt reintroduces itself:
+
+        - the **suggestion text** (title/description), which is GUM-generated and
+          may embed real names/projects drawn from the user's propositions; and
+        - the user's own **name**, which :data:`EXECUTION_AGENT_PROMPT` stamps in
+          verbatim — leaving it raw both leaks it and defeats the context's
+          pseudonymization (the agent could tie "[PERSON_1]" back to the user).
+
+        Both go through the SAME sanitizer as the grounding context, whose entity
+        map is stable, so a name here maps to the exact pseudo-ID it already
+        carries in the context block. With sanitization disabled (a fully-local,
+        trusted backend) the raw text is used unchanged.
         """
         parts = [suggestion.title.strip()]
         if suggestion.description and suggestion.description.strip():
             parts.append(suggestion.description.strip())
+        task_body = "\n\n".join(parts)
+        user_name = self.gum.user_name
+        sanitizer = self._get_sanitizer()
+        if sanitizer is not None:
+            # Blocking model inference; offload like gather_context does. The
+            # sanitizer's entity map is loaded/warmed by assemble_context above.
+            task_body = await asyncio.to_thread(sanitizer.sanitize, task_body)
+            user_name = await asyncio.to_thread(sanitizer.sanitize, user_name)
         return EXECUTION_AGENT_PROMPT.format(
-            user_name=self.gum.user_name,
+            user_name=user_name,
             context=context,
-            task="\n\n".join(parts),
+            task=task_body,
         )
 
     async def dispatch(self, suggestion: Suggestion) -> ExecutionOutcome:
@@ -505,7 +529,7 @@ class Executor:
             )
 
         context = await self.assemble_context(suggestion)
-        task = self._build_task(suggestion, context)
+        task = await self._build_task(suggestion, context)
         # Each dispatch gets its OWN ephemeral subdirectory under the workspace root,
         # torn down when the run finishes. A single shared cwd would leak one agent
         # run's scratch files and state into the next dispatch's sandbox and let
