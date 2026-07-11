@@ -25,7 +25,7 @@ from __future__ import annotations
 import asyncio
 import re
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import date, datetime
 from typing import Any
 
 from mcp.server.fastmcp import FastMCP
@@ -91,6 +91,28 @@ def _today_anchor() -> dict[str, str]:
     return {"date": now.strftime("%Y-%m-%d"), "weekday": now.strftime("%A")}
 
 
+# Propositions now state deadlines as absolute ``YYYY-MM-DD`` calendar dates (see
+# ``PROPOSE_PROMPT``'s temporal-grounding rule), so an off-device agent's dated
+# commitments can be recovered from the proposition text with a plain regex — no
+# model call, and complete coverage of whatever the GUM actually wrote down.
+_ABS_DATE_RE = re.compile(r"\b(\d{4})-(\d{2})-(\d{2})\b")
+
+
+def _extract_dates(text: str) -> list[date]:
+    """Parse every valid absolute ``YYYY-MM-DD`` date out of *text*.
+
+    Malformed matches (e.g. ``2026-13-40``) are skipped rather than raising, so a
+    stray number that merely looks like a date can never break the scan.
+    """
+    out: list[date] = []
+    for m in _ABS_DATE_RE.finditer(text or ""):
+        try:
+            out.append(date(int(m.group(1)), int(m.group(2)), int(m.group(3))))
+        except ValueError:
+            continue
+    return out
+
+
 def _focus_terms(topic: str) -> str:
     """Reduce a task instruction to its substantive search terms.
 
@@ -114,6 +136,9 @@ _INSTRUCTIONS = (
     "ground your work in them. Use `recent_context` to see what the user has "
     "been doing lately. Use `agenda` to see the user's ranked open commitments "
     "and deadlines before scheduling, drafting, or planning on their behalf. "
+    "Use `upcoming_deadlines` to get the raw, complete set of propositions that "
+    "carry an absolute calendar deadline (a deterministic date scan that "
+    "complements `agenda`'s local-model extraction). "
     "Higher `confidence` (1-10) means the model is more "
     "certain. Each proposition carries an `id`; call `inspect_proposition` with "
     "it to see the raw observations the model inferred it from when you need the "
@@ -350,6 +375,71 @@ def build_mcp(gum_instance: gum, *, sanitize: bool = True) -> FastMCP:
             "sanitized": sanitizer is not None,
         }
 
+    @mcp.tool(
+        description=(
+            "Return the propositions whose text carries an absolute calendar "
+            "deadline (a `YYYY-MM-DD` date), scanned deterministically from the "
+            "user's General User Model — no model extraction, so it surfaces the "
+            "complete, unfiltered set of dated commitments the GUM has recorded. "
+            "Each item is a proposition (with its `id`, `text`, `confidence`, and "
+            "`created_at`) plus the parsed `deadline` and `days_until_due` "
+            "(negative = overdue). Overdue items are always included; upcoming "
+            "ones are kept only if within `window_days` (default 30). Sorted "
+            "soonest-first. Use this ALONGSIDE `agenda` when building a daily "
+            "plan: `agenda` gives the local model's ranked, deduplicated "
+            "interpretation (and includes undated commitments), while this gives "
+            "you the raw dated signal to reason over yourself and to catch dated "
+            "items the extractor may have dropped. Read the returned `today` as "
+            "\"now\"."
+        )
+    )
+    async def upcoming_deadlines(
+        window_days: int = 30, limit: int = 20
+    ) -> dict[str, Any]:
+        window = max(0, int(window_days))
+        limit = max(1, min(int(limit), 50))
+        today = datetime.now().astimezone().date()
+        # Scan a generous pool of recent propositions (not just the newest few)
+        # so a deadline recorded a while back but due soon isn't missed for
+        # falling out of a short recency window. Bounded so a huge GUM can't make
+        # this unboundedly expensive.
+        scan = min(500, max(200, limit * 20))
+        props = await gum_instance.recent(limit=scan)
+        matches: list[tuple[int, int, Any, date]] = []
+        for p in props:
+            dates = _extract_dates(p.text or "")
+            if not dates:
+                continue
+            # Represent each proposition by its most actionable date: the soonest
+            # one that is today-or-later, else (all past) the most recent overdue
+            # date. A proposition can name several dates ("meet 2026-07-15,
+            # deliverable due 2026-07-20"); the nearest upcoming one is what a
+            # daily plan turns on.
+            future = sorted(d for d in dates if d >= today)
+            chosen = future[0] if future else max(dates)
+            days = (chosen - today).days
+            # Overdue (days < 0) is always kept; upcoming only within the window.
+            if days > window:
+                continue
+            matches.append((days, p.id, p, chosen))
+        # Soonest-first (most-overdue first), deterministic id tiebreak. Serialize
+        # only the top `limit` so the (per-text) sanitizer runs a bounded number
+        # of times regardless of how many propositions carry dates.
+        matches.sort(key=lambda t: (t[0], t[1]))
+        items: list[dict[str, Any]] = []
+        for days, _pid, p, chosen in matches[:limit]:
+            item = await _serialize_proposition(p, sanitizer)
+            item["deadline"] = chosen.isoformat()
+            item["days_until_due"] = days
+            items.append(item)
+        return {
+            "today": _today_anchor(),
+            "window_days": window,
+            "count": len(items),
+            "deadlines": items,
+            "sanitized": sanitizer is not None,
+        }
+
     @mcp.prompt(
         name="daily_agenda",
         title="Build the user's daily agenda from their GUM",
@@ -377,11 +467,14 @@ def build_mcp(gum_instance: gum, *, sanitize: bool = True) -> FastMCP:
             "its `today` field (the user's real local date) and use THAT as "
             "\"now\" — not your own sense of the date — to judge each item's "
             "`due_date` / `days_until_due` (negative = overdue).\n"
-            "2. Call `recent_context` (and `gather_context` with terms like "
-            "\"deadline due date meeting submit\") to catch dated commitments the "
-            "radar may have missed; each proposition's `text` states deadlines as "
-            "absolute YYYY-MM-DD dates and carries a `confidence` (1-10) — weight "
-            "higher-confidence items more.\n"
+            "2. Call `upcoming_deadlines` to get the raw, complete set of "
+            "propositions carrying an absolute YYYY-MM-DD deadline (the radar in "
+            "step 1 runs a lossy local extractor, so this catches dated "
+            "commitments it dropped or merged). Reconcile the two by proposition "
+            "`id`; each item carries a `deadline`, `days_until_due`, and a "
+            "`confidence` (1-10) — weight higher-confidence items more. Optionally "
+            "also call `recent_context` for undated but active work worth "
+            "advancing.\n"
             "3. For any item you are unsure about, call `inspect_proposition` "
             "with its `id` to read the underlying observations before including "
             "it.\n"

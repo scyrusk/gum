@@ -14,7 +14,7 @@ import os
 import tempfile
 import unittest
 import uuid
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from unittest import mock
 
 from mcp.shared.memory import create_connected_server_and_client_session
@@ -404,13 +404,121 @@ class AgendaTests(_Base):
         self.assertEqual(top["confidence"], 9)
 
 
+class UpcomingDeadlinesTests(_Base):
+    """The `upcoming_deadlines` tool: a deterministic regex scan that hands a
+    frontier agent the raw, complete set of propositions carrying an absolute
+    YYYY-MM-DD deadline — complementing the local-model `agenda` extractor so a
+    prong-2 daily-agenda agent can reason over the dates itself and catch items
+    the extractor dropped."""
+
+    def _iso(self, offset_days: int) -> str:
+        return (date.today() + timedelta(days=offset_days)).isoformat()
+
+    async def test_returns_dated_props_sorted_and_excludes_undated(self):
+        await self._seed(
+            _prop(f"Omar must submit the review by {self._iso(10)}", 6),
+            _prop("Omar prefers dark roast coffee in the morning", 8),  # undated
+            _prop(f"Omar has a call scheduled on {self._iso(3)}", 7),
+            _prop(f"Omar was supposed to reply on {self._iso(-2)}", 5),  # overdue
+        )
+        mcp = build_mcp(self.gum, sanitize=False)
+        result = await _call(mcp, "upcoming_deadlines", {"window_days": 30})
+
+        # The undated proposition is dropped; only the three dated ones remain,
+        # ordered soonest-first (most overdue -> nearest upcoming).
+        self.assertEqual(result["count"], 3)
+        self.assertFalse(result["sanitized"])
+        self.assertEqual(result["window_days"], 30)
+        days = [d["days_until_due"] for d in result["deadlines"]]
+        self.assertEqual(days, [-2, 3, 10])
+        deadlines = [d["deadline"] for d in result["deadlines"]]
+        self.assertEqual(deadlines, [self._iso(-2), self._iso(3), self._iso(10)])
+        # The temporal anchor for an off-device agent, same contract as `agenda`.
+        self.assertRegex(result["today"]["date"], r"^\d{4}-\d{2}-\d{2}$")
+
+    async def test_window_keeps_overdue_but_excludes_far_upcoming(self):
+        await self._seed(
+            _prop(f"Omar owes a payment due {self._iso(-3)}", 6),  # overdue kept
+            _prop(f"Omar has a deadline on {self._iso(5)}", 7),    # in window
+            _prop(f"Omar has a conference on {self._iso(100)}", 7),  # out of window
+        )
+        mcp = build_mcp(self.gum, sanitize=False)
+        result = await _call(mcp, "upcoming_deadlines", {"window_days": 30})
+
+        days = [d["days_until_due"] for d in result["deadlines"]]
+        self.assertEqual(days, [-3, 5])  # the +100 item is excluded
+
+    async def test_picks_most_actionable_date_when_multiple(self):
+        await self._seed(
+            # Nearest upcoming date is what a daily plan turns on.
+            _prop(f"Omar meets on {self._iso(8)} then delivers by {self._iso(2)}", 6),
+            # All-past proposition: represent by the most recent overdue date.
+            _prop(f"Omar missed {self._iso(-9)} and again {self._iso(-2)}", 5),
+        )
+        mcp = build_mcp(self.gum, sanitize=False)
+        result = await _call(mcp, "upcoming_deadlines", {"window_days": 30})
+
+        days = [d["days_until_due"] for d in result["deadlines"]]
+        self.assertEqual(days, [-2, 2])
+
+    async def test_invalid_date_is_ignored(self):
+        await self._seed(
+            _prop("Omar noted the impossible date 2026-13-40 in his notes", 6),
+            _prop(f"Omar has a real deadline on {self._iso(4)}", 7),
+        )
+        mcp = build_mcp(self.gum, sanitize=False)
+        result = await _call(mcp, "upcoming_deadlines", {"window_days": 30})
+
+        self.assertEqual(result["count"], 1)
+        self.assertEqual(result["deadlines"][0]["days_until_due"], 4)
+
+    async def test_limit_returns_only_the_soonest(self):
+        await self._seed(
+            _prop(f"Omar deadline A on {self._iso(1)}", 6),
+            _prop(f"Omar deadline B on {self._iso(2)}", 6),
+            _prop(f"Omar deadline C on {self._iso(3)}", 6),
+            _prop(f"Omar deadline D on {self._iso(4)}", 6),
+        )
+        mcp = build_mcp(self.gum, sanitize=False)
+        result = await _call(mcp, "upcoming_deadlines", {"limit": 2})
+
+        self.assertEqual(result["count"], 2)
+        self.assertEqual([d["days_until_due"] for d in result["deadlines"]], [1, 2])
+
+    async def test_pseudonymizes_text_but_preserves_the_date(self):
+        # The proposition text is scrubbed (name -> pseudo-ID), but the parsed
+        # `deadline` is a bare calendar date (not PII) and must survive verbatim —
+        # it is exactly the signal the daily-agenda agent depends on.
+        import gum.sanitize as sanitize_mod
+
+        fake = _FakeSanitizer({"Omar": "[PERSON_1]"})
+        original = sanitize_mod.get_sanitizer
+        sanitize_mod.get_sanitizer = lambda: fake
+        try:
+            due = self._iso(6)
+            await self._seed(_prop(f"Omar must submit the grant by {due}", 9))
+            mcp = build_mcp(self.gum, sanitize=True)
+            result = await _call(mcp, "upcoming_deadlines", {})
+        finally:
+            sanitize_mod.get_sanitizer = original
+
+        self.assertTrue(result["sanitized"])
+        item = result["deadlines"][0]
+        self.assertNotIn("Omar", item["text"])
+        self.assertIn("[PERSON_1]", item["text"])
+        self.assertEqual(item["deadline"], due)
+        self.assertEqual(item["days_until_due"], 6)
+        # The date is untouched inside the scrubbed text too.
+        self.assertIn(due, item["text"])
+
+
 class ToolAdvertisingTests(_Base):
     async def test_tools_are_advertised_to_clients(self):
         mcp = build_mcp(self.gum, sanitize=False)
         names = {t.name for t in await mcp.list_tools()}
         self.assertEqual(
             names,
-            {"gather_context", "recent_context", "inspect_proposition", "agenda"},
+            {"gather_context", "recent_context", "inspect_proposition", "agenda", "upcoming_deadlines"},
         )
 
 
@@ -519,7 +627,7 @@ class ClientSessionE2ETests(_Base):
             tools = {t.name for t in (await client.list_tools()).tools}
             self.assertEqual(
                 tools,
-                {"gather_context", "recent_context", "inspect_proposition", "agenda"},
+                {"gather_context", "recent_context", "inspect_proposition", "agenda", "upcoming_deadlines"},
             )
             prompts = {p.name for p in (await client.list_prompts()).prompts}
             self.assertIn("with_user_context", prompts)
