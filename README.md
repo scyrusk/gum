@@ -160,7 +160,12 @@ While the GUM is running it serves a **localhost-only REST API** (default `http:
 curl "http://127.0.0.1:8422/query?q=email&limit=5"
 curl "http://127.0.0.1:8422/recent?limit=5"
 curl "http://127.0.0.1:8422/observations?limit=5"
+curl "http://127.0.0.1:8422/agenda?limit=5&window_days=14"   # ranked commitment radar
 ```
+
+The `/agenda` endpoint returns the same ranked commitment/deadline radar as the
+`gum agenda` CLI and the MCP `agenda` tool, as JSON; like every response it is
+pseudonymized when the server runs with `--sanitize`.
 
 Or use it from Python directly (`from gum import gum; await gum(...).query("email")`), or wire up an [MCP server](docs/tutorials/mcp.md) for Claude Desktop / Codex — including the built-in, PII-sanitized `gum mcp` (fail-closed and on by default) that lets a local agent pull your context on demand and hand the finished artifact back through `gum rehydrate`.
 

@@ -301,6 +301,35 @@ def create_app(gum_instance: gum, *, sanitize: bool = False) -> FastAPI:
             return {"ok": False, "error": f"chat failed: {exc}"}
         return {"ok": True, "reply": await _scrub(reply, sanitizer)}
 
+    # ── commitment & deadline radar ───────────────────────────────────────
+    @app.get("/agenda")
+    async def agenda(
+        limit: int = Query(10, ge=1, le=50),
+        window_days: int | None = Query(
+            None,
+            ge=0,
+            description="Optional horizon: only keep commitments due within this many "
+            "days. Overdue and undated commitments are always kept.",
+        ),
+    ) -> dict[str, Any]:
+        # The Commitment & Deadline Radar (spec #1): the same ranked list the CLI
+        # `gum agenda` and MCP `agenda` surfaces build, exposed over HTTP for any
+        # local app. Like /suggestions it runs the local text model to extract
+        # commitments from the user's propositions, then pseudonymizes the
+        # model-written text fields when the server is sanitized.
+        from .agenda import build_agenda
+        commitments = await build_agenda(
+            gum_instance, limit=limit, window_days=window_days
+        )
+        return {
+            "count": len(commitments),
+            "window_days": window_days,
+            "commitments": [
+                await _serialize_commitment(c, sanitizer) for c in commitments
+            ],
+            "sanitized": sanitizer is not None,
+        }
+
     # ── GUMBO assistant desktop UI ────────────────────────────────────────
     @app.get("/gumbo", response_class=HTMLResponse)
     async def gumbo_page() -> str:

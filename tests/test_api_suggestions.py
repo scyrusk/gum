@@ -19,7 +19,12 @@ from fastapi.testclient import TestClient
 from gum import gum as Gum
 from gum.api import create_app
 from gum.models import Observation, Proposition
-from gum.schemas import SuggestionItem, SuggestionSchema
+from gum.schemas import (
+    CommitmentItem,
+    CommitmentSchema,
+    SuggestionItem,
+    SuggestionSchema,
+)
 
 
 def _prop(text: str, confidence: int) -> Proposition:
@@ -421,6 +426,102 @@ class SuggestionsEndpointTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("Chicago", sugs[0]["description"])
         # Numeric scores are untouched by the scrubber.
         self.assertEqual(sugs[0]["probability_useful"], 9)
+
+
+class AgendaEndpointTests(unittest.IsolatedAsyncioTestCase):
+    """The Commitment & Deadline Radar exposed over HTTP as `GET /agenda`.
+
+    Same ranked list the CLI `gum agenda` and MCP `agenda` surfaces build. The
+    text model is stubbed (patched structured_completion) so these drive the
+    read-only FastAPI app end-to-end while staying offline and deterministic. A
+    far-future due date keeps `days_until_due` positive regardless of the real
+    "now" the endpoint computes.
+    """
+
+    async def asyncSetUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.gum = Gum("Omar", "dummy-model", data_directory=self._tmp.name, db_name="test.db")
+        await self.gum.connect_db()
+        async with self.gum._session() as s:
+            s.add_all([
+                _prop("Omar has a grant proposal deadline for the Schmidt Foundation", 9),
+                _prop("Omar promised to send reviewer comments back to a colleague", 7),
+            ])
+
+    async def asyncTearDown(self):
+        if self.gum.engine is not None:
+            await self.gum.engine.dispose()
+        self._tmp.cleanup()
+
+    def _fake_completion(self):
+        async def fake(client, model, messages, schema, **kwargs):
+            return CommitmentSchema(commitments=[
+                CommitmentItem(source_index=1,
+                               title="Submit the Schmidt grant proposal",
+                               due_date="2999-07-20", source="Schmidt",
+                               status_guess="in progress"),
+                CommitmentItem(source_index=2, title="Send reviewer comments",
+                               due_date=None, source="a colleague",
+                               status_guess="not started"),
+            ])
+        return fake
+
+    def test_agenda_ranked_and_shaped(self):
+        app = create_app(self.gum)
+        with mock.patch("gum.agenda.structured_completion", side_effect=self._fake_completion()):
+            with TestClient(app) as client:
+                resp = client.get("/agenda")
+        self.assertEqual(resp.status_code, 200)
+        body = resp.json()
+        self.assertEqual(body["count"], 2)
+        self.assertFalse(body["sanitized"])
+        self.assertIsNone(body["window_days"])
+        commitments = body["commitments"]
+        # A dated commitment always outranks an undated one.
+        self.assertEqual(commitments[0]["title"], "Submit the Schmidt grant proposal")
+        self.assertEqual(commitments[0]["due_date"], "2999-07-20")
+        self.assertIsNone(commitments[1]["due_date"])
+        # Provenance + ranking fields are present for a client to render.
+        for key in ("urgency", "days_until_due", "proposition_id", "status_guess"):
+            self.assertIn(key, commitments[0])
+
+    def test_window_excludes_far_future_commitments(self):
+        app = create_app(self.gum)
+        with mock.patch("gum.agenda.structured_completion", side_effect=self._fake_completion()):
+            with TestClient(app) as client:
+                resp = client.get("/agenda", params={"window_days": 30})
+        body = resp.json()
+        self.assertEqual(body["window_days"], 30)
+        # The year-2999 deadline is far outside a 30-day horizon; the undated
+        # commitment has no date and is always kept.
+        titles = [c["title"] for c in body["commitments"]]
+        self.assertEqual(titles, ["Send reviewer comments"])
+
+    def test_limit_caps_results(self):
+        app = create_app(self.gum)
+        with mock.patch("gum.agenda.structured_completion", side_effect=self._fake_completion()):
+            with TestClient(app) as client:
+                resp = client.get("/agenda", params={"limit": 1})
+        self.assertEqual(len(resp.json()["commitments"]), 1)
+
+    def test_sanitize_scrubs_commitment_text(self):
+        # Under --sanitize the model-written text fields are pseudonymized on the
+        # way out while numeric/date/ranking fields pass through unchanged.
+        fake_sanitizer = mock.Mock()
+        fake_sanitizer.load = mock.Mock()
+        fake_sanitizer.sanitize = mock.Mock(side_effect=lambda t: t.replace("Schmidt", "[ORG]"))
+        with mock.patch("gum.sanitize.get_sanitizer", return_value=fake_sanitizer):
+            app = create_app(self.gum, sanitize=True)
+            with mock.patch("gum.agenda.structured_completion", side_effect=self._fake_completion()):
+                with TestClient(app) as client:
+                    resp = client.get("/agenda")
+        body = resp.json()
+        self.assertTrue(body["sanitized"])
+        top = body["commitments"][0]
+        self.assertEqual(top["title"], "Submit the [ORG] grant proposal")
+        self.assertNotIn("Schmidt", top["source"])
+        # The date is untouched by the scrubber.
+        self.assertEqual(top["due_date"], "2999-07-20")
 
 
 if __name__ == "__main__":
