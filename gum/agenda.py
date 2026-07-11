@@ -17,6 +17,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import re
@@ -27,8 +28,8 @@ from typing import Any
 from .gum import gum
 from .llm import structured_completion
 from .models import Proposition
-from .prompts.gum import AGENDA_PROMPT
-from .schemas import CommitmentItem, CommitmentSchema
+from .prompts.gum import AGENDA_PROMPT, AGENDA_VERIFY_PROMPT
+from .schemas import CommitmentItem, CommitmentSchema, CommitmentVerdictSchema
 
 # Commitments can matter even when the GUM is only moderately sure, so the
 # candidate bar sits lower than GUMBO's suggestion bar (7): the urgency ranking
@@ -56,6 +57,13 @@ def _env_int(name: str, default: int) -> int:
         return int(os.getenv(name, str(default)))
     except (TypeError, ValueError):
         return default
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() not in ("0", "false", "no", "off", "")
 
 
 def _clamp01(x: float) -> float:
@@ -189,6 +197,7 @@ class CommitmentRadar:
         max_propositions: int | None = None,
         limit: int | None = None,
         window_days: int | None = None,
+        verify: bool | None = None,
         logger: logging.Logger | None = None,
     ) -> None:
         self.gum = gum_instance
@@ -201,6 +210,13 @@ class CommitmentRadar:
             else _env_int("GUM_AGENDA_MAX_PROPOSITIONS", DEFAULT_MAX_PROPOSITIONS)
         )
         self.limit = limit if limit is not None else DEFAULT_LIMIT
+        # Second-pass isolation verification (see :meth:`_verify`). On by default;
+        # GUM_AGENDA_VERIFY=0 disables it (used by offline tests that stub only the
+        # extraction call).
+        self.verify = (
+            verify if verify is not None
+            else _env_bool("GUM_AGENDA_VERIFY", True)
+        )
         # None = no horizon; else only keep commitments due within this many days
         # (overdue and undated commitments are always kept — see :meth:`build`).
         self.window_days = window_days
@@ -292,7 +308,7 @@ class CommitmentRadar:
             logger=self.logger,
         )
 
-        commitments: list[Commitment] = []
+        pairs: list[tuple[CommitmentItem, Proposition]] = []
         for item in result.commitments:
             prop = by_index.get(item.source_index)
             if prop is None:
@@ -303,6 +319,18 @@ class CommitmentRadar:
                     item.source_index,
                 )
                 continue
+            pairs.append((item, prop))
+
+        # Second-pass verification: the extraction call judges commitments while
+        # looking at the whole candidate pool, which pressures the model to
+        # promote borderline ongoing activities to fill the list. Re-judging each
+        # survivor in isolation (a cleaner binary decision) reliably drops those
+        # false positives before ranking.
+        if self.verify and pairs:
+            pairs = await self._verify(pairs)
+
+        commitments: list[Commitment] = []
+        for item, prop in pairs:
             commitment = self._build_commitment(item, prop, now)
             if self._outside_window(commitment):
                 continue
@@ -318,6 +346,51 @@ class CommitmentRadar:
         commitments.sort(key=_sort_key)
         commitments = self._dedupe(commitments)
         return commitments[: self.limit] if self.limit is not None else commitments
+
+    async def _verify(
+        self, pairs: list[tuple[CommitmentItem, Proposition]]
+    ) -> list[tuple[CommitmentItem, Proposition]]:
+        """Re-judge each extracted commitment in isolation, dropping false positives.
+
+        Each candidate is verified independently (concurrently) with a focused
+        binary "is this a genuine discrete commitment, or an ongoing activity?"
+        call. This is where the ongoing-habit false positives — the ones the
+        pooled extraction over-promotes — get filtered out. Fails *open* per item:
+        a verification error keeps the commitment, so a transient model hiccup
+        never silently empties the radar.
+        """
+
+        async def judge(item: CommitmentItem, prop: Proposition) -> bool:
+            prompt = (
+                AGENDA_VERIFY_PROMPT
+                .replace("{user_name}", self.gum.user_name)
+                .replace("{proposition}", prop.text.strip())
+                .replace("{title}", (item.title or "").strip())
+            )
+            try:
+                verdict = await structured_completion(
+                    self.gum.client,
+                    self.gum.model,
+                    [{"role": "user", "content": prompt}],
+                    CommitmentVerdictSchema,
+                    temperature=0,  # a classification, not a creative task
+                    logger=self.logger,
+                )
+                keep = bool(getattr(verdict, "is_commitment", True))
+            except Exception as exc:  # noqa: BLE001 — fail open, never crash the radar
+                self.logger.debug(
+                    "agenda: verification error for %r, keeping it: %s",
+                    item.title, exc,
+                )
+                return True
+            if not keep:
+                self.logger.debug(
+                    "agenda: verification dropped ongoing-activity %r", item.title
+                )
+            return keep
+
+        verdicts = await asyncio.gather(*(judge(i, p) for i, p in pairs))
+        return [pair for pair, keep in zip(pairs, verdicts) if keep]
 
     def _dedupe(self, commitments: list[Commitment]) -> list[Commitment]:
         """Drop near-duplicate commitments, keeping the most-urgent instance.
@@ -382,6 +455,7 @@ async def build_agenda(
     limit: int | None = DEFAULT_LIMIT,
     window_days: int | None = None,
     min_confidence: int | None = None,
+    verify: bool | None = None,
     now: datetime | None = None,
 ) -> list[Commitment]:
     """Convenience one-shot: build a ranked commitment radar over *gum_instance*.
@@ -394,5 +468,6 @@ async def build_agenda(
         min_confidence=min_confidence,
         limit=limit,
         window_days=window_days,
+        verify=verify,
     )
     return await radar.build(now=now)

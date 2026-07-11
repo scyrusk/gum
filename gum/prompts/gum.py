@@ -263,3 +263,22 @@ Return **only** JSON in this exact format:
     // one object per open commitment; empty list if none
   ]
 }"""
+
+
+AGENDA_VERIFY_PROMPT = """You are auditing one candidate commitment for {user_name}'s deadline radar. A first pass — which scanned a large pool of propositions at once — guessed the proposition below implies an open commitment. That pass tends to over-reach when the pool is full of routine activity, promoting habits into commitments to pad the list. Your job is to confirm or reject this one candidate, judged **in isolation**.
+
+Proposition: "{proposition}"
+Guessed commitment title: "{title}"
+
+A GENUINE commitment has a single discrete completion point — one specific deliverable, reply, submission, decision, or event {user_name} can finish and then tick off, after which the task is DONE. A specific scheduled meeting or event ALWAYS counts as discrete (attending it is the completion point), no matter what it is about — do not reject it just because its topic ("review the budget", "discuss the plan") sounds ongoing. Submitting a specific document counts. Sending a specific reply counts. Paying a specific bill counts.
+
+It is NOT a genuine commitment if the proposition describes an ONGOING or RECURRING activity, role, habit, or way of working — managing, coordinating, collaborating, communicating with someone, regularly checking, reviewing, accessing, or maintaining something. Those never reach a "done" state; they are how {user_name} works, not a task owed. When the proposition leans on habitual/durative language ("regularly", "manages", "coordinates", "collaborates", "communicates with", "schedules meetings with", "is involved in", "works on") and names no single finished artifact or one-time event, reject it.
+
+Judge strictly about THIS proposition in isolation. When unsure, reject: a radar padded with routine activity is worse than a short, sharp one.
+
+Return only JSON in this exact format:
+
+{
+  "is_commitment": true or false,
+  "reason": "<one short phrase>"
+}"""

@@ -167,6 +167,13 @@ The `/agenda` endpoint returns the same ranked commitment/deadline radar as the
 `gum agenda` CLI and the MCP `agenda` tool, as JSON; like every response it is
 pseudonymized when the server runs with `--sanitize`.
 
+The radar builds in two passes: the local model first extracts candidate
+commitments from a pool of recent propositions, then re-judges each one *in
+isolation* ("is this a discrete, dischargeable task, or an ongoing activity?") to
+drop the habits and roles the first, pool-wide pass tends to over-promote. Both
+passes are greedy (deterministic) and stay on your local models. Set
+`GUM_AGENDA_VERIFY=0` to skip the second pass (faster, but noisier).
+
 Or use it from Python directly (`from gum import gum; await gum(...).query("email")`), or wire up an [MCP server](docs/tutorials/mcp.md) for Claude Desktop / Codex — including the built-in, PII-sanitized `gum mcp` (fail-closed and on by default) that lets a local agent pull your context on demand and hand the finished artifact back through `gum rehydrate`.
 
 ### How often does it observe?

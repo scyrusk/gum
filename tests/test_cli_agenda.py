@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import tempfile
 import unittest
 import uuid
@@ -59,6 +60,10 @@ def _args(**overrides) -> SimpleNamespace:
 
 class CmdAgendaTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
+        # Only the extraction call is stubbed here; disable the second-pass
+        # verification so it doesn't hit the same stub (it has dedicated coverage
+        # in tests.test_agenda.VerificationPassTests).
+        self.enterContext(mock.patch.dict(os.environ, {"GUM_AGENDA_VERIFY": "0"}))
         self._tmp = tempfile.TemporaryDirectory()
         self.gum = Gum(
             "Omar", "dummy-model", data_directory=self._tmp.name, db_name="test.db"

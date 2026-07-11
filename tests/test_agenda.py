@@ -9,6 +9,7 @@
 
 from __future__ import annotations
 
+import os
 import tempfile
 import unittest
 import uuid
@@ -24,7 +25,11 @@ from gum.agenda import (
     build_agenda,
     urgency_score,
 )
-from gum.schemas import CommitmentItem, CommitmentSchema
+from gum.schemas import (
+    CommitmentItem,
+    CommitmentSchema,
+    CommitmentVerdictSchema,
+)
 
 # A fixed "now" so proximity/recency math is deterministic across the suite.
 NOW = datetime(2026, 7, 11, 12, 0, 0, tzinfo=timezone.utc)
@@ -133,6 +138,10 @@ def _prop(text: str, confidence: int, *, decay: int = 5, created_at=None) -> obj
 
 class CommitmentRadarTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
+        # These tests stub only the extraction call, so switch off the second-pass
+        # verification (which would otherwise hit the same stub). The verification
+        # pass has its own dedicated coverage in VerificationPassTests.
+        self.enterContext(mock.patch.dict(os.environ, {"GUM_AGENDA_VERIFY": "0"}))
         self._tmp = tempfile.TemporaryDirectory()
         self.gum = Gum(
             "Omar", "dummy-model", data_directory=self._tmp.name, db_name="test.db"
@@ -346,6 +355,117 @@ class CommitmentRadarTests(unittest.IsolatedAsyncioTestCase):
             commitments = await radar.build(now=NOW)
         self.assertEqual(commitments, [])
         sc.assert_not_called()  # no model call when there's nothing to extract from
+
+
+class VerifyPromptGuidanceTests(unittest.TestCase):
+    """The verification prompt is the precision lever of the second pass; guard
+    that its isolation/ongoing-activity guidance stays in place."""
+
+    def test_verify_prompt_has_isolation_and_ongoing_guidance(self):
+        from gum.prompts.gum import AGENDA_VERIFY_PROMPT
+
+        lowered = AGENDA_VERIFY_PROMPT.lower()
+        self.assertIn("in isolation", lowered)
+        self.assertIn("discrete completion point", lowered)
+        self.assertIn("ongoing", lowered)
+        # A specific scheduled meeting must survive verification, whatever its topic.
+        self.assertIn("scheduled meeting", lowered)
+        self.assertIn("is_commitment", AGENDA_VERIFY_PROMPT)
+
+
+class VerificationPassTests(unittest.IsolatedAsyncioTestCase):
+    """The second-pass verification that re-judges each extracted commitment in
+    isolation, dropping ongoing-activity false positives the pooled extraction
+    over-promotes. Both LLM calls are stubbed via a schema-dispatching fake, so
+    the pass is exercised deterministically and offline (verification ON here)."""
+
+    async def asyncSetUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.gum = Gum(
+            "Omar", "dummy-model", data_directory=self._tmp.name, db_name="test.db"
+        )
+        await self.gum.connect_db()
+        async with self.gum._session() as s:
+            s.add_all([
+                _prop("Omar promised to send reviewer comments back to a colleague", 8),
+                _prop("Omar manages research-related activities across several apps", 9),
+            ])
+
+    async def asyncTearDown(self):
+        if self.gum.engine is not None:
+            await self.gum.engine.dispose()
+        self._tmp.cleanup()
+
+    def _index_of(self, prompt: str, needle: str) -> int:
+        for line in prompt.splitlines():
+            if needle in line and line.strip()[:1].isdigit():
+                return int(line.split(".", 1)[0].strip())
+        raise AssertionError(f"{needle!r} not found in prompt")
+
+    def _dispatch_stub(self, verdicts=None, verify_error=False, calls=None):
+        """A structured_completion fake that answers by schema.
+
+        The extraction call (CommitmentSchema) returns one genuine + one ongoing
+        commitment; the verification call (CommitmentVerdictSchema) answers each
+        proposition using *verdicts* (drop the 'manages' habit by default).
+        """
+        async def fake(client, model, messages, schema, **kwargs):
+            prompt = messages[0]["content"]
+            if schema is CommitmentSchema:
+                return CommitmentSchema(commitments=[
+                    CommitmentItem(
+                        source_index=self._index_of(prompt, "reviewer comments"),
+                        title="Send reviewer comments to a colleague",
+                        due_date=None, source="a colleague",
+                        status_guess="not started"),
+                    CommitmentItem(
+                        source_index=self._index_of(prompt, "manages research"),
+                        title="Manage research-related activities",
+                        due_date=None, source="unknown", status_guess="unknown"),
+                ])
+            # verification call
+            if calls is not None:
+                calls.append(prompt)
+            if verify_error:
+                raise RuntimeError("model unavailable")
+            keep = not ("manages research" in prompt)
+            if verdicts is not None:
+                keep = verdicts(prompt)
+            return CommitmentVerdictSchema(
+                is_commitment=keep, reason="stub verdict")
+        return fake
+
+    async def test_verification_drops_ongoing_activity(self):
+        calls: list[str] = []
+        radar = CommitmentRadar(self.gum, min_confidence=3)  # verify on by default
+        with mock.patch("gum.agenda.structured_completion",
+                        side_effect=self._dispatch_stub(calls=calls)):
+            commitments = await radar.build(now=NOW)
+
+        titles = [c.title for c in commitments]
+        self.assertEqual(titles, ["Send reviewer comments to a colleague"])
+        # One verification call per extracted commitment (2), judged individually.
+        self.assertEqual(len(calls), 2)
+
+    async def test_verification_disabled_keeps_everything(self):
+        radar = CommitmentRadar(self.gum, min_confidence=3, verify=False)
+        with mock.patch("gum.agenda.structured_completion",
+                        side_effect=self._dispatch_stub()):
+            commitments = await radar.build(now=NOW)
+        self.assertEqual(len(commitments), 2)  # ongoing item is NOT dropped
+
+    async def test_verification_fails_open_on_error(self):
+        # A verification error must never silently empty the radar — keep the item.
+        radar = CommitmentRadar(self.gum, min_confidence=3)
+        with mock.patch("gum.agenda.structured_completion",
+                        side_effect=self._dispatch_stub(verify_error=True)):
+            commitments = await radar.build(now=NOW)
+        self.assertEqual(len(commitments), 2)
+
+    async def test_verify_env_toggle_off(self):
+        with mock.patch.dict(os.environ, {"GUM_AGENDA_VERIFY": "0"}):
+            radar = CommitmentRadar(self.gum, min_confidence=3)
+        self.assertFalse(radar.verify)
 
 
 if __name__ == "__main__":

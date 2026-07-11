@@ -150,6 +150,25 @@ class CommitmentSchema(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
+class CommitmentVerdictSchema(BaseModel):
+    """Verdict from the agenda's second-pass verification of one candidate.
+
+    The extraction pass classifies commitments while looking at the *whole*
+    candidate pool, which pressures the model to promote borderline ongoing
+    activities to fill the list. This verdict re-judges a single candidate in
+    isolation — a cleaner binary decision — so those false positives can be
+    dropped before ranking (see gum.agenda.CommitmentRadar).
+    """
+    is_commitment: bool = Field(
+        ..., description="True only if the proposition implies a genuine discrete, dischargeable commitment"
+    )
+    reason: str = Field(
+        ..., description="One short phrase justifying the verdict"
+    )
+
+    model_config = ConfigDict(extra="forbid")
+
+
 def get_schema(json_schema):
     return {
         "type": "json_schema",

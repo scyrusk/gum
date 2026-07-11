@@ -9,6 +9,7 @@
 
 from __future__ import annotations
 
+import os
 import tempfile
 import unittest
 import uuid
@@ -439,6 +440,10 @@ class AgendaEndpointTests(unittest.IsolatedAsyncioTestCase):
     """
 
     async def asyncSetUp(self):
+        # Only the extraction call is stubbed; disable the second-pass
+        # verification so it doesn't hit the same stub (covered by
+        # tests.test_agenda.VerificationPassTests).
+        self.enterContext(mock.patch.dict(os.environ, {"GUM_AGENDA_VERIFY": "0"}))
         self._tmp = tempfile.TemporaryDirectory()
         self.gum = Gum("Omar", "dummy-model", data_directory=self._tmp.name, db_name="test.db")
         await self.gum.connect_db()

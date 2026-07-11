@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+import os
 import tempfile
 import unittest
 import uuid
@@ -292,6 +293,13 @@ class AgendaTests(_Base):
     the CLI agenda tests. A far-future due date keeps ``days_until_due`` positive
     regardless of the real "now" the tool uses.
     """
+
+    async def asyncSetUp(self):
+        await super().asyncSetUp()
+        # Only the extraction call is stubbed; disable the second-pass
+        # verification so it doesn't hit the same stub (covered by
+        # tests.test_agenda.VerificationPassTests).
+        self.enterContext(mock.patch.dict(os.environ, {"GUM_AGENDA_VERIFY": "0"}))
 
     def _fake_completion(self):
         async def fake(client, model, messages, schema, **kwargs):
