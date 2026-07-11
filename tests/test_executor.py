@@ -649,6 +649,19 @@ class ClaudeCLIBackendTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("draft the reply", result.output)
         self.assertIn("## context block", result.output)
 
+    async def test_prompt_requires_plan_mode_deliverable_on_stdout(self):
+        backend = ClaudeCLIBackend(command="cat", extra_args=[], permission_mode=None)
+        with tempfile.TemporaryDirectory() as cwd:
+            result = await backend.run(
+                "Draft the email body", "", cwd=cwd, timeout=10
+            )
+
+        self.assertTrue(result.ok)
+        self.assertIn("complete, finished deliverable directly", result.output)
+        self.assertIn("Do not call\nExitPlanMode", result.output)
+        self.assertIn("do not save the deliverable to a plan file", result.output)
+        self.assertIn("captured from stdout", result.output)
+
     async def test_timeout_kills_and_reports(self):
         # `sleep 30` never produces output; the backend must kill it and report a
         # timeout rather than hang.

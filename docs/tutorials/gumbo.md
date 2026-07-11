@@ -81,6 +81,12 @@ behalf. Four independent guardrails enforce this:
     lookup performed after the agent exits; the restored text is never sent back
     to the agent or any other cloud model.
 
+    The read-only backend also explicitly requires the finished deliverable in
+    its final stdout response. Even in Claude's `plan` permission mode, it must
+    not call `ExitPlanMode`, leave the draft in a transient plan file, or return
+    commentary about where the file was written; only stdout survives sandbox
+    cleanup and becomes the artifact shown for review.
+
 ## Turning it on
 
 ```bash

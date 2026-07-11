@@ -59,6 +59,19 @@ DEFAULT_TIMEOUT = 120.0
 # layer rather than trusting the prompt alone. See ClaudeCLIBackend.
 DEFAULT_PERMISSION_MODE = "plan"
 
+# Claude's plan permission mode can otherwise treat the requested artifact as a
+# plan to submit via ExitPlanMode (or save to a transient plan file) and print only
+# wrap-up commentary. The bridge needs the artifact itself on stdout because the
+# per-dispatch workspace is deliberately deleted as soon as the run returns.
+_STDOUT_DELIVERABLE_INSTRUCTION = """
+## Delivery requirement
+
+Return the complete, finished deliverable directly in your final response. Do not call
+ExitPlanMode, do not save the deliverable to a plan file, and do not respond with
+commentary about where it was saved. Your final response is captured from stdout and is
+the only artifact the user can review.
+""".strip()
+
 # Classifications the gate is willing to run automatically. "irreversible" is
 # never in this set by construction — those actions are always proposal-only.
 _AUTO_DISPATCH_REVERSIBILITY = frozenset({"read_only", "reversible"})
@@ -237,7 +250,8 @@ class ClaudeCLIBackend:
         # instruction. `task` already carries the safety framing (see
         # Executor._build_task); nothing here re-derives context, keeping the one
         # grounding path the spec requires.
-        return f"{context}\n\n{task}\n" if context else f"{task}\n"
+        body = f"{context}\n\n{task}" if context else task
+        return f"{body}\n\n{_STDOUT_DELIVERABLE_INSTRUCTION}\n"
 
     def _kill_process_tree(self, proc: asyncio.subprocess.Process) -> None:
         """SIGKILL the agent *and every process it spawned*.
