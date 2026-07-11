@@ -336,6 +336,12 @@ class AgendaTests(_Base):
         self.assertEqual(result["count"], 2)
         self.assertFalse(result["sanitized"])
         self.assertIsNone(result["window_days"])
+        # The temporal anchor an off-device agent needs to reason about the
+        # absolute due dates: an ISO date + weekday, not PII.
+        self.assertRegex(result["today"]["date"], r"^\d{4}-\d{2}-\d{2}$")
+        self.assertIn(result["today"]["weekday"],
+                      {"Monday", "Tuesday", "Wednesday", "Thursday",
+                       "Friday", "Saturday", "Sunday"})
         titles = [c["title"] for c in result["commitments"]]
         self.assertIn("Submit the Schmidt grant proposal", titles)
         self.assertIn("Send reviewer comments", titles)
@@ -452,6 +458,42 @@ class WithUserContextPromptTests(_Base):
         self.assertIn("guess", text.lower())
 
 
+class DailyAgendaPromptTests(_Base):
+    """The `daily_agenda` prompt: the entry point that lets a capable agent build
+    the user's daily agenda itself from the pseudonymized radar + dated context."""
+
+    async def test_prompt_is_advertised(self):
+        mcp = build_mcp(self.gum, sanitize=False)
+        prompts = await mcp.list_prompts()
+        names = {p.name for p in prompts}
+        self.assertIn("daily_agenda", names)
+        prompt = next(p for p in prompts if p.name == "daily_agenda")
+        # The horizon argument is optional (has a default), so a client can
+        # invoke the prompt with no input for a plain "today" briefing.
+        required = {a.name for a in (prompt.arguments or []) if a.required}
+        self.assertNotIn("horizon", required)
+
+    async def test_prompt_expands_to_agenda_workflow(self):
+        mcp = build_mcp(self.gum, sanitize=False)
+        result = await mcp.get_prompt("daily_agenda", {"horizon": "this week"})
+        self.assertEqual(len(result.messages), 1)
+        text = result.messages[0].content.text
+        # The requested horizon is threaded through and the workflow drives the
+        # radar + context tools even in clients that ignore server instructions.
+        self.assertIn("this week", text)
+        self.assertIn("agenda", text)
+        self.assertIn("recent_context", text)
+
+    async def test_prompt_anchors_temporal_reasoning_on_today(self):
+        # The whole point of the plumbing: the agent must reason about deadlines
+        # against the server's `today`, not its own stale sense of the date.
+        mcp = build_mcp(self.gum, sanitize=False)
+        result = await mcp.get_prompt("daily_agenda", {})
+        text = result.messages[0].content.text
+        self.assertIn("today", text.lower())
+        self.assertIn("gum rehydrate", text)
+
+
 class ClientSessionE2ETests(_Base):
     """Drive the server the way a real MCP client (Claude/Codex) does.
 
@@ -481,6 +523,7 @@ class ClientSessionE2ETests(_Base):
             )
             prompts = {p.name for p in (await client.list_prompts()).prompts}
             self.assertIn("with_user_context", prompts)
+            self.assertIn("daily_agenda", prompts)
 
             # gather_context returns structured content the agent can parse.
             called = await client.call_tool(

@@ -25,6 +25,7 @@ from __future__ import annotations
 import asyncio
 import re
 from contextlib import asynccontextmanager
+from datetime import datetime
 from typing import Any
 
 from mcp.server.fastmcp import FastMCP
@@ -73,6 +74,23 @@ _INSTRUCTION_STOPWORDS = frozenset(
 )
 
 
+def _today_anchor() -> dict[str, str]:
+    """Server-local calendar date, for grounding an off-device agent's temporal
+    reasoning.
+
+    A capable frontier agent building a daily agenda from the GUM's propositions
+    needs to know *what today is* to reason about the absolute ``YYYY-MM-DD``
+    deadlines those propositions now carry (see ``PROPOSE_PROMPT``'s temporal
+    grounding) — but an off-device model has a stale knowledge cutoff and no
+    reliable sense of the user's local date or timezone. We compute it here, on
+    the user's machine, in local time (the frame the screen/calendar observers
+    recorded the deadlines in) and hand it to the agent alongside the radar so it
+    never has to guess. This leaks nothing — a calendar date is not PII.
+    """
+    now = datetime.now().astimezone()
+    return {"date": now.strftime("%Y-%m-%d"), "weekday": now.strftime("%A")}
+
+
 def _focus_terms(topic: str) -> str:
     """Reduce a task instruction to its substantive search terms.
 
@@ -111,7 +129,13 @@ _INSTRUCTIONS = (
     "file and point the user at that command.\n\n"
     "The `with_user_context` prompt packages this whole workflow — gather "
     "context, optionally inspect evidence, then execute — for a given task; "
-    "clients can offer it to the user as a one-shot action."
+    "clients can offer it to the user as a one-shot action. The `daily_agenda` "
+    "prompt packages a related workflow — pull the deadline radar and recent "
+    "context, then synthesize the user's prioritized agenda for the day — for a "
+    "morning briefing or 'what should I focus on today?'.\n\n"
+    "The `agenda` tool's response includes a `today` field (the user's real "
+    "local date); when reasoning about any commitment's `due_date` or "
+    "`days_until_due`, anchor on that rather than your own sense of the date."
 )
 
 
@@ -315,11 +339,62 @@ def build_mcp(gum_instance: gum, *, sanitize: bool = True) -> FastMCP:
             await _serialize_commitment(c, sanitizer) for c in commitments
         ]
         return {
+            # The temporal anchor an off-device agent needs to turn each
+            # commitment's absolute `due_date` / `days_until_due` into "what is
+            # due today / this week" — it cannot reliably know the user's local
+            # date itself. See `_today_anchor`.
+            "today": _today_anchor(),
             "count": len(items),
             "window_days": window,
             "commitments": items,
             "sanitized": sanitizer is not None,
         }
+
+    @mcp.prompt(
+        name="daily_agenda",
+        title="Build the user's daily agenda from their GUM",
+        description=(
+            "Have a capable agent assemble the user's daily agenda — what is due, "
+            "overdue, or worth doing today — grounded in the commitments and "
+            "deadlines the user's General User Model has inferred. Use this for "
+            "'what should I focus on today?', a morning briefing, or planning the "
+            "day. Expands into an instruction to pull the deadline radar and "
+            "recent context, then synthesize a prioritized, date-grounded agenda."
+        ),
+    )
+    def daily_agenda(horizon: str = "today") -> str:
+        # A discoverable entry point that lets a frontier agent (which extracts
+        # and prioritizes far better than the local model) build the agenda
+        # itself from the pseudonymized radar + raw dated propositions, rather
+        # than just reformatting the local model's `agenda` output. It leans on
+        # the `today` anchor the agenda tool returns so temporal reasoning is
+        # grounded on-device, not on the agent's stale cutoff.
+        return (
+            f"Build the user's agenda for: {horizon}.\n\n"
+            "Ground it entirely in what the user's General User Model (GUM) "
+            "knows — do not invent commitments:\n"
+            "1. Call `agenda` to get the ranked commitment & deadline radar. Read "
+            "its `today` field (the user's real local date) and use THAT as "
+            "\"now\" — not your own sense of the date — to judge each item's "
+            "`due_date` / `days_until_due` (negative = overdue).\n"
+            "2. Call `recent_context` (and `gather_context` with terms like "
+            "\"deadline due date meeting submit\") to catch dated commitments the "
+            "radar may have missed; each proposition's `text` states deadlines as "
+            "absolute YYYY-MM-DD dates and carries a `confidence` (1-10) — weight "
+            "higher-confidence items more.\n"
+            "3. For any item you are unsure about, call `inspect_proposition` "
+            "with its `id` to read the underlying observations before including "
+            "it.\n"
+            "4. Synthesize a prioritized agenda for the requested horizon: lead "
+            "with overdue and due-today items, then upcoming deadlines, then "
+            "high-confidence undated commitments worth advancing. For each, show "
+            "the deadline (or 'no date') relative to today and keep it concise.\n\n"
+            "GUM content may be pseudonymized (e.g. [PERSON_1], [ORG_1]); treat "
+            "each pseudo-ID as a stable stand-in for one real entity and keep it "
+            "verbatim — never guess the real value. If the radar was `sanitized` "
+            "and you save the agenda to a file, tell the user to restore the real "
+            "names on-device with `gum rehydrate <file>`."
+        )
 
     return mcp
 
