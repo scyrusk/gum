@@ -33,7 +33,10 @@ behalf. Four independent guardrails enforce this:
    action is read-only/reversible, and its risk is low (`GUM_EXECUTOR_MAX_RISK`,
    default 3). The classifier is biased toward the *less-safe* reading under
    uncertainty, so an ambiguous action stays proposal-only. Anything that misses
-   the gate is held for review and no agent runs.
+   the gate is held for review and no agent runs. If the classifier itself cannot
+   complete (a failed or malformed local-model call), that suggestion fails *closed*
+   to proposal-only rather than dispatching — and one un-assessable suggestion never
+   aborts the rest of an `execute()` batch.
 3. **A sandboxed agent.** The dispatched agent (the shipped backend shells out to
    the local `claude` CLI) runs in a **restricted scratch workspace** under the
    GUM data directory — never your real project tree. Each dispatch gets its own

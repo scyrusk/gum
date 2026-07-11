@@ -421,6 +421,28 @@ class DispatchFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(outcome.is_pending_approval)
         self.assertIn("timed out", outcome.reason)
 
+    async def test_assessment_failure_fails_closed_without_dispatching(self):
+        # A flaky/failed safety classifier (model error, malformed response) must
+        # NOT dispatch and must NOT propagate: an un-assessable action is exactly
+        # what the gate exists to hold, and one bad assessment must not abort a
+        # whole execute() batch. It fails closed to proposal-only for this one.
+        backend = _RecordingBackend(AgentResult(ok=True, output="should not run"))
+        ex = Executor(self.gum, backend=backend, sanitize=False)
+        sug = _suggestion(probability_useful=10)
+
+        async def boom(*args, **kwargs):
+            raise RuntimeError("local model unavailable")
+
+        with mock.patch("gum.executor.structured_completion", side_effect=boom):
+            outcome = await ex.dispatch(sug)
+
+        self.assertEqual(outcome.status, STATUS_PROPOSAL_ONLY)
+        self.assertFalse(outcome.dispatched)
+        self.assertIsNone(outcome.assessment)  # never obtained
+        self.assertIsNone(outcome.result)
+        self.assertIn("assessment failed", outcome.reason)
+        self.assertEqual(backend.calls, [])  # the agent was never invoked
+
     async def test_missing_backend_stays_proposal_only(self):
         ex = Executor(self.gum, sanitize=False)  # no backend configured
         sug = _suggestion(probability_useful=9)

@@ -469,7 +469,24 @@ class Executor:
         errored or timed out). This method never commits an irreversible effect —
         it only ever produces a reviewable artifact.
         """
-        assessment = await self.assess_risk(suggestion)
+        try:
+            assessment = await self.assess_risk(suggestion)
+        except Exception as exc:  # fail closed on ANY assessment error
+            # If the safety classifier itself can't complete (a flaky/failed local
+            # model call, a malformed structured response), we must NOT dispatch:
+            # an un-assessable action is exactly the case the gate exists to hold.
+            # Fail closed to proposal-only for THIS suggestion rather than raising,
+            # so one bad assessment can't abort a whole execute() batch of others.
+            self.logger.warning(
+                "executor: risk assessment failed for suggestion %r; holding "
+                "proposal-only (%s)", suggestion.title, exc,
+            )
+            return ExecutionOutcome(
+                suggestion=suggestion,
+                status=STATUS_PROPOSAL_ONLY,
+                assessment=None,
+                reason=f"held for review: risk assessment failed ({exc})",
+            )
         if not self.is_auto_dispatchable(suggestion, assessment):
             return ExecutionOutcome(
                 suggestion=suggestion,
