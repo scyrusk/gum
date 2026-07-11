@@ -194,6 +194,8 @@ class RiskAssessmentSchema(BaseModel):
     )
     risk: int = Field(
         ...,
+        ge=1,
+        le=10,
         description=(
             "How much harm a wrong or unwanted action could cause the user, from 1 "
             "(trivial, easily ignored) to 10 (severe, hard to recover from)."

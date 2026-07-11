@@ -72,6 +72,37 @@ class RiskAssessmentDataclassTests(unittest.TestCase):
         self.assertFalse(RiskAssessment("irreversible", 2, "r").is_reversible)
 
 
+class RiskAssessmentSchemaBoundsTests(unittest.TestCase):
+    """The risk score is contractually 1–10; the schema must enforce that.
+
+    Without the bound, a local model that emits a sub-range score (e.g. 0) would
+    validate and sail through the gate's ``risk > max_risk`` check on a malformed
+    assessment. With the bound, an out-of-range score is rejected by
+    ``model_validate_json`` — which drives ``structured_completion`` to retry and,
+    if it never lands in range, ultimately fail closed to proposal-only.
+    """
+
+    def test_in_range_scores_are_accepted(self):
+        for score in (1, 3, 10):
+            RiskAssessmentSchema(reversibility="reversible", risk=score, rationale="r")
+
+    def test_out_of_range_scores_are_rejected(self):
+        from pydantic import ValidationError
+
+        for score in (0, -1, 11, 99):
+            with self.assertRaises(ValidationError):
+                RiskAssessmentSchema(
+                    reversibility="reversible", risk=score, rationale="r"
+                )
+
+    def test_json_schema_carries_the_bounds_for_the_model(self):
+        # The 1–10 range is advertised in the JSON schema handed to the local
+        # model, so constrained/structured decoding is guided toward valid scores.
+        risk = RiskAssessmentSchema.model_json_schema()["properties"]["risk"]
+        self.assertEqual(risk["minimum"], 1)
+        self.assertEqual(risk["maximum"], 10)
+
+
 class ExecutorGateTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self._tmp = tempfile.TemporaryDirectory()
