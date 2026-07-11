@@ -98,6 +98,24 @@ class ReviewOutcomesTests(unittest.IsolatedAsyncioTestCase):
         # The suggestion description rides along so the feedback observation is rich.
         self.assertEqual(gum.feedback[0]["description"], "do the thing")
 
+    async def test_approve_never_stores_rehydrated_draft_in_feedback(self):
+        gum = FakeGum()
+        private_draft = "Email DARPA/RESCOLUM2024 with the completed update."
+
+        recorded, out, _p = await _run(
+            gum,
+            [_pending("Draft an email", output=private_draft)],
+            ["approve"],
+        )
+
+        self.assertEqual(recorded, [{"title": "Draft an email", "vote": "up"}])
+        # The locally rehydrated artifact is visible in the review surface ...
+        self.assertIn(private_draft, "\n".join(out))
+        # ... but the feedback observation contains only the original suggestion
+        # metadata and vote, never the returned draft that may now contain real PII.
+        self.assertNotIn(private_draft, repr(gum.feedback))
+        self.assertNotIn("DARPA/RESCOLUM2024", repr(gum.feedback))
+
     async def test_reject_records_thumbs_down(self):
         gum = FakeGum()
         recorded, _out, _p = await _run(gum, [_pending("Risky thing")], ["reject"])
