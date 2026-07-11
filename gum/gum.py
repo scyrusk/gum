@@ -442,6 +442,7 @@ class gum:
         """
         prompt = (
             self.propose_prompt.replace("{user_name}", self.user_name)
+            .replace("{today}", self._today_str())
             .replace("{feedback_examples}", await self._build_feedback_examples(update.content))
             .replace("{inputs}", update.content)
         )
@@ -462,6 +463,18 @@ class gum:
             logger=self.logger,
         )
         return await self._enforce_blacklist(result.propositions)
+
+    @staticmethod
+    def _today_str() -> str:
+        """Local calendar date, e.g. '2026-07-11 (Saturday)'.
+
+        Anchors the propose/revise prompts so the model can turn relative
+        deadline wording in the transcript ("next Friday", "by end of week")
+        into an absolute date the downstream deadline radar (gum.agenda) can
+        rank. Uses local time — the transcript's temporal references are the
+        user's local frame, matching the calendar/screen observers.
+        """
+        return datetime.now().astimezone().strftime("%Y-%m-%d (%A)")
 
     @staticmethod
     def _proposition_messages(prompt: str, blacklist_prompt: str) -> list[dict[str, str]]:
@@ -734,7 +747,9 @@ rule. Do not rewrite candidates and do not include their text in your response.
             list[dict]: List of revised propositions.
         """
         body = await self._build_revision_body(similar_cluster, related_obs)
-        prompt = self.revise_prompt.replace("{body}", body)
+        prompt = self.revise_prompt.replace("{today}", self._today_str()).replace(
+            "{body}", body
+        )
         try:
             blacklist_prompt = self._blacklist_prompt()
         except BlacklistReadError:

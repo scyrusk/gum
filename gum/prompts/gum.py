@@ -39,11 +39,12 @@ PROPOSE_PROMPT = """You are a helpful assistant tasked with analyzing user behav
 
 Using a transcription of {user_name}'s activity, analyze {user_name}'s current activities, behavior, and preferences. Draw insightful, concrete conclusions.
 
-To support effective information retrieval (e.g., using BM25), your analysis must **explicitly identify and refer to specific named entities** mentioned in the transcript. This includes applications, websites, documents, people, organizations, tools, and any other proper nouns. Avoid general summaries—**use exact names** wherever possible, even if only briefly referenced.
+To support effective information retrieval (e.g., using BM25), your analysis must **explicitly identify and refer to specific named entities** mentioned in the transcript. This includes applications, websites, documents, people, organizations, tools, and any other proper nouns. It **also includes dates, times, and deadlines** — e.g. "July 20, 2026", "3pm on Friday", "due next week", "by end of day" — which are named entities you must never drop. Avoid general summaries—**use exact names** wherever possible, even if only briefly referenced.
 
 Consider these points in your analysis:
 
 - What specific tasks or goals is {user_name} actively working towards, as evidenced by named files, apps, platforms, or individuals?
+- **Does {user_name} face any deadline, scheduled event, or time-bound commitment** — a due date, a meeting or appointment, a submission, a bill, a reply or review they owe by a certain time? Identify *what* is due and its *exact date/time*.
 - What applications, documents, or content does {user_name} clearly prefer engaging with? Identify them by name.
 - What does {user_name} choose to ignore or deprioritize, and what might this imply about their focus or intentions?
 - What are the strengths or weaknesses in {user_name}’s behavior or tools? Cite relevant named entities or resources.
@@ -73,8 +74,12 @@ Rate how long the proposition is likely to stay relevant. Consider:
 
 Score: **1 (short-lived)** to **10 (long-lasting insight or pattern)**.
 
+A proposition tied to a concrete upcoming deadline or event is time-sensitive: give it a **low decay** (it stops mattering once the date passes), and make sure its date is stated explicitly (see the temporal-grounding rule below) so a downstream deadline radar can rank it while it is still relevant.
+
 {feedback_examples}
 # Input
+
+Today's date is {today}.
 
 Below is a set of transcribed actions and interactions that {user_name} has performed:
 
@@ -84,7 +89,9 @@ Below is a set of transcribed actions and interactions that {user_name} has perf
 
 # Task
 
-Generate **at least 5 distinct, well-supported propositions** about {user_name}, each grounded in the transcript. 
+Generate **at least 5 distinct, well-supported propositions** about {user_name}, each grounded in the transcript.
+
+**Temporal grounding.** Whenever a proposition concerns something time-bound — a deadline, a meeting, an appointment, a submission, a bill, or a promised reply/review — **state the specific date (and time, if known) explicitly inside the proposition text**. Resolve relative references ("tomorrow", "next Friday", "by end of week", "in two days", "this afternoon") against today's date ({today}) into an absolute calendar date in `YYYY-MM-DD` form, so the deadline stays meaningful even after today passes. If the transcript mentions a date, never drop it. If no date is present, do not invent one.
 
 Be conservative in your confidence estimates. Just because an application appears on {user_name}'s screen does not mean they have deeply engaged with it. They may have only glanced at it for a second, making it difficult to draw strong conclusions. 
 
@@ -110,7 +117,7 @@ REVISE_PROMPT = """You are an expert analyst. A cluster of similar propositions 
 
 Your job is to produce a **final set** of propositions that is clear, non-redundant, and captures everything about the user, {user_name}.
 
-To support information retrieval (e.g., with BM25), you must **explicitly identify and preserve all named entities** from the input wherever possible. These may include applications, websites, documents, people, organizations, tools, or any other specific proper nouns mentioned in the original propositions or their evidence.
+To support information retrieval (e.g., with BM25), you must **explicitly identify and preserve all named entities** from the input wherever possible. These may include applications, websites, documents, people, organizations, tools, or any other specific proper nouns mentioned in the original propositions or their evidence. This **includes any dates, times, and deadlines** ("July 20, 2026", "3pm Friday", a `YYYY-MM-DD` due date): carry them through edits, merges, and splits verbatim — never drop or blur a deadline. Today's date is {today}; if a proposition still carries a relative reference ("next Friday"), resolve it to an absolute `YYYY-MM-DD` date.
 
 You MAY:
 
