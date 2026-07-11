@@ -97,6 +97,24 @@ class DedupeKeyTests(unittest.TestCase):
         self.assertEqual(_dedupe_key("  —  !! "), "")
 
 
+class PromptGuidanceTests(unittest.TestCase):
+    """The extraction prompt is the sole precision lever for the local model, so
+    guard that its hard-won exclusion guidance stays in place. A negated/hedged
+    proposition ("is likely not involved in X") must not be inverted into a
+    positive commitment, while a deliverable-negation ("has not yet submitted X")
+    must still count — the distinction the model has to make."""
+
+    def test_prompt_excludes_negated_but_keeps_not_yet_done(self):
+        from gum.prompts.gum import AGENDA_PROMPT
+
+        lowered = AGENDA_PROMPT.lower()
+        self.assertIn("negated", lowered)
+        self.assertIn("unlikely to", lowered)
+        self.assertIn("no longer", lowered)
+        # The counter-example that keeps genuine open commitments in scope.
+        self.assertIn("has not yet submitted", lowered)
+
+
 def _prop(text: str, confidence: int, *, decay: int = 5, created_at=None) -> object:
     from gum.models import Proposition
 

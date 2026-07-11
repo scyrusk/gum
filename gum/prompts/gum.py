@@ -234,6 +234,7 @@ Identify only the propositions that imply an **open, not-yet-completed commitmen
 
 Do NOT include propositions that are:
 - ongoing activities, roles, habits, tools, preferences, or interests with no discrete deliverable — e.g. "maintains a professional presence on LinkedIn", "works with pandas", "researches privacy mechanisms", "collaborates on a project". These describe what {user_name} does, not something owed or due;
+- **negated, hedged, or hypothetical** — the proposition says {user_name} is NOT doing, is *unlikely to*, *no longer*, or is *probably not* involved in something. Do not invert these into a positive commitment. E.g. "is likely not actively involved in organizing dance classes" or "no longer maintains the old repo" imply NO commitment — {user_name} owes nothing. (This is different from "has not yet submitted the grant", which *is* an open commitment: something still to be done.);
 - already completed, or in the past with nothing left to do;
 - vague observations that do not commit {user_name} to anything.
 
