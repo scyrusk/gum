@@ -48,7 +48,10 @@ behalf. Four independent guardrails enforce this:
    "produce a draft, never act" contract is enforced by the CLI, not merely
    requested in the prompt (which also instructs the agent to draft, not act).
 4. **Human-in-the-loop approval.** Every result lands in a *pending-approval*
-   state. Nothing the agent produced is used until you approve it.
+   state. Nothing the agent produced is used until you approve it. A dispatch that
+   errors or times out — including a misbehaving backend that raises mid-run rather
+   than reporting the failure — lands in a *failed* state (nothing to approve)
+   instead of aborting the rest of an `execute()` batch.
 
 !!! note "Grounding is pseudonymized and fail-closed"
     The agent is grounded on the **same** context assembly the `gum mcp` server

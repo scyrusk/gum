@@ -453,6 +453,35 @@ class DispatchFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(outcome.is_pending_approval)
         self.assertIn("timed out", outcome.reason)
 
+    async def test_backend_that_raises_lands_failed_not_propagating(self):
+        # The AgentBackend contract is to *return* ok=False on failure, but an
+        # injected/alternative backend (or an unanticipated exception path in the
+        # shipped one) could raise instead. A raise must be recorded as a FAILED
+        # dispatch — the agent was invoked — and must NOT propagate: one misbehaving
+        # dispatch must not abort a whole execute() batch, and the per-run sandbox
+        # must still be cleaned up.
+        class _RaisingBackend:
+            def __init__(self):
+                self.cwd = None
+
+            async def run(self, task, context, *, cwd, timeout):
+                self.cwd = cwd
+                raise RuntimeError("backend blew up mid-run")
+
+        backend = _RaisingBackend()
+        ex = Executor(self.gum, backend=backend, sanitize=False)
+        sug = _suggestion(probability_useful=9)
+        with self._patch_assessment("reversible", 2):
+            outcome = await ex.dispatch(sug)
+
+        self.assertEqual(outcome.status, STATUS_FAILED)
+        self.assertFalse(outcome.is_pending_approval)
+        self.assertIsNotNone(outcome.assessment)  # the gate ran and cleared
+        self.assertIn("backend blew up mid-run", outcome.reason)
+        # The sandbox the backend was handed is torn down even though it raised.
+        self.assertFalse(os.path.exists(backend.cwd))
+        self.assertEqual(os.listdir(ex._ensure_workspace_root()), [])
+
     async def test_assessment_failure_fails_closed_without_dispatching(self):
         # A flaky/failed safety classifier (model error, malformed response) must
         # NOT dispatch and must NOT propagate: an un-assessable action is exactly

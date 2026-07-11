@@ -561,9 +561,27 @@ class Executor:
             suggestion.title, cwd, self.timeout,
         )
         try:
-            # The backend already received the grounding folded into `task`; passing
-            # an empty context here avoids duplicating it into the prompt twice.
-            result = await self.backend.run(task, "", cwd=cwd, timeout=self.timeout)
+            try:
+                # The backend already received the grounding folded into `task`;
+                # passing an empty context here avoids duplicating it into the
+                # prompt twice.
+                result = await self.backend.run(task, "", cwd=cwd, timeout=self.timeout)
+            except Exception as exc:  # a backend that raises instead of failing closed
+                # The AgentBackend contract is to *return* AgentResult(ok=False) on
+                # failure, and the shipped ClaudeCLIBackend honours it (catching
+                # missing-binary/OS/timeout). But an injected or alternative backend
+                # — or an unanticipated exception path — could still raise. Convert
+                # that into a failed run rather than propagating: the agent WAS
+                # dispatched, so this is STATUS_FAILED (nothing to approve), and one
+                # misbehaving dispatch must not abort a whole execute() batch. cwd is
+                # still torn down by the surrounding finally.
+                self.logger.warning(
+                    "executor: agent backend raised while dispatching suggestion %r; "
+                    "recording as failed (%s)", suggestion.title, exc,
+                )
+                result = AgentResult(
+                    ok=False, output="", error=f"agent backend error: {exc}"
+                )
         finally:
             shutil.rmtree(cwd, ignore_errors=True)
         status = STATUS_PENDING_APPROVAL if result.ok else STATUS_FAILED
