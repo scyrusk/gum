@@ -21,6 +21,7 @@ import asyncio
 import logging
 import os
 import shlex
+import signal
 from dataclasses import asdict, dataclass
 from typing import Any, Protocol, runtime_checkable
 
@@ -163,8 +164,10 @@ class ClaudeCLIBackend:
     Runs the agent non-interactively (``claude -p``) confined to a restricted
     working directory, with the GUM-grounded task fed on **stdin** (so no prompt
     text ever touches a shell command line) and a hard wall-clock timeout that
-    kills the process group on overrun. The CLI's stdout is captured verbatim as
-    the reviewable draft; the backend commits nothing itself.
+    kills the whole process tree on overrun (the CLI is launched as its own
+    session leader, so its bash-tool/MCP-server children die with it rather than
+    orphaning past the timeout). The CLI's stdout is captured verbatim as the
+    reviewable draft; the backend commits nothing itself.
 
     Sandboxing here is defence-in-depth on top of the executor's risk gate: the
     agent only ever sees a *restricted* ``cwd`` (the executor hands it a scratch
@@ -198,6 +201,27 @@ class ClaudeCLIBackend:
         # grounding path the spec requires.
         return f"{context}\n\n{task}\n" if context else f"{task}\n"
 
+    def _kill_process_tree(self, proc: asyncio.subprocess.Process) -> None:
+        """SIGKILL the agent *and every process it spawned*.
+
+        The ``claude`` CLI spawns children of its own (bash-tool commands, MCP
+        servers); a plain ``proc.kill()`` reaches only the direct child and would
+        orphan those grandchildren past the timeout, defeating the sandbox's
+        wall-clock guarantee. Because the process was launched into its own session
+        (``start_new_session=True``) it leads a process group whose id equals its
+        pid, so one ``killpg`` tears the whole tree down. Falls back to a direct
+        kill where process groups are unavailable (e.g. Windows).
+        """
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        except ProcessLookupError:
+            pass  # already gone
+        except (AttributeError, OSError):  # pragma: no cover - platform-dependent
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+
     async def run(
         self, task: str, context: str, *, cwd: str, timeout: float
     ) -> AgentResult:
@@ -210,6 +234,10 @@ class ClaudeCLIBackend:
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
+                # Run the agent as its own session/process-group leader so a timeout
+                # can tear down the whole tree (see _kill_process_tree), not just the
+                # CLI's direct child.
+                start_new_session=True,
             )
         except FileNotFoundError:
             return AgentResult(
@@ -225,7 +253,7 @@ class ClaudeCLIBackend:
                 proc.communicate(prompt.encode()), timeout=timeout
             )
         except asyncio.TimeoutError:
-            proc.kill()
+            self._kill_process_tree(proc)
             await proc.wait()
             return AgentResult(
                 ok=False, output="", error=f"agent timed out after {timeout:g}s"

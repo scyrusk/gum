@@ -12,7 +12,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
+import shlex
+import signal
 import tempfile
 import unittest
 import uuid
@@ -424,6 +427,47 @@ class ClaudeCLIBackendTests(unittest.IsolatedAsyncioTestCase):
             result = await backend.run("x", "", cwd=cwd, timeout=0.5)
         self.assertFalse(result.ok)
         self.assertIn("timed out", result.error)
+
+    @unittest.skipUnless(hasattr(os, "killpg"), "requires POSIX process groups")
+    async def test_timeout_kills_the_whole_process_tree(self):
+        # The real `claude` CLI spawns its own children (bash-tool commands, MCP
+        # servers). A plain kill of the direct child would orphan those past the
+        # timeout; the backend must tear down the whole process group. Stand in a
+        # shell that forks a long-lived grandchild and records its pid, then assert
+        # the grandchild is dead once the run times out.
+        #
+        # The grandchild redirects its own stdout/stderr away from the inherited
+        # pipe so it does NOT keep the backend's `communicate()` open — that makes
+        # the buggy (direct-kill-only) path fail *fast* here (the grandchild is
+        # still alive when we check) instead of hanging until it exits on its own.
+        child_pid = None
+        try:
+            with tempfile.TemporaryDirectory() as cwd:
+                pidfile = os.path.join(cwd, "child.pid")
+                script = (
+                    f"sleep 30 >/dev/null 2>&1 & "
+                    f"echo $! > {shlex.quote(pidfile)}; wait"
+                )
+                backend = ClaudeCLIBackend(command="sh", extra_args=["-c", script])
+                result = await backend.run("x", "", cwd=cwd, timeout=0.5)
+                self.assertFalse(result.ok)
+                self.assertIn("timed out", result.error)
+                with open(pidfile) as fh:
+                    child_pid = int(fh.read().strip())
+            # Give the OS a moment to reap the SIGKILLed grandchild, then confirm it
+            # is gone: os.kill(pid, 0) raises ProcessLookupError for a dead process.
+            await asyncio.sleep(0.2)
+            with self.assertRaises(ProcessLookupError):
+                os.kill(child_pid, 0)
+            child_pid = None  # confirmed dead; nothing to clean up
+        finally:
+            # If the backend failed to tear the tree down (the bug), don't leave a
+            # real orphan `sleep` lingering for 30s after the test.
+            if child_pid is not None:
+                try:
+                    os.kill(child_pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
 
     async def test_nonzero_exit_is_a_failure(self):
         # `false` exits 1 with no output.
