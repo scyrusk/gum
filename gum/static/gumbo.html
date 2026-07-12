@@ -870,9 +870,14 @@
       // the user can reverse a mis-click before it scrolls away). The undo URL is
       // carried on the button so it works for both endpoint families.
       const title = item.dataset.title || 'Item';
+      // Proposition-backed undo carries the displayed title so it can resolve a
+      // re-bound override that survived a churn as an orphan; added items don't.
+      const undoUrl = item.dataset.itemId
+        ? base + '/undo'
+        : base + '/undo?dedupe_title=' + encodeURIComponent(item.dataset.title || '');
       item.classList.remove('overdue');
       item.innerHTML = `<div class="ag-undo"><span>Dismissed “${esc(title)}”.</span>
-        <button class="ag-btn ag-undo-btn" data-endpoint="${escAttr(base + '/undo')}">Undo</button></div>`;
+        <button class="ag-btn ag-undo-btn" data-endpoint="${escAttr(undoUrl)}">Undo</button></div>`;
     } catch (e) {
       if (btn) { btn.disabled = false; btn.textContent = "Couldn't — retry"; }
     }

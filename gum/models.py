@@ -238,6 +238,14 @@ class AgendaOverride(Base):
     re-bound row would be pointless if it had been deleted first; surviving as an
     orphan is what makes the title fallback able to fire at all.
 
+    A re-bound override surfaces in the UI under the replacement proposition's
+    id, so the next edit/dismiss/undo arrives keyed by that new id. The override
+    mutators (:meth:`gum.gum.gum._get_or_make_override` /
+    :meth:`clear_agenda_override`) therefore fall back to ``dedupe_key`` when the
+    id lookup misses and **re-anchor** the surviving orphan to the new id — so an
+    orphan is reaped onto its replacement on first mutation rather than leaking a
+    duplicate row or a dismissal that can't be undone.
+
     Tradeoff: a user "Forget" also leaves an orphan (``proposition_id`` NULL)
     that matches nothing unless a future commitment's title happens to collide —
     accepted as a small, rare cost. SQLite treats NULLs as distinct under the

@@ -437,10 +437,16 @@ def create_app(gum_instance: gum, *, sanitize: bool = False) -> FastAPI:
         return {"ok": ok}
 
     @app.post("/agenda/{proposition_id}/undo")
-    async def agenda_undo(proposition_id: int) -> dict[str, Any]:
+    async def agenda_undo(
+        proposition_id: int, dedupe_title: str | None = None
+    ) -> dict[str, Any]:
         # Revert a persisted edit/dismissal so the item shows the model's raw
         # output again. Cannot retract an already-pushed correction observation.
-        ok = await gum_instance.clear_agenda_override(proposition_id)
+        # dedupe_title lets undo resolve a re-bound override that survived a
+        # proposition churn as an orphan (proposition_id IS NULL).
+        ok = await gum_instance.clear_agenda_override(
+            proposition_id, dedupe_title=dedupe_title
+        )
         return {"ok": ok}
 
     # ── explicitly-added agenda items (assistant/user) ────────────────────────
