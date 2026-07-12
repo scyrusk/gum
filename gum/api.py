@@ -49,6 +49,16 @@ class PropositionEditIn(BaseModel):
     confidence: int | None = None
 
 
+class AgendaEditIn(BaseModel):
+    # A user's edit to a generated agenda item (GUMBO Agenda page). All fields
+    # optional: only the ones set are applied. `clear_due_date` explicitly marks
+    # the item as having no fixed date (distinct from "date not overridden").
+    title: str | None = None
+    due_date: str | None = None  # ISO YYYY-MM-DD
+    status: str | None = None
+    clear_due_date: bool = False
+
+
 class ChatMessage(BaseModel):
     role: str  # "user" | "assistant"
     content: str
@@ -135,6 +145,13 @@ async def _serialize_commitment(commitment, sanitizer) -> dict[str, Any]:
     for field in ("title", "source"):
         data[field] = await _scrub_fragment(data[field], sanitizer)
     data["proposition_text"] = await _scrub(data["proposition_text"], sanitizer)
+    # The GUMBO Agenda page can edit items with known provenance: a
+    # proposition-backed commitment (via its override key) or an explicitly-added
+    # item (via its item_id). An item the model couldn't attribute to either has
+    # no handle and is read-only.
+    data["editable"] = (
+        commitment.proposition_id is not None or commitment.item_id is not None
+    )
     return data
 
 
@@ -335,18 +352,115 @@ def create_app(gum_instance: gum, *, sanitize: bool = False) -> FastAPI:
         # local app. Like /suggestions it runs the local text model to extract
         # commitments from the user's propositions, then pseudonymizes the
         # model-written text fields when the server is sanitized.
-        from .agenda import build_agenda
-        commitments = await build_agenda(
-            gum_instance, limit=limit, window_days=window_days
+        from datetime import datetime
+
+        from .agenda import (
+            agenda_item_to_commitment,
+            apply_overrides,
+            build_agenda,
+            _sort_key_commitment,
+            _today_anchor,
         )
+
+        # Anchor day math on the user's LOCAL "now" — the same frame as the
+        # `today` field below and the deadlines the observers recorded — so a
+        # commitment's `days_until_due` ("Due today"/"tomorrow") agrees with the
+        # calendar day the UI buckets it under. (Using UTC here would drift a day
+        # for evening/negative-offset timezones.)
+        now = datetime.now().astimezone()
+        # Build the full radar first (limit=None) so the user's overrides can
+        # reorder/reinstate items before the final `limit` is applied; overrides
+        # are overlaid on top so an edit shows even before re-inference catches up.
+        commitments = await build_agenda(
+            gum_instance, limit=None, window_days=window_days, now=now
+        )
+        overrides = await gum_instance.list_agenda_overrides()
+        commitments = apply_overrides(commitments, overrides, now=now)
+        # Fold in explicitly-added items (assistant/user), then rank the whole set
+        # together so a pinned item lands where its urgency puts it.
+        items = await gum_instance.list_agenda_items()
+        commitments += [agenda_item_to_commitment(it, now) for it in items]
+        commitments.sort(key=_sort_key_commitment)
+        commitments = commitments[:limit]
         return {
             "count": len(commitments),
             "window_days": window_days,
+            "today": _today_anchor(),
             "commitments": [
                 await _serialize_commitment(c, sanitizer) for c in commitments
             ],
             "sanitized": sanitizer is not None,
         }
+
+    @app.patch("/agenda/{proposition_id}")
+    async def agenda_edit(
+        proposition_id: int, body: AgendaEditIn
+    ) -> dict[str, Any]:
+        # Correct a generated agenda item (GUMBO Agenda page). The edit persists as
+        # an override and propagates back into the GUM (proposition rewrite when
+        # the date maps cleanly + a correction observation). A malformed due date
+        # is rejected rather than silently dropped.
+        from .agenda import _parse_due
+
+        due = body.due_date.strip() if body.due_date else None
+        if due and _parse_due(due) is None:
+            return {"ok": False, "error": "due_date must be YYYY-MM-DD"}
+        ok = await gum_instance.apply_agenda_override(
+            proposition_id,
+            title=body.title,
+            due_date=due,
+            status=body.status,
+            clear_due_date=body.clear_due_date,
+        )
+        if not ok:
+            return {"ok": False, "error": "not found"}
+        return {"ok": True}
+
+    @app.post("/agenda/{proposition_id}/dismiss")
+    async def agenda_dismiss(proposition_id: int) -> dict[str, Any]:
+        # Remove an item from the radar. Deliberately not a DELETE on the
+        # proposition — dismissing "this isn't a commitment" must not erase a fact
+        # that may still be true (see gum.dismiss_agenda_item).
+        ok = await gum_instance.dismiss_agenda_item(proposition_id)
+        return {"ok": ok}
+
+    @app.post("/agenda/{proposition_id}/undo")
+    async def agenda_undo(proposition_id: int) -> dict[str, Any]:
+        # Revert a persisted edit/dismissal so the item shows the model's raw
+        # output again. Cannot retract an already-pushed correction observation.
+        ok = await gum_instance.clear_agenda_override(proposition_id)
+        return {"ok": ok}
+
+    # ── explicitly-added agenda items (assistant/user) ────────────────────────
+    # Separate id space from proposition-backed commitments: these edit the
+    # AgendaItem row directly (no proposition, no correction observation).
+    @app.patch("/agenda/item/{item_id}")
+    async def agenda_item_edit(
+        item_id: int, body: AgendaEditIn
+    ) -> dict[str, Any]:
+        from .agenda import _parse_due
+
+        due = body.due_date.strip() if body.due_date else None
+        if due and _parse_due(due) is None:
+            return {"ok": False, "error": "due_date must be YYYY-MM-DD"}
+        ok = await gum_instance.update_agenda_item(
+            item_id,
+            title=body.title,
+            due_date=due,
+            status=body.status,
+            clear_due_date=body.clear_due_date,
+        )
+        return {"ok": ok, **({} if ok else {"error": "not found"})}
+
+    @app.post("/agenda/item/{item_id}/dismiss")
+    async def agenda_item_dismiss(item_id: int) -> dict[str, Any]:
+        ok = await gum_instance.set_agenda_item_dismissed(item_id, True)
+        return {"ok": ok}
+
+    @app.post("/agenda/item/{item_id}/undo")
+    async def agenda_item_undo(item_id: int) -> dict[str, Any]:
+        ok = await gum_instance.set_agenda_item_dismissed(item_id, False)
+        return {"ok": ok}
 
     # ── GUMBO assistant desktop UI ────────────────────────────────────────
     @app.get("/gumbo", response_class=HTMLResponse)

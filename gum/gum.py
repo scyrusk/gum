@@ -40,7 +40,7 @@ from .llm import (
     resolve_keep_warm_interval,
     resolve_text_idle_unload,
 )
-from .models import Observation, Proposition, init_db
+from .models import AgendaItem, AgendaOverride, Observation, Proposition, init_db
 from .observers import Observer
 from .schemas import (
     PropositionItem,
@@ -1243,3 +1243,315 @@ rule. Do not rewrite candidates and do not include their text in your response.
             content_type="input_text",
         )
         return True
+
+    # ── agenda edits (GUMBO Agenda page) ──────────────────────────────────────
+    #
+    # The agenda is re-extracted by the local model on every request, so a user's
+    # correction has nowhere to live on the agenda itself. These methods implement
+    # the *hybrid* propagation the Agenda page needs: (1) persist the edit in the
+    # `agenda_overrides` table so it shows immediately and survives regeneration
+    # (overlaid by gum.agenda.apply_overrides), and (2) propagate it back into the
+    # model — a direct proposition rewrite when the due date maps cleanly, plus a
+    # natural-language correction observation pushed through the same batching
+    # pipeline as GUMBO feedback (see add_suggestion_feedback) so the SIMILAR→
+    # revise re-inference path can eventually revise the underlying proposition.
+
+    async def _get_or_make_override(
+        self, session: AsyncSession, proposition_id: int
+    ) -> AgendaOverride:
+        """Fetch the override row for a proposition, creating it if absent."""
+        ov = (
+            await session.execute(
+                select(AgendaOverride).where(
+                    AgendaOverride.proposition_id == proposition_id
+                )
+            )
+        ).scalar_one_or_none()
+        if ov is None:
+            ov = AgendaOverride(proposition_id=proposition_id)
+            session.add(ov)
+        return ov
+
+    async def apply_agenda_override(
+        self,
+        proposition_id: int,
+        *,
+        title: str | None = None,
+        due_date: str | None = None,
+        status: str | None = None,
+        clear_due_date: bool = False,
+    ) -> bool:
+        """Persist a user's edit to a generated agenda item and propagate it.
+
+        Hybrid write (see the section comment): upserts the ``AgendaOverride`` row
+        (so the edit is visible on the next ``/agenda`` load), directly rewrites
+        the proposition text when the corrected due date maps cleanly onto the one
+        absolute date it carries (:func:`gum.agenda.rewrite_due_date`), and pushes
+        a correction observation that echoes the raw proposition text so the
+        relation model is likely to cluster it with — and thus revise — the source
+        proposition. Only fields the caller passes are changed. Returns False if
+        the proposition no longer exists.
+        """
+        from .agenda import _dedupe_key, _extract_dates, rewrite_due_date
+
+        title = title.strip() if title else None
+        status = status.strip() if status else None
+        due_date = due_date.strip() if due_date else None
+
+        old_date: str | None = None
+        old_text: str = ""
+        async with self._session() as session:
+            prop = await session.get(Proposition, proposition_id)
+            if prop is None:
+                return False
+            old_text = prop.text
+
+            ov = await self._get_or_make_override(session, proposition_id)
+            if title is not None:
+                ov.title = title
+            if status is not None:
+                ov.status = status
+            if clear_due_date:
+                ov.due_date = None
+                ov.due_date_cleared = True
+            elif due_date is not None:
+                ov.due_date = due_date
+                ov.due_date_cleared = False
+            # Snapshot a normalized-title key so the override can re-bind if
+            # re-inference later replaces the proposition with a new id.
+            ov.dedupe_key = _dedupe_key(title or ov.title or old_text)
+
+            # Direct proposition rewrite, only when the date maps unambiguously.
+            if due_date is not None and not clear_due_date:
+                new_text = rewrite_due_date(old_text, due_date)
+                if new_text is not None:
+                    existing = _extract_dates(old_text)
+                    old_date = existing[0].isoformat() if existing else None
+                    prop.text = new_text  # FTS stays synced via the AFTER UPDATE trigger
+
+        # Correction observation (after the transaction commits): the batcher has
+        # its own durable queue, mirroring add_suggestion_feedback.
+        changes: list[str] = []
+        if title:
+            changes.append(f'its title is "{title}"')
+        if clear_due_date:
+            changes.append("it has no fixed due date")
+        elif due_date:
+            changes.append(
+                f"it is due {due_date}, not {old_date}" if old_date else f"it is due {due_date}"
+            )
+        if status:
+            changes.append(f'its status is "{status}"')
+        if changes:
+            content = (
+                f'{self.user_name} corrected an agenda item derived from the note: '
+                f'"{old_text.strip()}". The commitment is now: '
+                + "; ".join(changes)
+                + "."
+            )
+            self.batcher.push(
+                observer_name="gumbo_agenda_edit",
+                content=content,
+                content_type="input_text",
+            )
+        return True
+
+    async def dismiss_agenda_item(
+        self, proposition_id: int, *, note: str | None = None
+    ) -> bool:
+        """Remove an item from the agenda without deleting its proposition.
+
+        A dismissal means "this isn't an open commitment to track", which is *not*
+        the same as "this fact is wrong" — so the proposition is kept (it may still
+        be true and useful elsewhere). We mark the override ``dismissed`` (so
+        :func:`gum.agenda.apply_overrides` filters it out) and push a correction
+        observation stating it's not a commitment, letting re-inference gradually
+        stop classifying it as one. Returns False if the proposition is gone.
+        """
+        from .agenda import _dedupe_key
+
+        old_text = ""
+        async with self._session() as session:
+            prop = await session.get(Proposition, proposition_id)
+            if prop is None:
+                return False
+            old_text = prop.text
+            ov = await self._get_or_make_override(session, proposition_id)
+            ov.dismissed = True
+            if not ov.dedupe_key:
+                ov.dedupe_key = _dedupe_key(ov.title or old_text)
+
+        parts = [
+            f'{self.user_name} indicated that the note "{old_text.strip()}" is not '
+            f"an open commitment or task with a deadline to track (it may still be a "
+            f"true fact, just not something to act on)."
+        ]
+        if note and note.strip():
+            parts.append(f"({note.strip()})")
+        self.batcher.push(
+            observer_name="gumbo_agenda_dismiss",
+            content=" ".join(parts),
+            content_type="input_text",
+        )
+        return True
+
+    async def clear_agenda_override(self, proposition_id: int) -> bool:
+        """Undo a persisted agenda edit/dismissal (delete the override row).
+
+        This reverts the *visual* overlay so the agenda shows the model's raw
+        output again. It cannot retract a correction observation already pushed by
+        a prior edit/dismiss — that evidence has entered the pipeline. Returns
+        False if there was no override to clear.
+        """
+        async with self._session() as session:
+            ov = (
+                await session.execute(
+                    select(AgendaOverride).where(
+                        AgendaOverride.proposition_id == proposition_id
+                    )
+                )
+            ).scalar_one_or_none()
+            if ov is None:
+                return False
+            await session.delete(ov)
+            return True
+
+    async def list_agenda_overrides(self) -> List[dict]:
+        """Return all agenda overrides as detached dicts for the REST merge.
+
+        Each dict carries the override fields plus a ``prop`` snapshot of the live
+        proposition (``id``/``text``/``confidence``/``decay``/``created_at``), or
+        ``prop=None`` if the proposition was since deleted. This is everything
+        :func:`gum.agenda.apply_overrides` needs to overlay edits and reconstruct
+        items the model didn't surface, without any further DB access.
+        """
+        from .agenda import _created_dt
+
+        async with self._session() as session:
+            rows = (await session.execute(select(AgendaOverride))).scalars().all()
+            out: List[dict] = []
+            for ov in rows:
+                prop = await session.get(Proposition, ov.proposition_id)
+                snap = None
+                if prop is not None:
+                    snap = {
+                        "id": prop.id,
+                        "text": prop.text,
+                        "confidence": prop.confidence,
+                        "decay": prop.decay,
+                        "created_at": _created_dt(prop).isoformat(),
+                    }
+                out.append(
+                    {
+                        "proposition_id": ov.proposition_id,
+                        "dedupe_key": ov.dedupe_key,
+                        "title": ov.title,
+                        "status": ov.status,
+                        "due_date": ov.due_date,
+                        "due_date_cleared": bool(ov.due_date_cleared),
+                        "dismissed": bool(ov.dismissed),
+                        "prop": snap,
+                    }
+                )
+            return out
+
+    # ── explicitly-added agenda items (assistant/user) ────────────────────────
+    #
+    # Distinct from the override path above: these are agenda entries someone put
+    # on the radar directly (chiefly a frontier agent via the MCP add_agenda_item
+    # tool), stored in their own table rather than as inferred propositions. Text
+    # is expected to already be in the user's real terms — the MCP tool rehydrates
+    # any pseudo-IDs before calling add_agenda_item — so nothing here touches the
+    # sanitizer or the batch/inference pipeline.
+
+    @staticmethod
+    def _agenda_item_dict(item: AgendaItem) -> dict:
+        return {
+            "id": item.id,
+            "title": item.title,
+            "due_date": item.due_date,
+            "status": item.status,
+            "source": item.source,
+            "note": item.note,
+            "created_by": item.created_by,
+            "dismissed": bool(item.dismissed),
+            "created_at": (
+                item.created_at.isoformat()
+                if hasattr(item.created_at, "isoformat")
+                else item.created_at
+            ),
+        }
+
+    async def add_agenda_item(
+        self,
+        *,
+        title: str,
+        due_date: str | None = None,
+        status: str | None = None,
+        source: str | None = None,
+        note: str | None = None,
+        created_by: str = "user",
+    ) -> int | None:
+        """Persist an explicitly-added agenda item; return its new id.
+
+        The caller is responsible for handing over already-rehydrated (real-value)
+        text — the MCP tool does this so a pseudonymized ``[PERSON_1]`` never lands
+        in the stored title. Returns None for an empty title.
+        """
+        title = (title or "").strip()
+        if not title:
+            return None
+        item = AgendaItem(
+            title=title,
+            due_date=(due_date or None),
+            status=(status.strip() if status else None),
+            source=(source.strip() if source else None),
+            note=(note.strip() if note else None),
+            created_by=created_by,
+        )
+        async with self._session() as session:
+            session.add(item)
+            await session.flush()
+            return item.id
+
+    async def list_agenda_items(self, *, include_dismissed: bool = False) -> List[dict]:
+        """Return stored agenda items as detached dicts (non-dismissed by default)."""
+        async with self._session() as session:
+            stmt = select(AgendaItem)
+            if not include_dismissed:
+                stmt = stmt.where(AgendaItem.dismissed.is_(False))
+            rows = (await session.execute(stmt)).scalars().all()
+            return [self._agenda_item_dict(r) for r in rows]
+
+    async def update_agenda_item(
+        self,
+        item_id: int,
+        *,
+        title: str | None = None,
+        due_date: str | None = None,
+        status: str | None = None,
+        clear_due_date: bool = False,
+    ) -> bool:
+        """Edit an added agenda item in place. Returns False if it doesn't exist."""
+        async with self._session() as session:
+            item = await session.get(AgendaItem, item_id)
+            if item is None:
+                return False
+            if title is not None and title.strip():
+                item.title = title.strip()
+            if status is not None:
+                item.status = status.strip() or None
+            if clear_due_date:
+                item.due_date = None
+            elif due_date is not None:
+                item.due_date = due_date.strip() or None
+            return True
+
+    async def set_agenda_item_dismissed(self, item_id: int, dismissed: bool) -> bool:
+        """Soft-hide (or restore) an added agenda item. False if it doesn't exist."""
+        async with self._session() as session:
+            item = await session.get(AgendaItem, item_id)
+            if item is None:
+                return False
+            item.dismissed = dismissed
+            return True

@@ -21,8 +21,12 @@ from gum.agenda import (
     Commitment,
     CommitmentRadar,
     _dedupe_key,
+    _extract_dates,
     _parse_due,
+    _today_anchor,
+    apply_overrides,
     build_agenda,
+    rewrite_due_date,
     urgency_score,
 )
 from gum.schemas import (
@@ -466,6 +470,175 @@ class VerificationPassTests(unittest.IsolatedAsyncioTestCase):
         with mock.patch.dict(os.environ, {"GUM_AGENDA_VERIFY": "0"}):
             radar = CommitmentRadar(self.gum, min_confidence=3)
         self.assertFalse(radar.verify)
+
+
+def _commitment(**kw) -> Commitment:
+    base = dict(
+        title="Submit the grant",
+        due_date="2026-07-20",
+        source="NSF",
+        status_guess="in progress",
+        confidence=8,
+        decay=5,
+        days_until_due=9,
+        urgency=1.5,
+        proposition_id=1,
+        proposition_text="Grant due 2026-07-20",
+        created_at=NOW.isoformat(),
+    )
+    base.update(kw)
+    return Commitment(**base)
+
+
+def _override(pid: int, **kw) -> dict:
+    base = dict(
+        proposition_id=pid,
+        dedupe_key=None,
+        title=None,
+        status=None,
+        due_date=None,
+        due_date_cleared=False,
+        dismissed=False,
+        prop=None,
+    )
+    base.update(kw)
+    return base
+
+
+class RewriteDueDateTests(unittest.TestCase):
+    def test_single_date_replaced(self):
+        out = rewrite_due_date("Grant due 2026-07-20 sharp", "2026-08-15")
+        self.assertEqual(out, "Grant due 2026-08-15 sharp")
+
+    def test_no_date_is_ambiguous(self):
+        self.assertIsNone(rewrite_due_date("Grant due soon", "2026-08-15"))
+
+    def test_multiple_dates_is_ambiguous(self):
+        # Two dates → we can't tell which is the deadline; refuse to touch it.
+        self.assertIsNone(
+            rewrite_due_date("Meet 2026-07-10, deliver 2026-07-20", "2026-08-15")
+        )
+
+    def test_same_date_is_noop(self):
+        self.assertIsNone(rewrite_due_date("Grant due 2026-08-15", "2026-08-15"))
+
+
+class ExtractDatesTests(unittest.TestCase):
+    def test_parses_valid_and_skips_malformed(self):
+        dates = _extract_dates("due 2026-07-20, bogus 2026-13-40, also 2026-01-05")
+        self.assertEqual([d.isoformat() for d in dates], ["2026-07-20", "2026-01-05"])
+
+    def test_empty(self):
+        self.assertEqual(_extract_dates(""), [])
+        self.assertEqual(_extract_dates(None), [])
+
+
+class TodayAnchorTests(unittest.TestCase):
+    def test_shape(self):
+        a = _today_anchor()
+        self.assertIn("date", a)
+        self.assertIn("weekday", a)
+        # date is ISO YYYY-MM-DD and re-parseable.
+        datetime.strptime(a["date"], "%Y-%m-%d")
+
+
+class ApplyOverridesTests(unittest.TestCase):
+    def test_title_and_status_overlay(self):
+        c = _commitment(proposition_id=1, title="Old title", status_guess="not started")
+        ov = _override(1, title="New title", status="blocked")
+        out = apply_overrides([c], [ov], now=NOW)
+        self.assertEqual(len(out), 1)
+        self.assertEqual(out[0].title, "New title")
+        self.assertEqual(out[0].status_guess, "blocked")
+
+    def test_due_date_change_recomputes_days_and_urgency(self):
+        c = _commitment(proposition_id=1, due_date="2026-07-20", days_until_due=9, urgency=1.4)
+        ov = _override(1, due_date="2026-07-15")
+        out = apply_overrides([c], [ov], now=NOW)
+        # NOW is 2026-07-11 → 2026-07-15 is 4 days out; a closer deadline ranks higher.
+        self.assertEqual(out[0].due_date, "2026-07-15")
+        self.assertEqual(out[0].days_until_due, 4)
+        self.assertGreater(out[0].urgency, 1.4)
+
+    def test_clear_due_date(self):
+        c = _commitment(proposition_id=1, due_date="2026-07-20", days_until_due=9)
+        ov = _override(1, due_date_cleared=True)
+        out = apply_overrides([c], [ov], now=NOW)
+        self.assertIsNone(out[0].due_date)
+        self.assertIsNone(out[0].days_until_due)
+
+    def test_dismiss_drops_item(self):
+        keep = _commitment(proposition_id=1, title="Keep me")
+        drop = _commitment(proposition_id=2, title="Drop me")
+        out = apply_overrides([keep, drop], [_override(2, dismissed=True)], now=NOW)
+        self.assertEqual([c.title for c in out], ["Keep me"])
+
+    def test_item_without_proposition_id_passes_through(self):
+        c = _commitment(proposition_id=None, title="Submit the grant")
+        # An override that would match by title can't bind — no proposition_id key.
+        ov = _override(99, dedupe_key=_dedupe_key("Submit the grant"), title="Hijacked")
+        out = apply_overrides([c], [ov], now=NOW)
+        # The un-keyable item is untouched; the override reconstructs separately only
+        # if it has a prop snapshot (it doesn't here), so it's dropped silently.
+        self.assertEqual(out[0].title, "Submit the grant")
+
+    def test_dedupe_key_fallback_rebinds_after_id_churn(self):
+        # Re-inference replaced the proposition, so the surfaced id (5) differs from
+        # the override's id (99); the normalized-title key still binds them.
+        c = _commitment(proposition_id=5, title="Submit the NSF grant")
+        ov = _override(
+            99, dedupe_key=_dedupe_key("Submit the NSF grant"), title="Submit the NSF grant (final)"
+        )
+        out = apply_overrides([c], [ov], now=NOW)
+        self.assertEqual(out[0].title, "Submit the NSF grant (final)")
+
+    def test_synthesizes_item_the_model_dropped(self):
+        # No surfaced commitment for pid 7, but the override has a live snapshot, so
+        # the edit persists as a reconstructed item.
+        ov = _override(
+            7,
+            due_date="2026-08-01",
+            status="in progress",
+            prop={
+                "id": 7,
+                "text": "Renew the lab software license by 2026-08-01",
+                "confidence": 6,
+                "decay": 4,
+                "created_at": NOW.isoformat(),
+            },
+        )
+        out = apply_overrides([], [ov], now=NOW)
+        self.assertEqual(len(out), 1)
+        self.assertEqual(out[0].proposition_id, 7)
+        self.assertEqual(out[0].due_date, "2026-08-01")
+        self.assertEqual(out[0].status_guess, "in progress")
+        self.assertIn("Renew the lab software license", out[0].title)
+
+    def test_dropped_override_without_snapshot_is_ignored(self):
+        # Proposition was deleted (snapshot None) and not surfaced → nothing to show.
+        out = apply_overrides([], [_override(7, title="ghost", prop=None)], now=NOW)
+        self.assertEqual(out, [])
+
+    def test_resorts_and_limits(self):
+        # A dated overlay should re-sort above an undated item, and limit applies
+        # after the overlay.
+        undated = _commitment(proposition_id=1, title="Undated", due_date=None,
+                              days_until_due=None, urgency=0.5)
+        dated = _commitment(proposition_id=2, title="Dated", due_date="2026-07-20",
+                            days_until_due=9, urgency=1.6)
+        out = apply_overrides([undated, dated], [], now=NOW, limit=1)
+        self.assertEqual(len(out), 1)
+        self.assertEqual(out[0].title, "Dated")
+
+
+class SharedHelperMoveTests(unittest.TestCase):
+    """The date/anchor helpers moved to agenda.py are re-used (not re-defined) by
+    mcp_server.py, so both machine surfaces share one implementation."""
+
+    def test_mcp_server_reexports_agenda_helpers(self):
+        from gum import agenda, mcp_server
+        self.assertIs(mcp_server._today_anchor, agenda._today_anchor)
+        self.assertIs(mcp_server._extract_dates, agenda._extract_dates)
 
 
 if __name__ == "__main__":

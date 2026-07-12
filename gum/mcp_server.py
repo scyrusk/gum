@@ -32,6 +32,7 @@ from mcp.server.fastmcp import FastMCP
 
 # Reuse the exact serialization + egress-sanitization the REST API uses so the
 # two machine-facing surfaces expose propositions identically.
+from .agenda import _extract_dates, _today_anchor
 from .api import (
     _serialize_commitment,
     _serialize_observation,
@@ -74,45 +75,6 @@ _INSTRUCTION_STOPWORDS = frozenset(
 )
 
 
-def _today_anchor() -> dict[str, str]:
-    """Server-local calendar date, for grounding an off-device agent's temporal
-    reasoning.
-
-    A capable frontier agent building a daily agenda from the GUM's propositions
-    needs to know *what today is* to reason about the absolute ``YYYY-MM-DD``
-    deadlines those propositions now carry (see ``PROPOSE_PROMPT``'s temporal
-    grounding) — but an off-device model has a stale knowledge cutoff and no
-    reliable sense of the user's local date or timezone. We compute it here, on
-    the user's machine, in local time (the frame the screen/calendar observers
-    recorded the deadlines in) and hand it to the agent alongside the radar so it
-    never has to guess. This leaks nothing — a calendar date is not PII.
-    """
-    now = datetime.now().astimezone()
-    return {"date": now.strftime("%Y-%m-%d"), "weekday": now.strftime("%A")}
-
-
-# Propositions now state deadlines as absolute ``YYYY-MM-DD`` calendar dates (see
-# ``PROPOSE_PROMPT``'s temporal-grounding rule), so an off-device agent's dated
-# commitments can be recovered from the proposition text with a plain regex — no
-# model call, and complete coverage of whatever the GUM actually wrote down.
-_ABS_DATE_RE = re.compile(r"\b(\d{4})-(\d{2})-(\d{2})\b")
-
-
-def _extract_dates(text: str) -> list[date]:
-    """Parse every valid absolute ``YYYY-MM-DD`` date out of *text*.
-
-    Malformed matches (e.g. ``2026-13-40``) are skipped rather than raising, so a
-    stray number that merely looks like a date can never break the scan.
-    """
-    out: list[date] = []
-    for m in _ABS_DATE_RE.finditer(text or ""):
-        try:
-            out.append(date(int(m.group(1)), int(m.group(2)), int(m.group(3))))
-        except ValueError:
-            continue
-    return out
-
-
 def _focus_terms(topic: str) -> str:
     """Reduce a task instruction to its substantive search terms.
 
@@ -152,6 +114,12 @@ _INSTRUCTIONS = (
     "it still carries those placeholders and is not usable until the user restores "
     "the real names on-device with `gum rehydrate <file>`; save your output to a "
     "file and point the user at that command.\n\n"
+    "Use `add_agenda_item` to put a commitment on the user's agenda on their "
+    "behalf (after helping them plan or commit to something). Keep any pseudo-IDs "
+    "in the title/note verbatim — the GUM rehydrates them to the real values "
+    "locally before saving, so the item lands in the user's agenda in their real "
+    "terms without the names ever coming back to you. This is the one write tool; "
+    "everything else here is read-only.\n\n"
     "The `with_user_context` prompt packages this whole workflow — gather "
     "context, optionally inspect evidence, then execute — for a given task; "
     "clients can offer it to the user as a one-shot action. The `daily_agenda` "
@@ -373,6 +341,74 @@ def build_mcp(gum_instance: gum, *, sanitize: bool = True) -> FastMCP:
             "window_days": window,
             "commitments": items,
             "sanitized": sanitizer is not None,
+        }
+
+    @mcp.tool(
+        description=(
+            "Add an item to the user's agenda on their behalf (e.g. after helping "
+            "them plan, commit to a task, or schedule something). Provide a short "
+            "`title`, an optional `due_date` as an absolute `YYYY-MM-DD` (resolve "
+            "relative dates like 'next Friday' against the `today` anchor the "
+            "`agenda` tool returns — do NOT guess), an optional `status` ('not "
+            "started' | 'in progress' | 'blocked' | 'done'), and an optional "
+            "`note`. IMPORTANT: the context you were given is pseudonymized, so if "
+            "the title/note refer to an entity you only know as a pseudo-ID (e.g. "
+            "[PERSON_1], [ORG_1]), KEEP that pseudo-ID verbatim — do NOT invent a "
+            "real name. The GUM restores the real value locally, on the user's "
+            "device, before saving; the real names are never sent back to you. The "
+            "item then appears in the user's local agenda UI. Returns the new "
+            "`item_id` and how many placeholders were restored (a count only)."
+        )
+    )
+    async def add_agenda_item(
+        title: str,
+        due_date: str | None = None,
+        status: str | None = None,
+        note: str | None = None,
+    ) -> dict[str, Any]:
+        from .agenda import _parse_due
+
+        title = (title or "").strip()
+        if not title:
+            return {"ok": False, "error": "title is required"}
+        due = (due_date or "").strip() or None
+        if due is not None and _parse_due(due) is None:
+            return {"ok": False, "error": "due_date must be an absolute YYYY-MM-DD"}
+        note = (note or "").strip() or None
+
+        # Re-identify on-device: the agent only ever saw pseudonymized context, so
+        # its title/note may carry pseudo-IDs. Rehydrate them here — a pure local
+        # entity-map lookup, no model — so the stored agenda item is in the user's
+        # real terms. The rehydrated text is NEVER returned to the agent (that
+        # would defeat the pseudonymization); we return only a substitution count.
+        restored = 0
+        r_title, r_note = title, note
+        if sanitizer is not None:
+            r_title, n1 = await asyncio.to_thread(sanitizer.rehydrate, title)
+            restored += n1
+            if note is not None:
+                r_note, n2 = await asyncio.to_thread(sanitizer.rehydrate, note)
+                restored += n2
+
+        item_id = await gum_instance.add_agenda_item(
+            title=r_title,
+            due_date=due,
+            status=(status or None),
+            note=r_note,
+            source="added by an assistant",
+            created_by="mcp",
+        )
+        return {
+            "ok": item_id is not None,
+            "item_id": item_id,
+            # A count of placeholders from the agent's OWN input — reveals no new
+            # PII, and lets the agent confirm its pseudo-IDs were understood.
+            "rehydrated_placeholders": restored,
+            "sanitized": sanitizer is not None,
+            "note": (
+                "Saved to the user's local agenda and de-pseudonymized on-device; "
+                "the real values are intentionally not returned here."
+            ),
         }
 
     @mcp.tool(

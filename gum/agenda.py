@@ -21,7 +21,7 @@ import asyncio
 import logging
 import os
 import re
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import date, datetime, timezone
 from typing import Any
 
@@ -126,6 +126,68 @@ def _parse_due(value: str | None) -> date | None:
     return None
 
 
+# Propositions state deadlines as absolute ``YYYY-MM-DD`` calendar dates (see
+# ``PROPOSE_PROMPT``'s temporal-grounding rule), so a dated commitment can be
+# recovered from the proposition text with a plain regex — no model call. Shared
+# by the deterministic MCP ``upcoming_deadlines`` scan and by the agenda-edit
+# due-date rewrite (:func:`rewrite_due_date`), which both need to find the one
+# canonical date a proposition carries.
+_ABS_DATE_RE = re.compile(r"\b(\d{4})-(\d{2})-(\d{2})\b")
+
+
+def _extract_dates(text: str) -> list[date]:
+    """Parse every valid absolute ``YYYY-MM-DD`` date out of *text*.
+
+    Malformed matches (e.g. ``2026-13-40``) are skipped rather than raising, so a
+    stray number that merely looks like a date can never break the scan.
+    """
+    out: list[date] = []
+    for m in _ABS_DATE_RE.finditer(text or ""):
+        try:
+            out.append(date(int(m.group(1)), int(m.group(2)), int(m.group(3))))
+        except ValueError:
+            continue
+    return out
+
+
+def rewrite_due_date(text: str, new_iso: str) -> str | None:
+    """Rewrite the one absolute date in *text* to *new_iso*, or None if ambiguous.
+
+    The hybrid agenda edit tries to push a corrected due date all the way down
+    into the source proposition so the fix is durable (and visible to the MCP
+    ``upcoming_deadlines`` scan), not just an overlay. That is only safe when the
+    proposition carries **exactly one** absolute ``YYYY-MM-DD`` date: with zero
+    dates there is nothing to replace, and with several the mapping from "the
+    commitment's deadline" to "which date in the text" is ambiguous — in both
+    cases we return None and let the caller fall back to the override + correction
+    observation alone. Also None when the single date already equals *new_iso*
+    (nothing to change).
+    """
+    matches = list(_ABS_DATE_RE.finditer(text or ""))
+    if len(matches) != 1:
+        return None
+    m = matches[0]
+    if m.group(0) == new_iso:
+        return None
+    return text[: m.start()] + new_iso + text[m.end() :]
+
+
+def _today_anchor() -> dict[str, str]:
+    """Server-local calendar date, for grounding a client's temporal reasoning.
+
+    A capable frontier agent (or the GUMBO Agenda page) reasoning about the
+    absolute ``YYYY-MM-DD`` deadlines the GUM's propositions now carry needs to
+    know *what today is* — but an off-device model has a stale knowledge cutoff
+    and no reliable sense of the user's local date or timezone, and a browser's
+    clock can drift from the machine the GUM ran on. We compute it here, on the
+    user's machine, in local time (the frame the screen/calendar observers
+    recorded the deadlines in) and hand it back alongside the radar. This leaks
+    nothing — a calendar date is not PII.
+    """
+    now = datetime.now().astimezone()
+    return {"date": now.strftime("%Y-%m-%d"), "weekday": now.strftime("%A")}
+
+
 def urgency_score(
     days_until_due: int | None,
     confidence: int | None,
@@ -177,9 +239,24 @@ class Commitment:
     proposition_id: int | None
     proposition_text: str
     created_at: str | None          # ISO timestamp of the source proposition
+    # Set when this row is an explicitly-added AgendaItem rather than a
+    # model-extracted commitment; the two are mutually exclusive. Lets the UI
+    # route edits/dismissals to the /agenda/item/{id} endpoints.
+    item_id: int | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
+
+
+def _sort_key_commitment(c: Commitment) -> tuple[float, int, int, int]:
+    """Ranking key: most-urgent first, with deterministic tie-breaks.
+
+    Shared by :meth:`CommitmentRadar.build` and :func:`apply_overrides` so a
+    radar with user overlays sorts identically to a fresh one. Ties break by
+    soonest deadline, then highest confidence, then oldest proposition.
+    """
+    days = c.days_until_due if c.days_until_due is not None else 10**9
+    return (-c.urgency, days, -(c.confidence or 0), c.proposition_id or 0)
 
 
 class CommitmentRadar:
@@ -339,11 +416,7 @@ class CommitmentRadar:
         # Rank most-urgent first, with deterministic tie-breaks so equal-urgency
         # items order sensibly (soonest deadline, then highest confidence, then
         # oldest proposition) instead of by arbitrary extraction order.
-        def _sort_key(c: Commitment) -> tuple[float, int, int, int]:
-            days = c.days_until_due if c.days_until_due is not None else 10**9
-            return (-c.urgency, days, -(c.confidence or 0), c.proposition_id or 0)
-
-        commitments.sort(key=_sort_key)
+        commitments.sort(key=_sort_key_commitment)
         commitments = self._dedupe(commitments)
         return commitments[: self.limit] if self.limit is not None else commitments
 
@@ -471,3 +544,213 @@ async def build_agenda(
         verify=verify,
     )
     return await radar.build(now=now)
+
+
+# ── user overrides (GUMBO Agenda page) ─────────────────────────────────────────
+#
+# The agenda has no persistent row to edit — it is re-extracted by the local
+# model on every request — so the user's direct edits live in the
+# `agenda_overrides` table (see gum.models.AgendaOverride) and are overlaid here,
+# on top of each freshly-built radar, before it reaches the UI. This keeps
+# `build_agenda` (and thus the CLI + MCP surfaces) pure; overrides are a
+# REST/desktop concern only. Propagation of the edit *into* the model (proposition
+# rewrite + correction observation) is handled separately in gum.gum.
+
+
+def _truncate_title(text: str, limit: int = 80) -> str:
+    text = (text or "").strip()
+    if len(text) <= limit:
+        return text
+    return text[: limit - 1].rstrip() + "…"
+
+
+def _age_days(created_at_iso: str | None, now: datetime) -> float:
+    """Age of a proposition (in days) from its ISO ``created_at``, clamped ≥ 0."""
+    if not created_at_iso:
+        return 0.0
+    try:
+        created = datetime.fromisoformat(created_at_iso)
+    except ValueError:
+        return 0.0
+    if created.tzinfo is None:
+        created = created.replace(tzinfo=timezone.utc)
+    return max(0.0, (now - created).total_seconds() / 86400.0)
+
+
+def _apply_override_fields(c: Commitment, ov: dict[str, Any], now: datetime) -> Commitment:
+    """Return *c* with the user's overridden title/status/due-date applied.
+
+    Only fields the user actually set replace the model's values. When the due
+    date changes (including being cleared to "no fixed date"), ``days_until_due``
+    and ``urgency`` are recomputed against *now* so the overlaid item ranks and
+    buckets correctly.
+    """
+    title = ov["title"] if ov.get("title") else c.title
+    status = ov["status"] if ov.get("status") else c.status_guess
+    due_date = c.due_date
+    days = c.days_until_due
+    urgency = c.urgency
+    date_changed = False
+
+    if ov.get("due_date_cleared"):
+        if c.due_date is not None:
+            due_date, days, date_changed = None, None, True
+    elif ov.get("due_date") and ov["due_date"] != c.due_date:
+        due_date, date_changed = ov["due_date"], True
+
+    if date_changed:
+        parsed = _parse_due(due_date)
+        due_date = parsed.isoformat() if parsed is not None else None
+        days = (parsed - now.date()).days if parsed is not None else None
+        urgency = round(
+            urgency_score(days, c.confidence, c.decay, _age_days(c.created_at, now)), 4
+        )
+
+    return replace(
+        c,
+        title=title,
+        status_guess=status,
+        due_date=due_date,
+        days_until_due=days,
+        urgency=urgency,
+    )
+
+
+def _synthesize_commitment(ov: dict[str, Any], snap: dict[str, Any], now: datetime) -> Commitment:
+    """Reconstruct a Commitment for an override the model didn't surface this run.
+
+    The local model re-extracts the radar every load and may simply not emit a
+    commitment for a proposition the user has already edited. Without this the
+    user's edit would appear to vanish on refresh; instead we rebuild the item
+    from the live proposition snapshot (*snap*) plus the overridden fields, so the
+    edit persists visually until re-inference catches up.
+    """
+    text = (snap.get("text") or "").strip()
+    title = ov["title"] if ov.get("title") else _truncate_title(text)
+    status = ov.get("status") or "unknown"
+    due_raw = None if ov.get("due_date_cleared") else ov.get("due_date")
+    parsed = _parse_due(due_raw)
+    days = (parsed - now.date()).days if parsed is not None else None
+    created_at = snap.get("created_at")
+    conf = snap.get("confidence")
+    decay = snap.get("decay")
+    urgency = round(urgency_score(days, conf, decay, _age_days(created_at, now)), 4)
+    return Commitment(
+        title=title,
+        due_date=parsed.isoformat() if parsed is not None else None,
+        source="you",
+        status_guess=status,
+        confidence=conf,
+        decay=decay,
+        days_until_due=days,
+        urgency=urgency,
+        proposition_id=ov["proposition_id"],
+        proposition_text=text,
+        created_at=created_at,
+    )
+
+
+def apply_overrides(
+    commitments: list[Commitment],
+    overrides: list[dict[str, Any]],
+    *,
+    now: datetime,
+    limit: int | None = None,
+) -> list[Commitment]:
+    """Overlay the user's persisted agenda edits on a freshly-extracted radar.
+
+    Pure function (no DB access): *overrides* are plain detached dicts as produced
+    by ``gum.list_agenda_overrides`` — each carries the override fields plus a
+    ``prop`` snapshot (``id``/``text``/``confidence``/``decay``/``created_at``, or
+    None if the proposition was since deleted).
+
+    For each surfaced commitment we look for a matching override, first by
+    ``proposition_id`` and then — because the SIMILAR→revise path can replace a
+    proposition with a new id — by normalized-title ``dedupe_key``. A matched
+    override either drops the item (``dismissed``) or overlays its fields.
+    Overrides that matched nothing this run are reconstructed from their
+    proposition snapshot so the edit still shows. Items with no ``proposition_id``
+    can't be keyed and pass through untouched. The result is re-sorted and
+    re-limited so overlays and reconstructions land in the right place.
+    """
+    by_id: dict[int, dict[str, Any]] = {}
+    by_key: dict[str, dict[str, Any]] = {}
+    for ov in overrides:
+        pid = ov.get("proposition_id")
+        if pid is not None:
+            by_id[pid] = ov
+        key = ov.get("dedupe_key")
+        if key:
+            by_key.setdefault(key, ov)
+
+    used: set[int] = set()
+    out: list[Commitment] = []
+    for c in commitments:
+        ov = None
+        if c.proposition_id is not None:
+            # Match by id first; fall back to the normalized-title key so an
+            # override re-binds after re-inference replaces the proposition with a
+            # new id. An item with no proposition_id can't be keyed at all — leave
+            # it untouched (it's non-editable) rather than let a title collision
+            # hijack it.
+            if c.proposition_id in by_id:
+                ov = by_id[c.proposition_id]
+            else:
+                key = _dedupe_key(c.title)
+                if key and key in by_key:
+                    ov = by_key[key]
+        if ov is None:
+            out.append(c)
+            continue
+        used.add(ov["proposition_id"])
+        if ov.get("dismissed"):
+            continue  # user removed this item from the radar
+        out.append(_apply_override_fields(c, ov, now))
+
+    # Overrides the model didn't surface this run: reconstruct so the edit sticks.
+    for ov in overrides:
+        if ov["proposition_id"] in used or ov.get("dismissed"):
+            continue
+        snap = ov.get("prop")
+        if not snap:
+            continue  # proposition gone; nothing to rebuild from
+        out.append(_synthesize_commitment(ov, snap, now))
+
+    out.sort(key=_sort_key_commitment)
+    return out[:limit] if limit is not None else out
+
+
+# High salience for explicitly-added items: someone deliberately put them on the
+# agenda, so they should rank among the model's own commitments rather than being
+# buried. Standing in for the confidence/decay a proposition would carry.
+_ADDED_ITEM_SALIENCE = 10
+
+
+def agenda_item_to_commitment(item: dict[str, Any], now: datetime) -> Commitment:
+    """Turn a stored :class:`gum.models.AgendaItem` (as a dict) into a Commitment.
+
+    Added items are already in the user's real terms (rehydrated on ingest), carry
+    an ``item_id`` rather than a ``proposition_id``, and rank as high-salience
+    since they were put on the agenda on purpose. ``now`` is the same local anchor
+    the rest of the radar uses so day math stays consistent.
+    """
+    due = _parse_due(item.get("due_date"))
+    days = (due - now.date()).days if due is not None else None
+    urgency = round(
+        urgency_score(days, _ADDED_ITEM_SALIENCE, _ADDED_ITEM_SALIENCE, 0.0), 4
+    )
+    title = (item.get("title") or "").strip()
+    return Commitment(
+        title=title,
+        due_date=due.isoformat() if due is not None else None,
+        source=(item.get("source") or "added").strip() or "added",
+        status_guess=(item.get("status") or "unknown"),
+        confidence=None,
+        decay=None,
+        days_until_due=days,
+        urgency=urgency,
+        proposition_id=None,
+        proposition_text=title,
+        created_at=item.get("created_at"),
+        item_id=item["id"],
+    )

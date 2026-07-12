@@ -20,7 +20,7 @@ from unittest import mock
 from mcp.shared.memory import create_connected_server_and_client_session
 
 from gum import gum as Gum
-from gum.models import Observation, Proposition
+from gum.models import AgendaItem, Observation, Proposition
 from gum.mcp_server import build_mcp, _focus_terms
 from gum.schemas import CommitmentItem, CommitmentSchema
 
@@ -69,6 +69,16 @@ class _FakeSanitizer:
                 aliases[raw] = pseudo
             text = text.replace(raw, pseudo)
         return text, aliases
+
+    def rehydrate(self, text: str) -> tuple[str, int]:
+        # Inverse of sanitize: restore each pseudo-ID to its real value (pure map
+        # lookup, no model), mirroring the real Sanitizer.rehydrate.
+        n = 0
+        for raw, pseudo in self._mapping.items():
+            if pseudo in text:
+                n += text.count(pseudo)
+                text = text.replace(pseudo, raw)
+        return text, n
 
 
 async def _call(mcp, name: str, args: dict) -> dict:
@@ -518,7 +528,8 @@ class ToolAdvertisingTests(_Base):
         names = {t.name for t in await mcp.list_tools()}
         self.assertEqual(
             names,
-            {"gather_context", "recent_context", "inspect_proposition", "agenda", "upcoming_deadlines"},
+            {"gather_context", "recent_context", "inspect_proposition", "agenda",
+             "upcoming_deadlines", "add_agenda_item"},
         )
 
 
@@ -627,7 +638,8 @@ class ClientSessionE2ETests(_Base):
             tools = {t.name for t in (await client.list_tools()).tools}
             self.assertEqual(
                 tools,
-                {"gather_context", "recent_context", "inspect_proposition", "agenda", "upcoming_deadlines"},
+                {"gather_context", "recent_context", "inspect_proposition", "agenda",
+                 "upcoming_deadlines", "add_agenda_item"},
             )
             prompts = {p.name for p in (await client.list_prompts()).prompts}
             self.assertIn("with_user_context", prompts)
@@ -659,6 +671,80 @@ class ClientSessionE2ETests(_Base):
             text = expanded.messages[0].content.text
             self.assertIn("Schmidt Foundation", text)
             self.assertIn("gather_context", text)
+
+
+class AddAgendaItemToolTests(_Base):
+    """The one write tool: an agent adds an agenda item, and any pseudo-IDs it
+    carries are rehydrated to real values on-device before storing — never
+    returned to the agent."""
+
+    async def _items(self) -> list[AgendaItem]:
+        from sqlalchemy import select
+        async with self.gum._session() as s:
+            return list((await s.execute(select(AgendaItem))).scalars().all())
+
+    async def test_rehydrates_pseudo_ids_before_storing(self):
+        import gum.sanitize as sanitize_mod
+
+        fake = _FakeSanitizer({"Project Aurora": "[PROJECT_1]", "Alice": "[PERSON_1]"})
+        original = sanitize_mod.get_sanitizer
+        sanitize_mod.get_sanitizer = lambda: fake
+        try:
+            mcp = build_mcp(self.gum, sanitize=True)
+            result = await _call(mcp, "add_agenda_item", {
+                "title": "Send [PROJECT_1] report to [PERSON_1]",
+                "due_date": "2999-07-20",
+                "status": "in progress",
+            })
+        finally:
+            sanitize_mod.get_sanitizer = original
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["rehydrated_placeholders"], 2)
+        # The response must NOT leak the real values back to the agent.
+        self.assertNotIn("Aurora", str(result))
+        self.assertNotIn("Alice", str(result))
+        # …but the stored item is in the user's real terms.
+        items = await self._items()
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0].title, "Send Project Aurora report to Alice")
+        self.assertEqual(items[0].due_date, "2999-07-20")
+        self.assertEqual(items[0].created_by, "mcp")
+
+    async def test_unsanitized_stores_verbatim(self):
+        mcp = build_mcp(self.gum, sanitize=False)
+        result = await _call(mcp, "add_agenda_item", {"title": "Buy milk"})
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["rehydrated_placeholders"], 0)
+        items = await self._items()
+        self.assertEqual(items[0].title, "Buy milk")
+
+    async def test_empty_title_rejected(self):
+        mcp = build_mcp(self.gum, sanitize=False)
+        result = await _call(mcp, "add_agenda_item", {"title": "   "})
+        self.assertFalse(result["ok"])
+        self.assertEqual(await self._items(), [])
+
+    async def test_bad_due_date_rejected(self):
+        mcp = build_mcp(self.gum, sanitize=False)
+        result = await _call(mcp, "add_agenda_item",
+                             {"title": "Do a thing", "due_date": "next Friday"})
+        self.assertFalse(result["ok"])
+        self.assertEqual(await self._items(), [])
+
+    async def test_agenda_tool_unaffected_by_added_items(self):
+        # Added items are a local-UI concern; the MCP `agenda` tool still reflects
+        # only the model's extraction (it calls build_agenda directly).
+        self.enterContext(mock.patch.dict(os.environ, {"GUM_AGENDA_VERIFY": "0"}))
+        mcp = build_mcp(self.gum, sanitize=False)
+        await _call(mcp, "add_agenda_item", {"title": "A pinned task"})
+
+        async def empty(client, model, messages, schema, **kwargs):
+            return CommitmentSchema(commitments=[])
+
+        with mock.patch("gum.agenda.structured_completion", side_effect=empty):
+            result = await _call(mcp, "agenda", {})
+        self.assertEqual(result["count"], 0)
 
 
 if __name__ == "__main__":
