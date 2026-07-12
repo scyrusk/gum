@@ -1280,6 +1280,7 @@ rule. Do not rewrite candidates and do not include their text in your response.
         due_date: str | None = None,
         status: str | None = None,
         clear_due_date: bool = False,
+        dedupe_title: str | None = None,
     ) -> bool:
         """Persist a user's edit to a generated agenda item and propagate it.
 
@@ -1297,6 +1298,7 @@ rule. Do not rewrite candidates and do not include their text in your response.
         title = title.strip() if title else None
         status = status.strip() if status else None
         due_date = due_date.strip() if due_date else None
+        dedupe_title = dedupe_title.strip() if dedupe_title else None
 
         old_date: str | None = None
         old_text: str = ""
@@ -1318,8 +1320,11 @@ rule. Do not rewrite candidates and do not include their text in your response.
                 ov.due_date = due_date
                 ov.due_date_cleared = False
             # Snapshot a normalized-title key so the override can re-bind if
-            # re-inference later replaces the proposition with a new id.
-            ov.dedupe_key = _dedupe_key(title or ov.title or old_text)
+            # re-inference later replaces the proposition with a new id. Prefer the
+            # client-supplied displayed title (which apply_overrides matches via
+            # _dedupe_key(c.title)) over the full proposition sentence, so due-date-
+            # or status-only edits can still re-bind after the id churns.
+            ov.dedupe_key = _dedupe_key(dedupe_title or title or ov.title or old_text)
 
             # Direct proposition rewrite, only when the date maps unambiguously.
             if due_date is not None and not clear_due_date:
@@ -1357,7 +1362,11 @@ rule. Do not rewrite candidates and do not include their text in your response.
         return True
 
     async def dismiss_agenda_item(
-        self, proposition_id: int, *, note: str | None = None
+        self,
+        proposition_id: int,
+        *,
+        note: str | None = None,
+        dedupe_title: str | None = None,
     ) -> bool:
         """Remove an item from the agenda without deleting its proposition.
 
@@ -1370,6 +1379,8 @@ rule. Do not rewrite candidates and do not include their text in your response.
         """
         from .agenda import _dedupe_key
 
+        dedupe_title = dedupe_title.strip() if dedupe_title else None
+
         old_text = ""
         async with self._session() as session:
             prop = await session.get(Proposition, proposition_id)
@@ -1378,7 +1389,13 @@ rule. Do not rewrite candidates and do not include their text in your response.
             old_text = prop.text
             ov = await self._get_or_make_override(session, proposition_id)
             ov.dismissed = True
-            if not ov.dedupe_key:
+            # Key off the client-supplied displayed title (matched by
+            # apply_overrides via _dedupe_key(c.title)) so a dismissal re-binds
+            # after re-inference gives the proposition a new id; fall back to any
+            # existing title/key or the full sentence.
+            if dedupe_title:
+                ov.dedupe_key = _dedupe_key(dedupe_title)
+            elif not ov.dedupe_key:
                 ov.dedupe_key = _dedupe_key(ov.title or old_text)
 
         parts = [

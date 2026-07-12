@@ -396,7 +396,9 @@ async def cmd_agenda(args) -> None:
 
     g = gum(_user_name(args) or "default", _text_model(args))
     await g.connect_db()
-    commitments = await build_agenda(g, limit=args.limit, window_days=args.window)
+    commitments = await build_agenda(
+        g, limit=args.limit, window_days=args.window, now=datetime.now().astimezone()
+    )
 
     # The model-written text fields (title/source/proposition_text) carry PII;
     # scrub them before they leave the process when sanitization is on. The

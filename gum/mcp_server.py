@@ -326,7 +326,10 @@ def build_mcp(gum_instance: gum, *, sanitize: bool = True) -> FastMCP:
         limit = max(1, min(int(limit), 50))
         window = None if window_days is None else max(0, int(window_days))
         commitments = await build_agenda(
-            gum_instance, limit=limit, window_days=window
+            gum_instance,
+            limit=limit,
+            window_days=window,
+            now=datetime.now().astimezone(),
         )
         items = [
             await _serialize_commitment(c, sanitizer) for c in commitments

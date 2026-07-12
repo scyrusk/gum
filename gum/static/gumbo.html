@@ -831,6 +831,11 @@
     else if (due && due !== (item.dataset.due || '')) body.due_date = due;
     if (status && status !== (item.dataset.status || '')) body.status = status;
     if (!Object.keys(body).length) { cancelAgEdit(item); return; }
+    // For proposition-backed items, send the currently-displayed model title
+    // (unchanged even when the user renames) so the server keys the override's
+    // dedupe_key off it and can re-bind after re-inference churns the id. Added
+    // items (item_id) are keyed by row id and must not send it.
+    if (!item.dataset.itemId) body.dedupe_title = item.dataset.title || '';
     const btn = item.querySelector('.ag-save');
     btn.disabled = true;
     try {
@@ -852,7 +857,12 @@
     const btn = item.querySelector('.ag-dismiss');
     if (btn) btn.disabled = true;
     try {
-      const r = await fetch(base + '/dismiss', { method: 'POST' });
+      // Proposition-backed dismissals carry the displayed title so the override
+      // re-binds after the proposition id churns; added items (item_id) don't.
+      const dismissUrl = item.dataset.itemId
+        ? base + '/dismiss'
+        : base + '/dismiss?dedupe_title=' + encodeURIComponent(item.dataset.title || '');
+      const r = await fetch(dismissUrl, { method: 'POST' });
       if (!r.ok) throw new Error('HTTP ' + r.status);
       const data = await r.json();
       if (!data.ok) throw new Error('failed');

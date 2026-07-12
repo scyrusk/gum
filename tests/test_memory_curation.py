@@ -265,6 +265,29 @@ class AgendaOverrideMethodTests(_Base):
             self.assertFalse(await self.gum.apply_agenda_override(999_999, title="x"))
             self.assertFalse(await self.gum.dismiss_agenda_item(999_999))
 
+    async def test_due_only_edit_keys_dedupe_off_displayed_title(self):
+        # A due-date-only edit sends no title, but the client supplies the
+        # displayed model title so the override's dedupe_key can re-bind after
+        # re-inference churns the proposition id (matched by _dedupe_key(c.title)).
+        from gum.agenda import _dedupe_key
+
+        pid = await self._seed_prop_with_obs("Submit the grant by 2026-07-20", 1)
+        with mock.patch.object(self.gum.batcher, "push"):
+            await self.gum.apply_agenda_override(
+                pid, due_date="2026-08-15", dedupe_title="Submit the grant"
+            )
+        ov = await self._one_override()
+        self.assertEqual(ov.dedupe_key, _dedupe_key("Submit the grant"))
+
+    async def test_dismiss_keys_dedupe_off_displayed_title(self):
+        from gum.agenda import _dedupe_key
+
+        pid = await self._seed_prop_with_obs("Reorganize the desktop icons", 1)
+        with mock.patch.object(self.gum.batcher, "push"):
+            await self.gum.dismiss_agenda_item(pid, dedupe_title="Reorganize icons")
+        ov = await self._one_override()
+        self.assertEqual(ov.dedupe_key, _dedupe_key("Reorganize icons"))
+
     async def test_edit_does_not_hold_batch_lock(self):
         pid = await self._seed_prop_with_obs("stays responsive", 1)
         with mock.patch.object(self.gum.batcher, "push"):
