@@ -1448,7 +1448,11 @@ rule. Do not rewrite candidates and do not include their text in your response.
             rows = (await session.execute(select(AgendaOverride))).scalars().all()
             out: List[dict] = []
             for ov in rows:
-                prop = await session.get(Proposition, ov.proposition_id)
+                prop = (
+                    await session.get(Proposition, ov.proposition_id)
+                    if ov.proposition_id is not None
+                    else None
+                )
                 snap = None
                 if prop is not None:
                     snap = {

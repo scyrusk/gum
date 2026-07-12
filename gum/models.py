@@ -229,19 +229,28 @@ class AgendaOverride(Base):
     ``due_date_cleared`` distinguishes an explicit "no fixed date" from "date not
     overridden". ``dedupe_key`` is a normalized-title snapshot
     (:func:`gum.agenda._dedupe_key`) used as a *fallback* match: the GUM's
-    SIMILAR→revise path deletes-and-replaces a proposition with a **new** id,
-    which cascades this row away by ``proposition_id``; matching on the stable
-    normalized title lets a live override re-bind to the replacement proposition
-    the next time the radar surfaces it.
+    SIMILAR→revise path deletes-and-replaces a proposition with a **new** id.
+    Rather than cascade this row away with the old proposition, the foreign key
+    is ``ON DELETE SET NULL`` so the override **survives** — ``proposition_id``
+    goes to NULL while ``dedupe_key`` is retained — letting
+    :func:`gum.agenda.apply_overrides` re-bind the edit by normalized title to
+    the replacement commitment the next time the radar surfaces it. A correctly
+    re-bound row would be pointless if it had been deleted first; surviving as an
+    orphan is what makes the title fallback able to fire at all.
+
+    Tradeoff: a user "Forget" also leaves an orphan (``proposition_id`` NULL)
+    that matches nothing unless a future commitment's title happens to collide —
+    accepted as a small, rare cost. SQLite treats NULLs as distinct under the
+    ``unique`` constraint, so multiple orphaned rows coexist fine.
 
     Auto-created by :func:`init_db` via ``Base.metadata.create_all`` (same as
     :class:`PropositionFeedback`); no FTS index is needed.
 
     Attributes:
         id (int): Primary key.
-        proposition_id (int): Source proposition — unique, one override per
-            proposition (repeated edits merge onto the same row). Cascade-deleted
-            with the proposition.
+        proposition_id (Optional[int]): Source proposition — unique, one override
+            per proposition (repeated edits merge onto the same row). Set to NULL
+            (orphaned, kept alive) when the proposition is deleted/revised.
         dedupe_key (Optional[str]): Normalized-title snapshot for fallback match.
         title (Optional[str]): Overridden title, or None.
         status (Optional[str]): Overridden status guess, or None.
@@ -253,9 +262,9 @@ class AgendaOverride(Base):
     __tablename__ = "agenda_overrides"
 
     id:               Mapped[int]           = mapped_column(primary_key=True)
-    proposition_id:   Mapped[int]           = mapped_column(
-        ForeignKey("propositions.id", ondelete="CASCADE"),
-        nullable=False, unique=True, index=True,
+    proposition_id:   Mapped[Optional[int]] = mapped_column(
+        ForeignKey("propositions.id", ondelete="SET NULL"),
+        unique=True, index=True,
     )
     dedupe_key:       Mapped[Optional[str]] = mapped_column(String(200), index=True)
     title:            Mapped[Optional[str]] = mapped_column(Text)
