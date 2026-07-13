@@ -84,6 +84,7 @@ class SuggestionsEndpointTests(unittest.IsolatedAsyncioTestCase):
                 resp = client.get("/suggestions")
         self.assertEqual(resp.status_code, 200)
         body = resp.json()
+        self.assertFalse(body["execution_enabled"])
         sugs = body["suggestions"]
         # Ranked by expected utility: the high-value one is first and surfaced.
         self.assertEqual(len(sugs), 2)
@@ -410,6 +411,16 @@ class SuggestionsEndpointTests(unittest.IsolatedAsyncioTestCase):
             body = client.get("/gumbo").text
         self.assertIn("/suggestions/chat", body)
         self.assertIn("Start Chat", body)
+
+    def test_gumbo_page_has_edit_execute_and_review_controls(self):
+        app = create_app(self.gum, execute=True)
+        with TestClient(app) as client:
+            body = client.get("/gumbo").text
+        self.assertIn("execute-suggestion", body)
+        self.assertIn("Additional execution instructions", body)
+        self.assertIn("/suggestions/execute", body)
+        self.assertIn("Approve", body)
+        self.assertIn("Reject", body)
 
     def test_sanitize_scrubs_suggestion_text(self):
         # Under --sanitize, the model-written text is pseudonymized on the way out

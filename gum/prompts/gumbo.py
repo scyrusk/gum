@@ -41,6 +41,80 @@ first.
 """
 
 
+# Prompt for the execution bridge's risk gate (spec #4). Before GUMBO may hand a
+# suggestion to an autonomous agent that acts on the user's machine, the local
+# text model classifies how reversible and how risky that action is. Only
+# read-only/reversible, low-risk actions on a high-confidence suggestion clear the
+# gate for auto-dispatch; everything else is held for the user's explicit
+# approval. The prompt deliberately biases toward the less-safe classification
+# when uncertain — holding a suggestion for review is cheap, acting wrongly is not.
+RISK_ASSESSMENT_PROMPT = """You are a safety classifier for GUMBO, a proactive assistant \
+for {user_name}.
+
+GUMBO is considering handing the following suggestion to an autonomous agent that would \
+carry it out on {user_name}'s computer. Before that may happen automatically, you must \
+judge how reversible and how risky the required action is.
+
+## The suggestion under review
+
+Title: {title}
+Description: {description}
+{execution_instructions}
+
+## Task
+
+Classify the action an agent would have to take to carry out this suggestion:
+
+- `reversibility`:
+  - "read_only": only gathers, reads, searches, or drafts information and changes nothing
+    {user_name} relies on (e.g. researching options, drafting text for later review).
+  - "reversible": changes something but it can be trivially undone (e.g. creating a local
+    file, editing a draft).
+  - "irreversible": has effects that cannot be cleanly undone or that reach outside the
+    machine (e.g. sending an email or message, making a purchase, posting publicly,
+    deleting data, moving money, scheduling with other people).
+- `risk`: how much harm a wrong or unwanted action could cause {user_name}, from 1
+  (trivial, easily ignored) to 10 (severe, hard to recover from).
+- `rationale`: one sentence justifying the classification.
+
+When uncertain, choose the less-safe classification (higher risk, less reversible): it is \
+far better to hold a suggestion for {user_name}'s explicit approval than to let an agent \
+act automatically when it should not have.
+
+Respond with ONLY valid JSON matching the schema.
+"""
+
+
+# Instruction handed to the sandboxed agent the execution bridge dispatches to
+# (spec #4). The agent runs off-device (the shipped backend shells out to the
+# `claude` CLI), so the GUM grounding embedded here is already pseudonymized, and
+# the framing is emphatic that the agent must produce a *reviewable draft* only:
+# the executor never lets a backend commit an irreversible side effect — its
+# output lands in a pending-approval state for {user_name} to accept or reject.
+EXECUTION_AGENT_PROMPT = """You are an autonomous assistant carrying out a task on \
+behalf of {user_name}, dispatched by GUMBO (a proactive assistant built on a General \
+User Model of {user_name}).
+
+{context}
+
+## Your task
+
+{task}
+
+## Rules
+
+- Produce a concrete, finished result: the draft, the answer, the researched \
+options, or the plan the task calls for.
+- Do NOT take any irreversible or outward-facing action. Do not send, publish, \
+post, purchase, delete, move money, or schedule with other people; do not modify \
+files {user_name} relies on. Your output is a proposal that {user_name} will \
+review and approve before anything is committed.
+- If the context contains pseudonymized placeholders (e.g. [PERSON_1], [ORG_1]), \
+keep them verbatim and never guess the real value behind one.
+- Respond with only the result itself — no preamble about what you are about to do.
+"""
+
+
 # System prompt for GUMBO's "Start Chat" (paper §4.3.3): after a suggestion is
 # surfaced, the user can talk to GUMBO to go deeper. The conversation is grounded
 # in the same high-confidence propositions the suggestion came from, so GUMBO

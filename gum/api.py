@@ -10,20 +10,30 @@
 # downstream / off-device consumers (e.g. a frontier model behind the MCP) never
 # see raw identities. This posture is fail-closed — if the sanitizer cannot load,
 # the server refuses to start rather than serving raw data.
+#
+# The API is read-oriented, with a few write routes that feed signal back into the
+# GUM (proposition review, suggestion feedback). The one route that can *run* an
+# agent — the execution bridge (spec #4) at POST /suggestions/execute — is gated
+# behind an explicit, default-OFF opt-in (`execute=True` / GUMBO_EXECUTION_ENABLED)
+# and still only ever produces a draft held for the user's approval.
 
 from __future__ import annotations
 
 import asyncio
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from fastapi import FastAPI, Query
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
 from .gum import gum
-from .gumbo import Gumbo, Suggestion
+from .gumbo import Gumbo, Suggestion, expected_utility
 from .models import FEEDBACK_RATINGS, Observation, Proposition
+from .schemas import SuggestionItem
+
+if TYPE_CHECKING:  # avoid pulling gum.executor (and the CLI backend) at import time
+    from .executor import ExecutionOutcome
 
 _STATIC_DIR = Path(__file__).parent / "static"
 
@@ -70,6 +80,12 @@ class SuggestionChatIn(BaseModel):
     focus: str | None = None  # active project tab, if any
 
 
+class SuggestionExecuteIn(BaseModel):
+    focus: str | None = None  # active project tab, if any
+    suggestion: SuggestionItem | None = None  # exact card to execute, if supplied
+    comments: str | None = None  # optional user guidance for this execution only
+
+
 async def _scrub(text: str | None, sanitizer) -> str | None:
     """Pseudonymize *text* when a sanitizer is active, else return it unchanged."""
     if sanitizer is None or not text:
@@ -87,6 +103,14 @@ async def _scrub_fragment(text: str | None, sanitizer) -> str | None:
     if sanitizer is None or not text:
         return text
     return await asyncio.to_thread(sanitizer.sanitize_fragment, text)
+
+
+async def _rehydrate(text: str | None, sanitizer) -> str | None:
+    """Restore known pseudo-IDs in trusted inbound UI text before local use."""
+    if sanitizer is None or not text:
+        return text
+    restored, _ = await asyncio.to_thread(sanitizer.rehydrate, text)
+    return restored
 
 
 async def _serialize_proposition(
@@ -155,6 +179,33 @@ async def _serialize_commitment(commitment, sanitizer) -> dict[str, Any]:
     return data
 
 
+async def _serialize_outcome(outcome: "ExecutionOutcome", sanitizer) -> dict[str, Any]:
+    """Serialize an execution-bridge outcome for the API's approval surface.
+
+    The gate fields (reversibility class, numeric risk, status) carry no PII and
+    pass through unchanged; the model-written text — the suggestion's title/
+    description/rationale, the risk rationale, failure reason, and backend error —
+    is pseudonymized when a sanitizer is active. A successful agent ``output`` is
+    deliberately *not* scrubbed here: the executor has already rehydrated that
+    local-only review artifact so this approval surface shows the user real entity
+    names. The grounding ``context`` is already egress-pseudonymized by the executor
+    itself (its own fail-closed sanitizer), so it is not scrubbed a second time here.
+    """
+    data = outcome.to_dict()
+    sug = data.get("suggestion") or {}
+    for field in ("title", "description", "rationale"):
+        if field in sug:
+            sug[field] = await _scrub(sug.get(field), sanitizer)
+    if data.get("assessment"):
+        data["assessment"]["rationale"] = await _scrub(
+            data["assessment"].get("rationale"), sanitizer
+        )
+    data["reason"] = await _scrub(data.get("reason"), sanitizer)
+    if data.get("result"):
+        data["result"]["error"] = await _scrub(data["result"].get("error"), sanitizer)
+    return data
+
+
 async def _serialize_observation(obs: Observation, sanitizer) -> dict[str, Any]:
     return {
         "id": obs.id,
@@ -165,12 +216,20 @@ async def _serialize_observation(obs: Observation, sanitizer) -> dict[str, Any]:
     }
 
 
-def create_app(gum_instance: gum, *, sanitize: bool = False) -> FastAPI:
+def create_app(
+    gum_instance: gum, *, sanitize: bool = False, execute: bool | None = None
+) -> FastAPI:
     """Build the FastAPI app backed by a live `gum` instance.
 
     When *sanitize* is True the sanitizer is loaded eagerly (fail-closed): if the
     model or its dependencies are missing, this raises so the server never comes up
     serving raw PII.
+
+    *execute* opts the server into the execution bridge (spec #4): when enabled,
+    POST /suggestions/execute may dispatch surface-worthy, gate-clearing
+    suggestions to a sandboxed agent and return reviewable drafts. It is default-OFF
+    — ``None`` defers to the ``GUMBO_EXECUTION_ENABLED`` env var (also default-OFF);
+    while disabled the route exists but refuses to run anything.
     """
     sanitizer = None
     if sanitize:
@@ -180,13 +239,15 @@ def create_app(gum_instance: gum, *, sanitize: bool = False) -> FastAPI:
 
     app = FastAPI(
         title="GUM Local API",
-        description="Read-only local interface to your General User Model.",
+        description="Local interface to your General User Model.",
         version="1.0.0",
     )
 
     # GUMBO suggestion engine over the same live GUM. Cheap to construct and does
-    # no I/O until asked, so one shared instance is reused across requests.
-    gumbo = Gumbo(gum_instance)
+    # no I/O until asked, so one shared instance is reused across requests. The
+    # execution bridge is threaded through here (default-OFF); passing None lets
+    # Gumbo resolve the GUMBO_EXECUTION_ENABLED env flag itself.
+    gumbo = Gumbo(gum_instance, execution_enabled=execute)
 
     @app.get("/health")
     async def health() -> dict[str, Any]:
@@ -300,6 +361,7 @@ def create_app(gum_instance: gum, *, sanitize: bool = False) -> FastAPI:
         results = results[:limit]
         return {
             "focus": focus,
+            "execution_enabled": gumbo.execution_enabled,
             "suggestions": [await _serialize_suggestion(s, sanitizer) for s in results],
         }
 
@@ -462,6 +524,79 @@ def create_app(gum_instance: gum, *, sanitize: bool = False) -> FastAPI:
         ok = await gum_instance.set_agenda_item_dismissed(item_id, False)
         return {"ok": ok}
 
+    @app.post("/suggestions/execute")
+    async def suggestions_execute(
+        body: SuggestionExecuteIn | None = None,
+    ) -> dict[str, Any]:
+        # Execution bridge (spec #4), default-OFF. A request with an exact
+        # suggestion is the user-driven card flow: it skips proactive relevance
+        # throttles but retains the reversible/low-risk action gate. A request
+        # without one preserves the original generated, rate-limited batch flow.
+        # Both return reviewable drafts; nothing irreversible is committed.
+        if not gumbo.execution_enabled:
+            return {
+                "ok": False,
+                "enabled": False,
+                "error": "execution bridge is disabled; start the server with "
+                "execute=True (or GUMBO_EXECUTION_ENABLED=1) to opt in",
+            }
+        focus = (body.focus.strip() if body and body.focus else "") or None
+        try:
+            if body and body.suggestion is not None:
+                item = body.suggestion
+                title = (await _rehydrate(item.title.strip(), sanitizer) or "").strip()
+                description = (
+                    await _rehydrate(item.description.strip(), sanitizer) or ""
+                ).strip()
+                rationale = (
+                    await _rehydrate(item.rationale.strip(), sanitizer) or ""
+                ).strip()
+                comments = (
+                    await _rehydrate((body.comments or "").strip(), sanitizer) or ""
+                ).strip() or None
+                if not title or not description:
+                    return {
+                        "ok": False,
+                        "enabled": True,
+                        "error": "suggestion title and description cannot be blank",
+                    }
+                utility, should_surface = expected_utility(
+                    item.probability_useful,
+                    item.benefit,
+                    item.cost_if_wrong,
+                    item.cost_if_missed,
+                )
+                suggestion = Suggestion(
+                    title=title,
+                    description=description,
+                    rationale=rationale,
+                    probability_useful=item.probability_useful,
+                    benefit=item.benefit,
+                    cost_if_wrong=item.cost_if_wrong,
+                    cost_if_missed=item.cost_if_missed,
+                    expected_utility=utility,
+                    should_surface=should_surface,
+                )
+                outcome = await gumbo.execute_suggestion(
+                    suggestion,
+                    user_instructions=comments,
+                    explicit=True,
+                )
+                outcomes = [outcome] if outcome is not None else []
+            else:
+                outcomes = await gumbo.execute(focus=focus)
+        except Exception as exc:  # local model / backend transport error
+            return {"ok": False, "enabled": True, "error": f"execution failed: {exc}"}
+        return {
+            "ok": True,
+            "enabled": True,
+            "focus": focus or "",
+            # How many actually produced an agent draft awaiting approval; the rest
+            # stayed proposal-only (gate declined) or failed.
+            "dispatched": sum(1 for o in outcomes if o.is_pending_approval),
+            "outcomes": [await _serialize_outcome(o, sanitizer) for o in outcomes],
+        }
+
     # ── GUMBO assistant desktop UI ────────────────────────────────────────
     @app.get("/gumbo", response_class=HTMLResponse)
     async def gumbo_page() -> str:
@@ -508,16 +643,25 @@ def create_app(gum_instance: gum, *, sanitize: bool = False) -> FastAPI:
     return app
 
 
-def build_server(gum_instance: gum, host: str = "127.0.0.1", port: int = 8422, *, sanitize: bool = False):
+def build_server(
+    gum_instance: gum,
+    host: str = "127.0.0.1",
+    port: int = 8422,
+    *,
+    sanitize: bool = False,
+    execute: bool | None = None,
+):
     """Build a uvicorn Server for the API (caller awaits ``server.serve()``).
 
     Host defaults to 127.0.0.1 so the API is never exposed off-machine. When
     *sanitize* is True, all responses are pseudonymized (fail-closed at build).
+    *execute* opts the server into the default-OFF execution bridge (spec #4);
+    ``None`` defers to the ``GUMBO_EXECUTION_ENABLED`` env var.
     """
     import uvicorn
 
     config = uvicorn.Config(
-        create_app(gum_instance, sanitize=sanitize),
+        create_app(gum_instance, sanitize=sanitize, execute=execute),
         host=host,
         port=port,
         log_level="warning",

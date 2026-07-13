@@ -89,7 +89,7 @@
   .score b { font-weight: 800; }
   .eu { margin-left: auto; font-size: 12px; color: var(--muted); font-weight: 600; align-self: center; }
 
-  .actions { display: flex; align-items: center; gap: 8px; margin-top: 16px;
+  .actions { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; margin-top: 16px;
              padding-top: 14px; border-top: 1px solid var(--border); }
   .fb-label { font-size: 13px; color: var(--muted); margin-right: 2px; }
   .fb { border: 1px solid var(--border); border-radius: 9px; background: var(--card); color: var(--text);
@@ -105,6 +105,43 @@
              font-weight: 600; cursor: pointer; }
   .chatbtn:hover { filter: brightness(1.08); }
   .chatbtn:active { transform: translateY(1px); }
+  .card-actions { margin-left: auto; display: inline-flex; align-items: center; gap: 7px; }
+  .card-actions .chatbtn { margin-left: 0; }
+  .edit-suggestion, .execute-suggestion, .exec-decision, .exec-retry {
+    border: 1px solid var(--border); border-radius: 9px; background: var(--card); color: var(--text);
+    padding: 6px 12px; font: inherit; font-size: 13px; font-weight: 600; cursor: pointer;
+  }
+  .edit-suggestion:hover, .exec-retry:hover { border-color: var(--accent); }
+  .execute-suggestion { border-color: var(--accent); background: var(--accent); color: #fff; }
+  .execute-suggestion:hover { filter: brightness(1.08); }
+  .execute-suggestion:disabled, .edit-suggestion:disabled { opacity: .5; cursor: default; }
+  .execution-editor { margin-top: 14px; padding: 14px; border: 1px solid var(--border);
+                      border-radius: 12px; background: var(--bg); }
+  .execution-editor label { display: block; color: var(--muted); font-size: 12px; font-weight: 650;
+                            margin: 0 0 5px; }
+  .execution-editor input, .execution-editor textarea { width: 100%; border: 1px solid var(--border);
+                            border-radius: 9px; background: var(--card); color: var(--text);
+                            padding: 8px 10px; font: inherit; font-size: 14px; margin-bottom: 10px; }
+  .execution-editor input:focus, .execution-editor textarea:focus { outline: none; border-color: var(--accent); }
+  .execution-editor textarea { resize: vertical; min-height: 70px; }
+  .execution-help { color: var(--muted); font-size: 12px; margin: -2px 0 0; }
+  .execution-result { margin-top: 14px; padding: 14px; border: 1px solid var(--border);
+                      border-radius: 12px; background: var(--bg); }
+  .execution-result.pending_approval { border-color: var(--surface); }
+  .exec-head { display: flex; align-items: center; gap: 8px; font-size: 14px; font-weight: 700; }
+  .exec-copy { color: var(--muted); font-size: 13px; margin: 7px 0 0; }
+  .exec-output { white-space: pre-wrap; overflow-wrap: anywhere; margin: 12px 0 0; padding: 13px;
+                 border-radius: 10px; background: var(--card); border: 1px solid var(--border);
+                 color: var(--text); font: 13px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; }
+  .exec-review { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
+  .exec-review-note { color: var(--muted); font-size: 12px; margin-right: auto; }
+  .exec-decision[data-vote="up"] { border-color: var(--surface); color: var(--surface); }
+  .exec-decision[data-vote="down"]:hover { border-color: #c0392b; color: #c0392b; }
+  .exec-decision:disabled { opacity: .5; cursor: default; }
+  .card.executing .execute-suggestion { opacity: .65; cursor: wait; }
+  .execution-banner { margin-bottom: 14px; padding: 11px 14px; border: 1px solid var(--border);
+                      border-radius: 11px; background: var(--chip); color: var(--muted); font-size: 13px; }
+  .execution-banner code { color: var(--text); }
 
   /* "Start Chat" panel (paper §4.3.3) — talk to GUMBO about a suggestion */
   .chat { margin-top: 14px; padding-top: 14px; border-top: 1px solid var(--border); }
@@ -277,6 +314,7 @@
   let active = localStorage.getItem(ACTIVE_KEY) || ALL;
   if (active !== ALL && !projects.includes(active)) active = ALL;
   let busy = false;
+  let executionEnabled = false;
 
   function loadProjects() {
     try { const v = JSON.parse(localStorage.getItem(TABS_KEY)); return Array.isArray(v) ? v : []; }
@@ -349,6 +387,7 @@
       const r = await fetch('/suggestions?' + params.toString());
       if (!r.ok) throw new Error('HTTP ' + r.status);
       const data = await r.json();
+      executionEnabled = !!data.execution_enabled;
       render(data.suggestions || []);
     } catch (e) {
       main.innerHTML = '<div class="center"><h2>Couldn\'t reach GUMBO</h2><p>'
@@ -370,7 +409,12 @@
         </div>`;
       return;
     }
-    main.innerHTML = suggestions.map(cardHtml).join('');
+    const banner = executionEnabled ? '' : `
+      <div class="execution-banner">
+        Execution is currently disabled. Restart GUM with <code>GUMBO_EXECUTION_ENABLED=1</code>
+        to enable the guarded Execute buttons.
+      </div>`;
+    main.innerHTML = banner + suggestions.map(cardHtml).join('');
   }
 
   function scoreChip(label, val) {
@@ -383,11 +427,17 @@
       : '<span class="badge quiet">Keeping quiet</span>';
     const eu = (typeof s.expected_utility === 'number')
       ? `<span class="eu">EU ${s.expected_utility.toFixed(1)}</span>` : '';
-    const attr = (v) => esc(v).replace(/"/g, '&quot;');
+    const attr = (v) => escAttr(String(v ?? ''));
+    const executeTitle = executionEnabled
+      ? 'Execute this suggestion using the reversible, low-risk safety gate'
+      : 'Execution is disabled — restart GUM with GUMBO_EXECUTION_ENABLED=1';
     return `
       <div class="card${s.should_surface ? ' surfaced' : ''}"
            data-title="${attr(s.title || '')}" data-desc="${attr(s.description || '')}"
-           data-rationale="${attr(s.rationale || '')}">
+           data-rationale="${attr(s.rationale || '')}"
+           data-probability-useful="${attr(s.probability_useful)}"
+           data-benefit="${attr(s.benefit)}" data-cost-if-wrong="${attr(s.cost_if_wrong)}"
+           data-cost-if-missed="${attr(s.cost_if_missed)}">
         <div class="card-head">
           <h3 class="title">${esc(s.title)}</h3>
           ${badge}
@@ -401,11 +451,25 @@
           ${scoreChip('Cost if missed', s.cost_if_missed)}
           ${eu}
         </div>
+        <div class="execution-editor" hidden>
+          <label>Suggestion title</label>
+          <input class="exec-title" type="text" value="${attr(s.title || '')}" />
+          <label>What should GUMBO do?</label>
+          <textarea class="exec-description" rows="3">${esc(s.description || '')}</textarea>
+          <label>Additional execution instructions <span style="font-weight:400">(optional)</span></label>
+          <textarea class="exec-comments" rows="3" placeholder="Add constraints, preferences, or context for the model…"></textarea>
+          <p class="execution-help">These edits apply only to this run. Comments are included in the safety check and agent instructions.</p>
+        </div>
+        <div class="execution-result" hidden></div>
         <div class="actions">
           <span class="fb-label">Was this useful?</span>
           <button class="fb" data-vote="up" title="Helpful — GUMBO learns from this">👍</button>
           <button class="fb" data-vote="down" title="Not helpful — GUMBO learns from this">👎</button>
-          <button class="chatbtn" data-action="chat" title="Talk to GUMBO about this suggestion">💬 Start Chat</button>
+          <span class="card-actions">
+            <button class="edit-suggestion" title="Edit this suggestion and add execution instructions">✎ Edit</button>
+            <button class="execute-suggestion" ${executionEnabled ? '' : 'disabled'} title="${attr(executeTitle)}">▶ Execute</button>
+            <button class="chatbtn" data-action="chat" title="Talk to GUMBO about this suggestion">💬 Start Chat</button>
+          </span>
         </div>
       </div>`;
   }
@@ -930,7 +994,195 @@
     }
   }
 
+  // ── Edit + execute ────────────────────────────────────────────────────────
+  // Card edits are deliberately ephemeral: they shape this execution request
+  // without rewriting GUM memory or the next batch of generated suggestions.
+  function syncSuggestionEditor(card) {
+    const title = card.querySelector('.exec-title').value.trim();
+    const description = card.querySelector('.exec-description').value.trim();
+    if (!title || !description) return false;
+    card.dataset.title = title;
+    card.dataset.desc = description;
+    card.querySelector('.title').textContent = title;
+    let desc = card.querySelector('.desc');
+    if (!desc) {
+      desc = document.createElement('p');
+      desc.className = 'desc';
+      card.querySelector('.card-head').after(desc);
+    }
+    desc.textContent = description;
+    return true;
+  }
+
+  function toggleSuggestionEditor(card) {
+    if (card.classList.contains('executing')) return;
+    const editor = card.querySelector('.execution-editor');
+    const btn = card.querySelector('.edit-suggestion');
+    if (!editor.hidden && !syncSuggestionEditor(card)) {
+      editor.querySelector(!editor.querySelector('.exec-title').value.trim()
+        ? '.exec-title' : '.exec-description').focus();
+      return;
+    }
+    editor.hidden = !editor.hidden;
+    btn.textContent = editor.hidden ? '✎ Edit' : 'Done editing';
+    if (!editor.hidden) editor.querySelector('.exec-title').focus();
+  }
+
+  function execEl(tag, className, text) {
+    const el = document.createElement(tag);
+    if (className) el.className = className;
+    if (text !== undefined) el.textContent = text;
+    return el;
+  }
+
+  function renderExecutionResult(card, outcome) {
+    const panel = card.querySelector('.execution-result');
+    delete panel.dataset.decided;
+    panel.hidden = false;
+    panel.className = 'execution-result ' + (outcome.status || 'failed');
+    panel.replaceChildren();
+
+    const labels = {
+      pending_approval: '✓ Draft ready for review',
+      proposal_only: 'Held by the safety gate',
+      failed: 'Execution failed',
+    };
+    panel.appendChild(execEl('div', 'exec-head', labels[outcome.status] || 'Execution result'));
+
+    if (outcome.assessment) {
+      const a = outcome.assessment;
+      panel.appendChild(execEl(
+        'p', 'exec-copy',
+        `Safety check: ${a.reversibility || 'unknown'}, risk ${a.risk ?? '—'}/10${a.rationale ? ' — ' + a.rationale : ''}`
+      ));
+    }
+
+    if (outcome.status === 'pending_approval' && outcome.result) {
+      panel.appendChild(execEl('pre', 'exec-output', outcome.result.output || '(empty draft)'));
+      const review = execEl('div', 'exec-review');
+      review.appendChild(execEl(
+        'span', 'exec-review-note',
+        'Approval records feedback; it does not commit an external action.'
+      ));
+      const approve = execEl('button', 'exec-decision', 'Approve');
+      approve.dataset.vote = 'up';
+      const reject = execEl('button', 'exec-decision', 'Reject');
+      reject.dataset.vote = 'down';
+      review.append(approve, reject);
+      panel.appendChild(review);
+    } else {
+      panel.appendChild(execEl(
+        'p', 'exec-copy',
+        outcome.reason || 'No agent draft was produced.'
+      ));
+      if (outcome.status === 'failed') {
+        panel.appendChild(execEl('button', 'exec-retry', 'Retry'));
+      }
+    }
+  }
+
+  function renderExecutionError(card, message) {
+    renderExecutionResult(card, { status: 'failed', reason: message });
+  }
+
+  async function executeSuggestion(card) {
+    if (!executionEnabled || card.classList.contains('executing')) return;
+    if (!syncSuggestionEditor(card)) {
+      card.querySelector('.execution-editor').hidden = false;
+      card.querySelector('.edit-suggestion').textContent = 'Done editing';
+      renderExecutionError(card, 'Suggestion title and description are required.');
+      card.querySelector(!card.querySelector('.exec-title').value.trim()
+        ? '.exec-title' : '.exec-description').focus();
+      return;
+    }
+
+    const editor = card.querySelector('.execution-editor');
+    editor.hidden = true;
+    card.querySelector('.edit-suggestion').textContent = '✎ Edit';
+    card.classList.add('executing');
+    const executeBtn = card.querySelector('.execute-suggestion');
+    const editBtn = card.querySelector('.edit-suggestion');
+    executeBtn.disabled = true;
+    editBtn.disabled = true;
+    executeBtn.textContent = 'Executing…';
+    const panel = card.querySelector('.execution-result');
+    panel.hidden = false;
+    panel.className = 'execution-result';
+    panel.replaceChildren(execEl('div', 'exec-head', 'GUMBO is executing this suggestion…'));
+
+    const suggestion = {
+      title: card.dataset.title || '',
+      description: card.dataset.desc || '',
+      rationale: card.dataset.rationale || '',
+      probability_useful: parseInt(card.dataset.probabilityUseful, 10),
+      benefit: parseInt(card.dataset.benefit, 10),
+      cost_if_wrong: parseInt(card.dataset.costIfWrong, 10),
+      cost_if_missed: parseInt(card.dataset.costIfMissed, 10),
+    };
+    const body = {
+      suggestion,
+      comments: card.querySelector('.exec-comments').value.trim() || null,
+    };
+    if (active !== ALL) body.focus = active;
+
+    try {
+      const r = await fetch('/suggestions/execute', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      const data = await r.json();
+      if (!data.ok) throw new Error(data.error || 'execution failed');
+      if (!data.outcomes || !data.outcomes.length) throw new Error('no execution outcome returned');
+      renderExecutionResult(card, data.outcomes[0]);
+    } catch (err) {
+      renderExecutionError(card, err && err.message || String(err));
+    } finally {
+      card.classList.remove('executing');
+      executeBtn.disabled = !executionEnabled;
+      editBtn.disabled = false;
+      executeBtn.textContent = '▶ Execute';
+    }
+  }
+
+  async function decideExecution(card, vote, button) {
+    const panel = card.querySelector('.execution-result');
+    if (panel.dataset.decided) return;
+    const buttons = [...panel.querySelectorAll('.exec-decision')];
+    buttons.forEach(b => { b.disabled = true; });
+    const body = {
+      title: card.dataset.title || '',
+      description: card.dataset.desc || '',
+      vote,
+    };
+    if (active !== ALL) body.focus = active;
+    try {
+      const r = await fetch('/suggestions/feedback', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      const data = await r.json();
+      if (!data.ok) throw new Error(data.error || 'feedback failed');
+      panel.dataset.decided = vote;
+      button.textContent = vote === 'up' ? 'Approved ✓' : 'Rejected';
+    } catch (err) {
+      buttons.forEach(b => { b.disabled = false; });
+      button.textContent = 'Couldn\'t save — retry';
+    }
+  }
+
   main.addEventListener('click', (e) => {
+    const decision = e.target.closest('.exec-decision');
+    if (decision) { decideExecution(decision.closest('.card'), decision.dataset.vote, decision); return; }
+    const retry = e.target.closest('.exec-retry');
+    if (retry) { executeSuggestion(retry.closest('.card')); return; }
+    const executeBtn = e.target.closest('.execute-suggestion');
+    if (executeBtn) { executeSuggestion(executeBtn.closest('.card')); return; }
+    const editBtn = e.target.closest('.edit-suggestion');
+    if (editBtn) { toggleSuggestionEditor(editBtn.closest('.card')); return; }
     const chatBtn = e.target.closest('.chatbtn');
     if (chatBtn) { toggleChat(chatBtn.closest('.card')); return; }
     const btn = e.target.closest('.fb');

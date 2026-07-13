@@ -299,5 +299,160 @@ class GumboEngineTests(unittest.IsolatedAsyncioTestCase):
         sc.assert_not_called()  # no model call when there's nothing to ground on
 
 
+class _RecordingExecutor:
+    """Test double for the execution bridge: records what it was asked to run."""
+
+    def __init__(self):
+        self.dispatched: list = []
+        self.options: list = []
+
+    async def dispatch(self, suggestion, **kwargs):
+        self.dispatched.append(suggestion)
+        self.options.append(kwargs)
+        return {"suggestion": suggestion.title, "status": "pending_approval"}
+
+
+class GumboExecuteTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.gum = Gum("Omar", "dummy-model", data_directory=self._tmp.name, db_name="test.db")
+        await self.gum.connect_db()
+        async with self.gum._session() as s:
+            s.add_all([
+                _prop("Omar is going to a friend's wedding in Chicago", 8),
+                _prop("Omar doesn't own suitable formal wear", 7),
+            ])
+
+    async def asyncTearDown(self):
+        if self.gum.engine is not None:
+            await self.gum.engine.dispose()
+        self._tmp.cleanup()
+
+    def _one_surfaced_completion(self):
+        async def fake_completion(client, model, messages, schema, **kwargs):
+            return SuggestionSchema(suggestions=[
+                SuggestionItem(
+                    title="Rent a suit in Chicago",
+                    description="Find a suit rental shop near the wedding venue.",
+                    rationale="Wedding + no formal wear.",
+                    probability_useful=9, benefit=9, cost_if_wrong=2, cost_if_missed=7,
+                ),
+            ])
+        return fake_completion
+
+    async def test_execute_off_by_default_is_a_noop(self):
+        # Default-OFF: execute() dispatches nothing and never touches the executor,
+        # even when a worthy suggestion exists.
+        executor = _RecordingExecutor()
+        engine = Gumbo(self.gum, min_confidence=7, executor=executor)
+        self.assertFalse(engine.execution_enabled)
+        with mock.patch("gum.gumbo.structured_completion", side_effect=self._one_surfaced_completion()):
+            outcomes = await engine.execute()
+        self.assertEqual(outcomes, [])
+        self.assertEqual(executor.dispatched, [])
+
+    async def test_execute_dispatches_worthy_suggestions_when_enabled(self):
+        executor = _RecordingExecutor()
+        engine = Gumbo(
+            self.gum, min_confidence=7, execution_enabled=True, executor=executor,
+        )
+        with mock.patch("gum.gumbo.structured_completion", side_effect=self._one_surfaced_completion()):
+            outcomes = await engine.execute()
+        self.assertEqual(len(outcomes), 1)
+        self.assertEqual([s.title for s in executor.dispatched], ["Rent a suit in Chicago"])
+        self.assertEqual(outcomes[0]["status"], "pending_approval")
+
+    async def test_execute_preserves_token_bucket_rate_limit(self):
+        # execute() runs the same rate-limited pipeline as surface(): the token
+        # bucket that caps surfacing also caps how many suggestions can act.
+        t = [0.0]
+        executor = _RecordingExecutor()
+        engine = Gumbo(
+            self.gum, min_confidence=7, execution_enabled=True, executor=executor,
+            surface_interval=60, clock=lambda: t[0],
+        )
+        with mock.patch("gum.gumbo.structured_completion", side_effect=self._one_surfaced_completion()):
+            first = await engine.execute()
+            self.assertEqual(len(first), 1)
+            # A second call within the same interval is throttled — nothing dispatched.
+            self.assertEqual(await engine.execute(), [])
+        self.assertEqual(len(executor.dispatched), 1)
+
+    async def test_execute_env_flag_enables_bridge(self):
+        executor = _RecordingExecutor()
+        with mock.patch.dict("os.environ", {"GUMBO_EXECUTION_ENABLED": "1"}):
+            engine = Gumbo(self.gum, min_confidence=7, executor=executor)
+        self.assertTrue(engine.execution_enabled)
+        with mock.patch("gum.gumbo.structured_completion", side_effect=self._one_surfaced_completion()):
+            outcomes = await engine.execute()
+        self.assertEqual(len(outcomes), 1)
+
+    async def test_execute_suggestion_dispatches_exact_card_with_instructions(self):
+        executor = _RecordingExecutor()
+        engine = Gumbo(self.gum, execution_enabled=True, executor=executor)
+        item = (await self._one_surfaced_completion()(None, None, None, None)).suggestions[0]
+        utility, should_surface = expected_utility(
+            item.probability_useful, item.benefit, item.cost_if_wrong, item.cost_if_missed
+        )
+        suggestion = Suggestion(
+            **item.model_dump(),
+            expected_utility=utility,
+            should_surface=should_surface,
+        )
+        outcome = await engine.execute_suggestion(
+            suggestion, user_instructions="Use a table.", explicit=True
+        )
+        self.assertEqual(outcome["suggestion"], suggestion.title)
+        self.assertEqual(executor.dispatched, [suggestion])
+        self.assertEqual(
+            executor.options,
+            [{"user_instructions": "Use a table.", "explicit": True}],
+        )
+
+
+class SuggestionItemBoundsTests(unittest.TestCase):
+    """The four suggestion scores are contractually 1–10; the schema enforces it.
+
+    These scores are gate inputs to the execution bridge: ``probability_useful``
+    is read raw by ``Executor.is_auto_dispatchable`` (a malformed high value like
+    100 would clear the ``probability_useful < min_probability`` confidence bar on
+    a bogus score), and ``benefit``/``cost_if_wrong``/``cost_if_missed`` feed the
+    ``expected_utility``/``should_surface`` decision the gate also depends on
+    (only ``p`` is clamped there, so an out-of-range ``benefit`` could flip
+    ``should_surface``). Enforcing the range rejects a malformed score at
+    validation — driving ``structured_completion``'s retries — instead of letting
+    it sail through the auto-dispatch gate, mirroring ``RiskAssessmentSchema.risk``.
+    """
+
+    def _item(self, **overrides):
+        fields = dict(
+            title="t", description="d", rationale="r",
+            probability_useful=9, benefit=9, cost_if_wrong=2, cost_if_missed=7,
+        )
+        fields.update(overrides)
+        return SuggestionItem(**fields)
+
+    def test_in_range_scores_are_accepted(self):
+        for score in (1, 5, 10):
+            self._item(
+                probability_useful=score, benefit=score,
+                cost_if_wrong=score, cost_if_missed=score,
+            )
+
+    def test_out_of_range_scores_are_rejected(self):
+        from pydantic import ValidationError
+
+        for field in ("probability_useful", "benefit", "cost_if_wrong", "cost_if_missed"):
+            for score in (0, -1, 11, 99):
+                with self.assertRaises(ValidationError):
+                    self._item(**{field: score})
+
+    def test_json_schema_carries_the_bounds_for_the_model(self):
+        props = SuggestionItem.model_json_schema()["properties"]
+        for field in ("probability_useful", "benefit", "cost_if_wrong", "cost_if_missed"):
+            self.assertEqual(props[field]["minimum"], 1, field)
+            self.assertEqual(props[field]["maximum"], 10, field)
+
+
 if __name__ == "__main__":
     unittest.main()
