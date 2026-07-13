@@ -102,7 +102,7 @@ pip install "gum-ai[tray]"      # one-time: adds rumps
 gum tray                        # 🧠 appears in the menu bar (💤 when stopped)
 ```
 
-From the menu you can **Start / Stop GUM**, **Search GUM…** (results in a pop-up), skim **Recent Propositions** (click one for its full reasoning and confidence), **Open Review UI**, or **Open Logs**. It drives the same daemon and localhost API as the CLI, so it works alongside everything above.
+From the menu you can **Start / Stop GUM**, **Search GUM…** (results in a pop-up), skim **Recent Propositions** (click one for its full reasoning and confidence), **Open GUMBO Assistant**, **Open Agenda** (your editable commitment & deadline radar), **Open Review UI**, or **Open Logs**. It drives the same daemon and localhost API as the CLI, so it works alongside everything above.
 
 #### Launch it at login
 
