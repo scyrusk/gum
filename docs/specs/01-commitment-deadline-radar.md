@@ -44,3 +44,20 @@ standing artifact. Read `paper/gum.pdf` §4.2 for framing.
 - The MCP `agenda` resource returns sanitized output.
 - Add unit tests under `tests/` mirroring existing test style; full suite passes; lint clean.
 - Update `docs/` and README with the new command.
+
+## Later extension — editable agenda
+
+The editable-agenda work (the tray-reachable Agenda page in `gumbo.html`)
+intentionally relaxes the read-only "no schema migrations, no new DB tables"
+constraint above. It adds two small tables:
+
+- `agenda_overrides` — persists a user's manual edits and dismissals as an
+  overlay on top of the freshly regenerated radar, so corrections survive
+  proposition churn.
+- `agenda_items` — holds assistant-added or user-added agenda entries that don't
+  originate from a proposition.
+
+Both tables are auto-created via SQLAlchemy `Base.metadata.create_all` (see
+`gum/models.py`); there is still no migration framework. A new MCP
+`add_agenda_item` write tool lets a frontier agent add items, which are
+rehydrated on-device before being stored.
