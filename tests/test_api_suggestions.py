@@ -618,6 +618,30 @@ class AgendaEditEndpointTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("2026-08-15", text)
         self.assertNotIn("2026-07-20", text)
 
+    def test_edit_normalizes_non_iso_due_date_to_iso(self):
+        # `_parse_due` accepts a few lenient formats (e.g. mm/dd/yyyy) so a local
+        # model's drift still lands on the radar. But a parseable-but-non-ISO value
+        # must be canonicalized to YYYY-MM-DD before it is stored or spliced into
+        # the proposition text — otherwise the `\d{4}-\d{2}-\d{2}` deadline scans
+        # (and a later rewrite) would no longer see the date.
+        app = create_app(self.gum)
+        with mock.patch("gum.agenda.structured_completion", side_effect=self._fake()):
+            with mock.patch.object(self.gum.batcher, "push"):
+                with TestClient(app) as client:
+                    before = self._get(client)
+                    target = [c for c in before["commitments"]
+                              if "2026-07-20" in c["proposition_text"]][0]
+                    pid = target["proposition_id"]
+                    r = client.patch(f"/agenda/{pid}", json={"due_date": "07/20/2026"}).json()
+                    self.assertTrue(r["ok"])
+                    after = self._get(client)
+                    mem = client.get("/memory").json()
+        edited = [c for c in after["commitments"] if c["proposition_id"] == pid][0]
+        self.assertEqual(edited["due_date"], "2026-07-20")
+        text = [p["text"] for p in mem["propositions"] if p["id"] == pid][0]
+        self.assertIn("2026-07-20", text)
+        self.assertNotIn("07/20/2026", text)
+
     def test_edit_title_persists_over_model_output(self):
         app = create_app(self.gum)
         with mock.patch("gum.agenda.structured_completion", side_effect=self._fake()):

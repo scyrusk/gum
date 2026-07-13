@@ -1294,11 +1294,14 @@ rule. Do not rewrite candidates and do not include their text in your response.
         proposition. Only fields the caller passes are changed. Returns False if
         the proposition no longer exists.
         """
-        from .agenda import _extract_dates, rewrite_due_date
+        from .agenda import _extract_dates, _parse_due, rewrite_due_date
 
         title = title.strip() if title else None
         status = status.strip() if status else None
         due_date = due_date.strip() if due_date else None
+        if due_date is not None:
+            parsed = _parse_due(due_date)
+            due_date = parsed.isoformat() if parsed is not None else None
 
         old_date: str | None = None
         old_text: str = ""
@@ -1495,12 +1498,18 @@ rule. Do not rewrite candidates and do not include their text in your response.
         text — the MCP tool does this so a pseudonymized ``[PERSON_1]`` never lands
         in the stored title. Returns None for an empty title.
         """
+        from .agenda import _parse_due
+
         title = (title or "").strip()
         if not title:
             return None
+        due = (due_date or "").strip() or None
+        if due is not None:
+            parsed = _parse_due(due)
+            due = parsed.isoformat() if parsed is not None else None
         item = AgendaItem(
             title=title,
-            due_date=(due_date or None),
+            due_date=due,
             status=(status.strip() if status else None),
             source=(source.strip() if source else None),
             note=(note.strip() if note else None),
@@ -1530,6 +1539,8 @@ rule. Do not rewrite candidates and do not include their text in your response.
         clear_due_date: bool = False,
     ) -> bool:
         """Edit an added agenda item in place. Returns False if it doesn't exist."""
+        from .agenda import _parse_due
+
         async with self._session() as session:
             item = await session.get(AgendaItem, item_id)
             if item is None:
@@ -1541,7 +1552,11 @@ rule. Do not rewrite candidates and do not include their text in your response.
             if clear_due_date:
                 item.due_date = None
             elif due_date is not None:
-                item.due_date = due_date.strip() or None
+                due = due_date.strip() or None
+                if due is not None:
+                    parsed = _parse_due(due)
+                    due = parsed.isoformat() if parsed is not None else None
+                item.due_date = due
             return True
 
     async def set_agenda_item_dismissed(self, item_id: int, dismissed: bool) -> bool:

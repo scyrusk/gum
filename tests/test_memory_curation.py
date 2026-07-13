@@ -210,6 +210,19 @@ class AgendaOverrideMethodTests(_Base):
         self.assertNotIn("2026-07-20", text)
         self.assertEqual(push.call_args.kwargs["observer_name"], "gumbo_agenda_edit")
 
+    async def test_edit_normalizes_non_iso_due_date(self):
+        # A non-ISO but parseable due date is canonicalized before it is stored on
+        # the override AND spliced into the proposition text.
+        pid = await self._seed_prop_with_obs("Submit the grant by 2026-07-20", 1)
+        with mock.patch.object(self.gum.batcher, "push"):
+            ok = await self.gum.apply_agenda_override(pid, due_date="08/15/2026")
+        self.assertTrue(ok)
+        self.assertEqual((await self._one_override()).due_date, "2026-08-15")
+        async with self.gum._session() as s:
+            text = (await s.get(Proposition, pid)).text
+        self.assertIn("2026-08-15", text)
+        self.assertNotIn("08/15/2026", text)
+
     async def test_edit_upserts_single_row(self):
         pid = await self._seed_prop_with_obs("Renew the license", 1)
         with mock.patch.object(self.gum.batcher, "push"):
@@ -320,6 +333,15 @@ class AgendaItemMethodTests(_Base):
         self.assertEqual(item.title, "Draft the memo")
         self.assertEqual(item.status, "blocked")
         self.assertEqual(item.due_date, "2999-08-01")
+
+    async def test_add_and_update_normalize_non_iso_due_date(self):
+        # A parseable-but-non-ISO due date (mm/dd/yyyy) must be canonicalized to
+        # YYYY-MM-DD on the way into the store, so the deadline stays visible to
+        # the `\d{4}-\d{2}-\d{2}` scans regardless of ingress.
+        iid = await self.gum.add_agenda_item(title="File taxes", due_date="07/20/2999")
+        self.assertEqual((await self._all_items())[0].due_date, "2999-07-20")
+        await self.gum.update_agenda_item(iid, due_date="08/01/2999")
+        self.assertEqual((await self._all_items())[0].due_date, "2999-08-01")
 
     async def test_update_clear_due_date(self):
         iid = await self.gum.add_agenda_item(title="Thing", due_date="2999-07-20")
