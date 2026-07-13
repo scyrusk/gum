@@ -23,6 +23,7 @@ import os
 import shlex
 import shutil
 import signal
+import sys
 import tempfile
 from dataclasses import asdict, dataclass
 from typing import Any, Protocol, runtime_checkable
@@ -58,6 +59,10 @@ DEFAULT_TIMEOUT = 120.0
 # enforces the executor's "reviewable artifact, never act" contract at the tool
 # layer rather than trusting the prompt alone. See ClaudeCLIBackend.
 DEFAULT_PERMISSION_MODE = "plan"
+# The shipped off-device backend must be confined by the operating system, not
+# merely started in a scratch cwd. macOS is GUM's supported desktop platform, so
+# the default backend uses Seatbelt via sandbox-exec and fails closed elsewhere.
+DEFAULT_FILESYSTEM_ISOLATION = True
 
 # Claude's plan permission mode can otherwise treat the requested artifact as a
 # plan to submit via ExitPlanMode (or save to a transient plan file) and print only
@@ -182,8 +187,8 @@ class ExecutionOutcome:
 class ClaudeCLIBackend:
     """An :class:`AgentBackend` that shells out to the local ``claude`` CLI.
 
-    Runs the agent non-interactively (``claude -p``) confined to a restricted
-    working directory, with the GUM-grounded task fed on **stdin** (so no prompt
+    Runs the agent non-interactively (``claude -p``) inside a deny-by-default
+    macOS Seatbelt sandbox, with the GUM-grounded task fed on **stdin** (so no prompt
     text ever touches a shell command line) and a hard wall-clock timeout that
     kills the whole process tree on overrun (the CLI is launched as its own
     session leader, so its bash-tool/MCP-server children die with it rather than
@@ -192,8 +197,9 @@ class ClaudeCLIBackend:
 
     Sandboxing here is defence-in-depth on top of the executor's risk gate:
 
-    - the agent only ever sees a *restricted* ``cwd`` (the executor hands it a
-      scratch workspace, not the user's real project);
+    - filesystem access is enforced by Seatbelt: the ephemeral workspace is the
+      only writable/readable user-data path, while system/runtime files are
+      read-only; changing ``cwd`` alone is explicitly not treated as isolation;
     - the run is time-boxed and its whole process tree torn down on overrun;
     - the CLI runs in a read/research-only **permission mode** (``plan`` by
       default), so the tool layer itself refuses file edits, Bash, and
@@ -214,6 +220,8 @@ class ClaudeCLIBackend:
         command: str = "claude",
         extra_args: list[str] | None = None,
         permission_mode: str | None = DEFAULT_PERMISSION_MODE,
+        filesystem_isolation: bool = DEFAULT_FILESYSTEM_ISOLATION,
+        sandbox_command: str = "/usr/bin/sandbox-exec",
         logger: logging.Logger | None = None,
     ) -> None:
         self.command = command
@@ -231,6 +239,8 @@ class ClaudeCLIBackend:
         if env_mode is not None:
             permission_mode = env_mode.strip() or None
         self.permission_mode = permission_mode
+        self.filesystem_isolation = filesystem_isolation
+        self.sandbox_command = sandbox_command
         self.logger = logger or logging.getLogger("gum.executor.backend")
 
     def _build_argv(self) -> list[str]:
@@ -252,6 +262,93 @@ class ClaudeCLIBackend:
         # grounding path the spec requires.
         body = f"{context}\n\n{task}" if context else task
         return f"{body}\n\n{_STDOUT_DELIVERABLE_INSTRUCTION}\n"
+
+    @staticmethod
+    def _seatbelt_string(value: str) -> str:
+        """Quote a path as a literal SBPL string without permitting injection."""
+        return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+    def _build_sandbox_profile(self, cwd: str, executable: str) -> str:
+        """Return the deny-by-default Seatbelt profile for one dispatch.
+
+        The model-facing CLI can read and write only the fresh dispatch
+        workspace. Standard OS/runtime trees and the resolved CLI executable are
+        readable/executable, but no other user path is granted.
+        """
+        workspace = self._seatbelt_string(os.path.realpath(cwd))
+        command = self._seatbelt_string(os.path.realpath(executable))
+        system_roots = (
+            "/System",
+            "/usr",
+            "/bin",
+            "/sbin",
+            "/Library/Apple",
+            "/private/etc",
+            "/private/var/db/timezone",
+            "/dev",
+        )
+        reads = "\n".join(
+            f"    (subpath {self._seatbelt_string(path)})" for path in system_roots
+        )
+        execs = "\n".join(
+            f"    (subpath {self._seatbelt_string(path)})"
+            for path in ("/usr", "/bin", "/sbin")
+        )
+        return f"""(version 1)
+(deny default)
+(allow file-read*
+    (subpath {workspace})
+    (literal {command})
+{reads})
+(allow file-write* (subpath {workspace}))
+(allow process-fork)
+(allow process-exec
+    (literal {command})
+{execs})
+(allow signal)
+(allow sysctl-read)
+(allow mach-lookup)
+(allow ipc-posix*)
+(allow network-outbound)
+"""
+
+    def _prepare_launch(
+        self, argv: list[str], cwd: str
+    ) -> tuple[list[str], dict[str, str] | None, str | None]:
+        """Wrap *argv* in OS filesystem isolation, failing closed if unavailable."""
+        if not self.filesystem_isolation:
+            return argv, None, None
+        if sys.platform != "darwin":
+            return argv, None, "filesystem isolation requires macOS sandbox-exec"
+        sandbox = shutil.which(self.sandbox_command)
+        executable = shutil.which(argv[0])
+        if executable is None:
+            return argv, None, f"agent CLI {self.command!r} not found on PATH"
+        if sandbox is None:
+            return argv, None, "filesystem sandbox executable not found"
+
+        executable = os.path.realpath(executable)
+        argv = [executable, *argv[1:]]
+        profile = self._build_sandbox_profile(cwd, executable)
+        sandboxed = [sandbox, "-p", profile, *argv]
+
+        # Keep CLI config, caches, and temporary files inside the same disposable
+        # workspace. Seatbelt remains the enforcement boundary if a process
+        # ignores these conventional environment variables.
+        env = os.environ.copy()
+        config = os.path.join(cwd, ".config")
+        cache = os.path.join(cwd, ".cache")
+        tmp = os.path.join(cwd, ".tmp")
+        for path in (config, cache, tmp):
+            os.makedirs(path, exist_ok=True)
+        env.update({
+            "HOME": cwd,
+            "XDG_CONFIG_HOME": config,
+            "XDG_CACHE_HOME": cache,
+            "TMPDIR": tmp,
+            "CLAUDE_CONFIG_DIR": os.path.join(config, "claude"),
+        })
+        return sandboxed, env, None
 
     def _kill_process_tree(self, proc: asyncio.subprocess.Process) -> None:
         """SIGKILL the agent *and every process it spawned*.
@@ -279,10 +376,14 @@ class ClaudeCLIBackend:
     ) -> AgentResult:
         prompt = self._build_prompt(task, context)
         argv = self._build_argv()
+        argv, env, launch_error = self._prepare_launch(argv, cwd)
+        if launch_error:
+            return AgentResult(ok=False, output="", error=launch_error)
         try:
             proc = await asyncio.create_subprocess_exec(
                 *argv,
                 cwd=cwd,
+                env=env,
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
@@ -310,6 +411,13 @@ class ClaudeCLIBackend:
             return AgentResult(
                 ok=False, output="", error=f"agent timed out after {timeout:g}s"
             )
+        except asyncio.CancelledError:
+            # Cancelling communicate() does not terminate the subprocess. Tear
+            # down and reap the whole process group before preserving cancellation
+            # semantics for the caller.
+            self._kill_process_tree(proc)
+            await asyncio.shield(proc.wait())
+            raise
 
         out = stdout.decode(errors="replace").strip()
         if proc.returncode != 0:
@@ -391,17 +499,26 @@ class Executor:
         self._sanitizer = sanitizer
         self.logger = logger or logging.getLogger("gum.executor")
 
-    async def assess_risk(self, suggestion: Suggestion) -> RiskAssessment:
+    async def assess_risk(
+        self, suggestion: Suggestion, *, user_instructions: str | None = None
+    ) -> RiskAssessment:
         """Classify the reversibility and risk of *suggestion*'s implied action.
 
         Uses the same local text model the rest of the pipeline uses (nothing
         leaves the machine). The prompt biases toward the less-safe classification
         under uncertainty, so a genuinely ambiguous action lands proposal-only.
         """
+        instruction_block = ""
+        if user_instructions and user_instructions.strip():
+            instruction_block = (
+                "\n## Additional instructions from the user\n\n"
+                + user_instructions.strip()
+            )
         prompt = RISK_ASSESSMENT_PROMPT.format(
             user_name=self.gum.user_name,
             title=suggestion.title,
             description=suggestion.description,
+            execution_instructions=instruction_block,
         )
         result = await structured_completion(
             self.gum.client,
@@ -433,7 +550,9 @@ class Executor:
             self._sanitizer.load()
         return self._sanitizer
 
-    async def assemble_context(self, suggestion: Suggestion) -> str:
+    async def assemble_context(
+        self, suggestion: Suggestion, *, user_instructions: str | None = None
+    ) -> str:
         """Build the GUM-grounded prompt block for *suggestion*'s dispatched task.
 
         Reuses the exact same assembly the MCP server's ``gather_context`` tool
@@ -443,7 +562,10 @@ class Executor:
         backend can embed in the agent's instructions; the suggestion's own
         title/description seed the retrieval topic.
         """
-        topic = f"{suggestion.title}. {suggestion.description}".strip()
+        topic_parts = [suggestion.title, suggestion.description]
+        if user_instructions and user_instructions.strip():
+            topic_parts.append(user_instructions.strip())
+        topic = ". ".join(part for part in topic_parts if part).strip()
         result = await gather_context(
             self.gum,
             topic,
@@ -467,7 +589,13 @@ class Executor:
         self._workspace_dir = path
         return path
 
-    async def _build_task(self, suggestion: Suggestion, context: str) -> str:
+    async def _build_task(
+        self,
+        suggestion: Suggestion,
+        context: str,
+        *,
+        user_instructions: str | None = None,
+    ) -> str:
         """Compose the safety-framed, GUM-grounded instruction for the backend.
 
         Wraps the suggestion in :data:`EXECUTION_AGENT_PROMPT`, which embeds the
@@ -493,6 +621,11 @@ class Executor:
         parts = [suggestion.title.strip()]
         if suggestion.description and suggestion.description.strip():
             parts.append(suggestion.description.strip())
+        if user_instructions and user_instructions.strip():
+            parts.append(
+                "Additional instructions from the user:\n"
+                + user_instructions.strip()
+            )
         task_body = "\n\n".join(parts)
         user_name = self.gum.user_name
         sanitizer = self._get_sanitizer()
@@ -507,11 +640,19 @@ class Executor:
             task=task_body,
         )
 
-    async def dispatch(self, suggestion: Suggestion) -> ExecutionOutcome:
+    async def dispatch(
+        self,
+        suggestion: Suggestion,
+        *,
+        user_instructions: str | None = None,
+        explicit: bool = False,
+    ) -> ExecutionOutcome:
         """Run the full bridge for *suggestion*: gate → ground → dispatch → capture.
 
         Assesses the action's risk and applies the auto-dispatch gate; a
         suggestion that fails stays :data:`STATUS_PROPOSAL_ONLY` and no agent runs.
+        ``explicit=True`` skips proactive relevance/confidence checks after a
+        direct user click, but never skips reversibility or risk checks.
         A suggestion that clears it is grounded on the shared GUM context assembly
         and handed to the configured :class:`AgentBackend`, whose output is
         captured into a :class:`ExecutionOutcome` held for the user's approval
@@ -520,7 +661,12 @@ class Executor:
         it only ever produces a reviewable artifact.
         """
         try:
-            assessment = await self.assess_risk(suggestion)
+            if user_instructions:
+                assessment = await self.assess_risk(
+                    suggestion, user_instructions=user_instructions
+                )
+            else:
+                assessment = await self.assess_risk(suggestion)
         except Exception as exc:  # fail closed on ANY assessment error
             # If the safety classifier itself can't complete (a flaky/failed local
             # model call, a malformed structured response), we must NOT dispatch:
@@ -537,7 +683,9 @@ class Executor:
                 assessment=None,
                 reason=f"held for review: risk assessment failed ({exc})",
             )
-        if not self.is_auto_dispatchable(suggestion, assessment):
+        if not self.is_auto_dispatchable(
+            suggestion, assessment, explicit=explicit
+        ):
             return ExecutionOutcome(
                 suggestion=suggestion,
                 status=STATUS_PROPOSAL_ONLY,
@@ -555,8 +703,15 @@ class Executor:
             )
 
         try:
-            context = await self.assemble_context(suggestion)
-            task = await self._build_task(suggestion, context)
+            if user_instructions:
+                context = await self.assemble_context(
+                    suggestion, user_instructions=user_instructions
+                )
+            else:
+                context = await self.assemble_context(suggestion)
+            task = await self._build_task(
+                suggestion, context, user_instructions=user_instructions
+            )
         except Exception as exc:  # fail closed if grounding/sanitization can't build
             # The gate cleared, but before we can dispatch we must assemble the
             # GUM grounding and pseudonymize the whole prompt for the off-device
@@ -635,22 +790,30 @@ class Executor:
         )
 
     def is_auto_dispatchable(
-        self, suggestion: Suggestion, assessment: RiskAssessment
+        self,
+        suggestion: Suggestion,
+        assessment: RiskAssessment,
+        *,
+        explicit: bool = False,
     ) -> bool:
         """Whether *suggestion* may run automatically given its *assessment*.
 
-        All four conditions must hold: the mixed-initiative decision already found
-        the suggestion worth surfacing, its P(useful) clears the higher execution
-        bar, and the action is both reversible and low-risk. Any miss keeps the
-        suggestion proposal-only — the safe default the whole bridge is built on.
+        For proactive dispatch, all four conditions must hold: worth surfacing,
+        sufficient P(useful), reversible, and low-risk. A direct user click may
+        bypass only the first two. Any safety miss keeps the suggestion
+        proposal-only — the safe default the whole bridge is built on.
         """
         reasons: list[str] = []
-        if not suggestion.should_surface:
-            reasons.append("suggestion not worth surfacing")
-        if suggestion.probability_useful < self.min_probability:
-            reasons.append(
-                f"P(useful) {suggestion.probability_useful} < {self.min_probability}"
-            )
+        # A direct user click is no longer a proactive interruption, so it may
+        # bypass GUMBO's relevance/confidence thresholds. It never bypasses the
+        # action-safety gate below: risky or irreversible work remains held.
+        if not explicit:
+            if not suggestion.should_surface:
+                reasons.append("suggestion not worth surfacing")
+            if suggestion.probability_useful < self.min_probability:
+                reasons.append(
+                    f"P(useful) {suggestion.probability_useful} < {self.min_probability}"
+                )
         if not assessment.is_reversible:
             reasons.append(f"action is {assessment.reversibility}")
         if assessment.risk > self.max_risk:

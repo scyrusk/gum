@@ -59,6 +59,7 @@ judge how reversible and how risky the required action is.
 
 Title: {title}
 Description: {description}
+{execution_instructions}
 
 ## Task
 

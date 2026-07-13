@@ -304,9 +304,11 @@ class _RecordingExecutor:
 
     def __init__(self):
         self.dispatched: list = []
+        self.options: list = []
 
-    async def dispatch(self, suggestion):
+    async def dispatch(self, suggestion, **kwargs):
         self.dispatched.append(suggestion)
+        self.options.append(kwargs)
         return {"suggestion": suggestion.title, "status": "pending_approval"}
 
 
@@ -384,6 +386,28 @@ class GumboExecuteTests(unittest.IsolatedAsyncioTestCase):
         with mock.patch("gum.gumbo.structured_completion", side_effect=self._one_surfaced_completion()):
             outcomes = await engine.execute()
         self.assertEqual(len(outcomes), 1)
+
+    async def test_execute_suggestion_dispatches_exact_card_with_instructions(self):
+        executor = _RecordingExecutor()
+        engine = Gumbo(self.gum, execution_enabled=True, executor=executor)
+        item = (await self._one_surfaced_completion()(None, None, None, None)).suggestions[0]
+        utility, should_surface = expected_utility(
+            item.probability_useful, item.benefit, item.cost_if_wrong, item.cost_if_missed
+        )
+        suggestion = Suggestion(
+            **item.model_dump(),
+            expected_utility=utility,
+            should_surface=should_surface,
+        )
+        outcome = await engine.execute_suggestion(
+            suggestion, user_instructions="Use a table.", explicit=True
+        )
+        self.assertEqual(outcome["suggestion"], suggestion.title)
+        self.assertEqual(executor.dispatched, [suggestion])
+        self.assertEqual(
+            executor.options,
+            [{"user_instructions": "Use a table.", "explicit": True}],
+        )
 
 
 class SuggestionItemBoundsTests(unittest.TestCase):

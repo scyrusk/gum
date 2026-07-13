@@ -28,8 +28,9 @@ from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
 from .gum import gum
-from .gumbo import Gumbo, Suggestion
+from .gumbo import Gumbo, Suggestion, expected_utility
 from .models import FEEDBACK_RATINGS, Observation, Proposition
+from .schemas import SuggestionItem
 
 if TYPE_CHECKING:  # avoid pulling gum.executor (and the CLI backend) at import time
     from .executor import ExecutionOutcome
@@ -81,6 +82,8 @@ class SuggestionChatIn(BaseModel):
 
 class SuggestionExecuteIn(BaseModel):
     focus: str | None = None  # active project tab, if any
+    suggestion: SuggestionItem | None = None  # exact card to execute, if supplied
+    comments: str | None = None  # optional user guidance for this execution only
 
 
 async def _scrub(text: str | None, sanitizer) -> str | None:
@@ -100,6 +103,14 @@ async def _scrub_fragment(text: str | None, sanitizer) -> str | None:
     if sanitizer is None or not text:
         return text
     return await asyncio.to_thread(sanitizer.sanitize_fragment, text)
+
+
+async def _rehydrate(text: str | None, sanitizer) -> str | None:
+    """Restore known pseudo-IDs in trusted inbound UI text before local use."""
+    if sanitizer is None or not text:
+        return text
+    restored, _ = await asyncio.to_thread(sanitizer.rehydrate, text)
+    return restored
 
 
 async def _serialize_proposition(
@@ -350,6 +361,7 @@ def create_app(
         results = results[:limit]
         return {
             "focus": focus,
+            "execution_enabled": gumbo.execution_enabled,
             "suggestions": [await _serialize_suggestion(s, sanitizer) for s in results],
         }
 
@@ -516,12 +528,11 @@ def create_app(
     async def suggestions_execute(
         body: SuggestionExecuteIn | None = None,
     ) -> dict[str, Any]:
-        # Execution bridge (spec #4), default-OFF: runs the SAME rate-limited
-        # surfacing pipeline as /suggestions and hands each surface-worthy,
-        # gate-clearing suggestion to the sandboxed Executor, returning reviewable
-        # drafts held for the user's approval. Nothing irreversible is committed;
-        # a risky/low-confidence suggestion stays proposal-only. Approve/reject
-        # flows back through the existing POST /suggestions/feedback route.
+        # Execution bridge (spec #4), default-OFF. A request with an exact
+        # suggestion is the user-driven card flow: it skips proactive relevance
+        # throttles but retains the reversible/low-risk action gate. A request
+        # without one preserves the original generated, rate-limited batch flow.
+        # Both return reviewable drafts; nothing irreversible is committed.
         if not gumbo.execution_enabled:
             return {
                 "ok": False,
@@ -531,7 +542,49 @@ def create_app(
             }
         focus = (body.focus.strip() if body and body.focus else "") or None
         try:
-            outcomes = await gumbo.execute(focus=focus)
+            if body and body.suggestion is not None:
+                item = body.suggestion
+                title = (await _rehydrate(item.title.strip(), sanitizer) or "").strip()
+                description = (
+                    await _rehydrate(item.description.strip(), sanitizer) or ""
+                ).strip()
+                rationale = (
+                    await _rehydrate(item.rationale.strip(), sanitizer) or ""
+                ).strip()
+                comments = (
+                    await _rehydrate((body.comments or "").strip(), sanitizer) or ""
+                ).strip() or None
+                if not title or not description:
+                    return {
+                        "ok": False,
+                        "enabled": True,
+                        "error": "suggestion title and description cannot be blank",
+                    }
+                utility, should_surface = expected_utility(
+                    item.probability_useful,
+                    item.benefit,
+                    item.cost_if_wrong,
+                    item.cost_if_missed,
+                )
+                suggestion = Suggestion(
+                    title=title,
+                    description=description,
+                    rationale=rationale,
+                    probability_useful=item.probability_useful,
+                    benefit=item.benefit,
+                    cost_if_wrong=item.cost_if_wrong,
+                    cost_if_missed=item.cost_if_missed,
+                    expected_utility=utility,
+                    should_surface=should_surface,
+                )
+                outcome = await gumbo.execute_suggestion(
+                    suggestion,
+                    user_instructions=comments,
+                    explicit=True,
+                )
+                outcomes = [outcome] if outcome is not None else []
+            else:
+                outcomes = await gumbo.execute(focus=focus)
         except Exception as exc:  # local model / backend transport error
             return {"ok": False, "enabled": True, "error": f"execution failed: {exc}"}
         return {

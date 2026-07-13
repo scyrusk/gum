@@ -260,7 +260,8 @@ class Sanitizer:
                 except ImportError as exc:
                     raise RuntimeError(
                         "Sanitization requires the 'sanitize' extra. "
-                        "Install it with: pip install 'gum-ai[sanitize]'"
+                        "In this checkout run: uv sync --extra sanitize "
+                        "(or: uv pip install 'gum-ai[sanitize]')"
                     ) from exc
                 self._pipeline = pipeline(
                     "token-classification",

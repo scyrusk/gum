@@ -187,6 +187,12 @@ def parse_args():
         help="Interactively approve or reject each agent-produced draft; the "
         "decision is recorded as GUMBO feedback (default: just list the outcomes)",
     )
+    p_execute.add_argument(
+        "--output",
+        "-o",
+        type=str,
+        help="Write the execution outcomes to this file instead of stdout",
+    )
     p_execute.add_argument("--user-name", "-u", type=str)
     p_execute.add_argument("--text-model", "-m", type=str)
 
@@ -584,6 +590,25 @@ def _render_outcome(outcome, index: int, total: int) -> str:
     return "\n".join(lines)
 
 
+def _render_outcomes(outcomes) -> str:
+    """Format a complete execution report suitable for stdout or a file."""
+    total = len(outcomes)
+    return "\n".join(
+        _render_outcome(outcome, index, total)
+        for index, outcome in enumerate(outcomes, 1)
+    )
+
+
+def _write_execution_outcomes(path: str, outcomes) -> str:
+    """Write a complete execution report and return the expanded destination."""
+    destination = os.path.expanduser(path)
+    parent = os.path.dirname(os.path.abspath(destination))
+    os.makedirs(parent, exist_ok=True)
+    with open(destination, "w") as fh:
+        fh.write(_render_outcomes(outcomes) + "\n")
+    return destination
+
+
 async def review_outcomes(
     gum_instance,
     outcomes,
@@ -661,7 +686,20 @@ async def cmd_execute(args) -> None:
     print(
         f"\n{len(outcomes)} suggestion(s) considered; {dispatched} dispatched to the agent."
     )
-    await review_outcomes(g, outcomes, interactive=getattr(args, "review", False))
+    output = getattr(args, "output", None)
+    if output:
+        try:
+            destination = _write_execution_outcomes(output, outcomes)
+        except OSError as exc:
+            print(f"Could not write to {os.path.expanduser(output)}: {exc}")
+            return
+        print(f"Wrote {len(outcomes)} execution outcome(s) to {destination}")
+
+    review = getattr(args, "review", False)
+    # A non-interactive export goes only to the requested file. Interactive
+    # review still renders in the terminal so every prompt has visible context.
+    if not output or review:
+        await review_outcomes(g, outcomes, interactive=review)
 
 
 def cmd_mcp(args) -> None:

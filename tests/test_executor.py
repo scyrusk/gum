@@ -16,6 +16,8 @@ import asyncio
 import os
 import shlex
 import signal
+import subprocess
+import sys
 import tempfile
 import unittest
 import uuid
@@ -205,6 +207,38 @@ class ExecutorGateTests(unittest.IsolatedAsyncioTestCase):
         with self._patch_assessment("read_only", 1):
             assessment = await ex.assess_risk(sug)
         self.assertFalse(ex.is_auto_dispatchable(sug, assessment))
+
+    async def test_explicit_click_bypasses_relevance_but_not_safety(self):
+        ex = Executor(self.gum)
+        sug = _suggestion(
+            probability_useful=2, benefit=1, cost_if_wrong=10, cost_if_missed=1
+        )
+        self.assertFalse(sug.should_surface)
+        with self._patch_assessment("read_only", 1):
+            safe = await ex.assess_risk(sug)
+        self.assertTrue(ex.is_auto_dispatchable(sug, safe, explicit=True))
+
+        with self._patch_assessment("irreversible", 1):
+            unsafe = await ex.assess_risk(sug)
+        self.assertFalse(ex.is_auto_dispatchable(sug, unsafe, explicit=True))
+
+    async def test_user_instructions_are_part_of_risk_assessment(self):
+        captured = {}
+
+        async def fake_completion(client, model, messages, schema, **kwargs):
+            captured["prompt"] = messages[0]["content"]
+            return RiskAssessmentSchema(
+                reversibility="read_only", risk=1, rationale="stub"
+            )
+
+        ex = Executor(self.gum)
+        with mock.patch(
+            "gum.executor.structured_completion", side_effect=fake_completion
+        ):
+            await ex.assess_risk(
+                _suggestion(), user_instructions="Prefer stores open after 7 PM."
+            )
+        self.assertIn("Prefer stores open after 7 PM.", captured["prompt"])
 
     async def test_thresholds_are_configurable(self):
         # A stricter executor (only read_only, only risk 1) rejects a reversible
@@ -398,6 +432,23 @@ class DispatchFlowTests(unittest.IsolatedAsyncioTestCase):
         # The per-dispatch sandbox is torn down once the run returns, so nothing
         # accumulates and no run's scratch state leaks into the next dispatch.
         self.assertFalse(os.path.exists(call["cwd"]))
+
+    async def test_explicit_dispatch_includes_user_instructions(self):
+        backend = _RecordingBackend(AgentResult(ok=True, output="draft"))
+        ex = Executor(self.gum, backend=backend, sanitize=False)
+        sug = _suggestion(
+            probability_useful=2, benefit=1, cost_if_wrong=10, cost_if_missed=1
+        )
+        self.assertFalse(sug.should_surface)
+        with self._patch_assessment("read_only", 1):
+            outcome = await ex.dispatch(
+                sug,
+                explicit=True,
+                user_instructions="Keep the answer under 200 words.",
+            )
+
+        self.assertEqual(outcome.status, STATUS_PENDING_APPROVAL)
+        self.assertIn("Keep the answer under 200 words.", backend.calls[0]["task"])
 
     async def test_dispatched_prompt_is_pseudonymized_for_off_device_backend(self):
         # The shipped backend ships the whole instruction off-device, so every
@@ -642,7 +693,10 @@ class ClaudeCLIBackendTests(unittest.IsolatedAsyncioTestCase):
         # `cat` echoes stdin to stdout, so it stands in for a CLI that reads the
         # prompt and prints a result: we can assert the prompt reached the process
         # and its output was captured.
-        backend = ClaudeCLIBackend(command="cat", extra_args=[], permission_mode=None)
+        backend = ClaudeCLIBackend(
+            command="cat", extra_args=[], permission_mode=None,
+            filesystem_isolation=False,
+        )
         with tempfile.TemporaryDirectory() as cwd:
             result = await backend.run("draft the reply", "## context block", cwd=cwd, timeout=10)
         self.assertTrue(result.ok)
@@ -650,7 +704,10 @@ class ClaudeCLIBackendTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("## context block", result.output)
 
     async def test_prompt_requires_plan_mode_deliverable_on_stdout(self):
-        backend = ClaudeCLIBackend(command="cat", extra_args=[], permission_mode=None)
+        backend = ClaudeCLIBackend(
+            command="cat", extra_args=[], permission_mode=None,
+            filesystem_isolation=False,
+        )
         with tempfile.TemporaryDirectory() as cwd:
             result = await backend.run(
                 "Draft the email body", "", cwd=cwd, timeout=10
@@ -667,7 +724,8 @@ class ClaudeCLIBackendTests(unittest.IsolatedAsyncioTestCase):
         # (for example after routing it to a transient plan file).  The backend
         # must not turn that into a blank pending-approval draft.
         backend = ClaudeCLIBackend(
-            command="true", extra_args=[], permission_mode=None
+            command="true", extra_args=[], permission_mode=None,
+            filesystem_isolation=False,
         )
         with tempfile.TemporaryDirectory() as cwd:
             result = await backend.run("Draft the email body", "", cwd=cwd, timeout=10)
@@ -679,11 +737,55 @@ class ClaudeCLIBackendTests(unittest.IsolatedAsyncioTestCase):
     async def test_timeout_kills_and_reports(self):
         # `sleep 30` never produces output; the backend must kill it and report a
         # timeout rather than hang.
-        backend = ClaudeCLIBackend(command="sleep", extra_args=["30"], permission_mode=None)
+        backend = ClaudeCLIBackend(
+            command="sleep", extra_args=["30"], permission_mode=None,
+            filesystem_isolation=False,
+        )
         with tempfile.TemporaryDirectory() as cwd:
             result = await backend.run("x", "", cwd=cwd, timeout=0.5)
         self.assertFalse(result.ok)
         self.assertIn("timed out", result.error)
+
+    @unittest.skipUnless(hasattr(os, "killpg"), "requires POSIX process groups")
+    async def test_cancellation_kills_and_reaps_the_whole_process_tree(self):
+        child_pids = []
+        try:
+            with tempfile.TemporaryDirectory() as cwd:
+                pidfile = os.path.join(cwd, "pids")
+                script = (
+                    f"sleep 30 >/dev/null 2>&1 & "
+                    f"echo $$ $! > {shlex.quote(pidfile)}; wait"
+                )
+                backend = ClaudeCLIBackend(
+                    command="sh", extra_args=["-c", script], permission_mode=None,
+                    filesystem_isolation=False,
+                )
+                task = asyncio.create_task(
+                    backend.run("x", "", cwd=cwd, timeout=30)
+                )
+                for _ in range(100):
+                    if os.path.exists(pidfile):
+                        break
+                    await asyncio.sleep(0.01)
+                self.assertTrue(os.path.exists(pidfile), "agent process never started")
+                with open(pidfile) as fh:
+                    child_pids = [int(value) for value in fh.read().split()]
+
+                task.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await task
+
+            await asyncio.sleep(0.2)
+            for pid in child_pids:
+                with self.assertRaises(ProcessLookupError):
+                    os.kill(pid, 0)
+            child_pids = []
+        finally:
+            for pid in child_pids:
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
 
     @unittest.skipUnless(hasattr(os, "killpg"), "requires POSIX process groups")
     async def test_timeout_kills_the_whole_process_tree(self):
@@ -706,7 +808,8 @@ class ClaudeCLIBackendTests(unittest.IsolatedAsyncioTestCase):
                     f"echo $! > {shlex.quote(pidfile)}; wait"
                 )
                 backend = ClaudeCLIBackend(
-                    command="sh", extra_args=["-c", script], permission_mode=None
+                    command="sh", extra_args=["-c", script], permission_mode=None,
+                    filesystem_isolation=False,
                 )
                 result = await backend.run("x", "", cwd=cwd, timeout=0.5)
                 self.assertFalse(result.ok)
@@ -730,11 +833,67 @@ class ClaudeCLIBackendTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_nonzero_exit_is_a_failure(self):
         # `false` exits 1 with no output.
-        backend = ClaudeCLIBackend(command="false", extra_args=[], permission_mode=None)
+        backend = ClaudeCLIBackend(
+            command="false", extra_args=[], permission_mode=None,
+            filesystem_isolation=False,
+        )
         with tempfile.TemporaryDirectory() as cwd:
             result = await backend.run("x", "", cwd=cwd, timeout=5)
         self.assertFalse(result.ok)
         self.assertTrue(result.error)
+
+    def test_filesystem_profile_is_deny_by_default_and_workspace_scoped(self):
+        backend = ClaudeCLIBackend(command="cat", permission_mode=None)
+        with tempfile.TemporaryDirectory() as cwd:
+            profile = backend._build_sandbox_profile(cwd, "/bin/cat")
+        self.assertIn("(deny default)", profile)
+        self.assertIn(os.path.realpath(cwd), profile)
+        self.assertIn(f'(literal "{os.path.realpath("/bin/cat")}")', profile)
+        self.assertNotIn(os.path.expanduser("~/.ssh"), profile)
+        self.assertNotIn(os.path.expanduser("~/Documents"), profile)
+
+    @unittest.skipUnless(
+        sys.platform == "darwin" and os.path.exists("/usr/bin/sandbox-exec"),
+        "requires macOS sandbox-exec",
+    )
+    async def test_filesystem_sandbox_blocks_reads_outside_workspace(self):
+        probe = subprocess.run(
+            ["/usr/bin/sandbox-exec", "-p", "(version 1) (allow default)", "/usr/bin/true"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        if probe.returncode != 0:
+            self.skipTest("sandbox-exec is unavailable inside the current host sandbox")
+
+        with tempfile.TemporaryDirectory() as parent:
+            cwd = os.path.join(parent, "workspace")
+            os.mkdir(cwd)
+            allowed = os.path.join(cwd, "allowed.txt")
+            with open(allowed, "w") as fh:
+                fh.write("workspace-readable")
+            secret = os.path.join(parent, "outside-secret.txt")
+            with open(secret, "w") as fh:
+                fh.write("must-not-leak")
+            allowed_backend = ClaudeCLIBackend(
+                command="cat", extra_args=[allowed], permission_mode=None
+            )
+            allowed_result = await allowed_backend.run(
+                "ignored", "", cwd=cwd, timeout=5
+            )
+            if (not allowed_result.ok and allowed_result.error
+                    and "sandbox_apply: Operation not permitted" in allowed_result.error):
+                self.skipTest(
+                    "deny-by-default profiles cannot be nested in the current host sandbox"
+                )
+            backend = ClaudeCLIBackend(
+                command="cat", extra_args=[secret], permission_mode=None
+            )
+            result = await backend.run("ignored", "", cwd=cwd, timeout=5)
+
+        self.assertTrue(allowed_result.ok, allowed_result.error)
+        self.assertIn("workspace-readable", allowed_result.output)
+        self.assertFalse(result.ok)
+        self.assertNotIn("must-not-leak", result.output)
 
     def test_defaults_to_read_only_permission_mode(self):
         # Defence-in-depth: the shipped backend runs the CLI in a read/research-only

@@ -59,6 +59,22 @@ async def _fake_suggestions(client, model, messages, schema, **kwargs):
     return _FAKE_SUGGESTIONS
 
 
+def _exact_payload(**overrides):
+    suggestion = {
+        "title": "Draft an edited Chicago checklist",
+        "description": "Create a concise checklist for the wedding trip.",
+        "rationale": "Wedding travel is coming up.",
+        # Deliberately below the proactive thresholds: a direct user click may
+        # bypass relevance/confidence, but still goes through action safety.
+        "probability_useful": 2,
+        "benefit": 1,
+        "cost_if_wrong": 10,
+        "cost_if_missed": 1,
+    }
+    suggestion.update(overrides)
+    return {"suggestion": suggestion, "comments": "Use a two-column table."}
+
+
 class _RecordingBackend:
     """An AgentBackend double that records the dispatch and returns a canned draft."""
 
@@ -172,6 +188,88 @@ class ExecuteEndpointTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(outcome["result"])
         # Gate declined before any dispatch: the backend never ran.
         self.assertEqual(backend.calls, [])
+
+    def test_execute_exact_edited_card_with_comments(self):
+        backend = _RecordingBackend()
+        captured = {}
+
+        async def _capture_risk(client, model, messages, schema, **kwargs):
+            captured["prompt"] = messages[0]["content"]
+            return await _fake_risk(client, model, messages, schema, **kwargs)
+
+        app = create_app(self.gum, execute=True)
+        with _patch_executor(self.gum, backend), \
+                mock.patch("gum.gumbo.structured_completion") as regenerate, \
+                mock.patch("gum.executor.structured_completion", side_effect=_capture_risk):
+            with TestClient(app) as client:
+                resp = client.post("/suggestions/execute", json=_exact_payload())
+
+        body = resp.json()
+        self.assertTrue(body["ok"])
+        self.assertEqual(body["dispatched"], 1)
+        outcome = body["outcomes"][0]
+        self.assertEqual(outcome["status"], "pending_approval")
+        self.assertEqual(outcome["suggestion"]["title"], "Draft an edited Chicago checklist")
+        self.assertFalse(outcome["suggestion"]["should_surface"])
+        self.assertIn("Use a two-column table.", captured["prompt"])
+        self.assertIn("Use a two-column table.", backend.calls[0][0])
+        regenerate.assert_not_called()
+
+    def test_exact_execution_rejects_blank_edited_text(self):
+        backend = _RecordingBackend()
+        app = create_app(self.gum, execute=True)
+        payload = _exact_payload(title="   ")
+        with _patch_executor(self.gum, backend):
+            with TestClient(app) as client:
+                resp = client.post("/suggestions/execute", json=payload)
+        self.assertFalse(resp.json()["ok"])
+        self.assertIn("cannot be blank", resp.json()["error"])
+        self.assertEqual(backend.calls, [])
+
+    def test_exact_execution_rehydrates_sanitized_ui_text_locally(self):
+        class _RoundTripSanitizer:
+            def load(self):
+                pass
+
+            def sanitize(self, text):
+                return (text.replace("Omar", "[PERSON_1]")
+                        .replace("Chicago", "[LOCATION_1]"))
+
+            def rehydrate(self, text):
+                restored = (text.replace("[PERSON_1]", "Omar")
+                            .replace("[LOCATION_1]", "Chicago"))
+                return restored, int(restored != text)
+
+        backend = _RecordingBackend(output="Draft ready for Omar")
+        captured = {}
+
+        async def _capture_risk(client, model, messages, schema, **kwargs):
+            captured["prompt"] = messages[0]["content"]
+            return await _fake_risk(client, model, messages, schema, **kwargs)
+
+        with mock.patch(
+            "gum.sanitize.get_sanitizer", return_value=_RoundTripSanitizer()
+        ):
+            app = create_app(self.gum, sanitize=True, execute=True)
+        payload = _exact_payload(
+            title="Draft a [LOCATION_1] checklist",
+            description="Prepare it for [PERSON_1].",
+        )
+        payload["comments"] = "Keep it useful for [PERSON_1]."
+        with _patch_executor(self.gum, backend), mock.patch(
+            "gum.executor.structured_completion", side_effect=_capture_risk
+        ):
+            with TestClient(app) as client:
+                resp = client.post("/suggestions/execute", json=payload)
+
+        outcome = resp.json()["outcomes"][0]
+        self.assertIn("Chicago", captured["prompt"])
+        self.assertIn("Omar", captured["prompt"])
+        self.assertIn("Omar", backend.calls[0][0])
+        self.assertEqual(
+            outcome["suggestion"]["title"], "Draft a [LOCATION_1] checklist"
+        )
+        self.assertEqual(outcome["result"]["output"], "Draft ready for Omar")
 
     def test_execute_preserves_rehydrated_output_under_sanitize(self):
         # The API sanitizer must not undo the executor's local rehydration of the

@@ -11,9 +11,17 @@
 
 from __future__ import annotations
 
+import tempfile
 import unittest
+from pathlib import Path
+from unittest.mock import patch
 
-from gum.cli import review_outcomes
+from gum.cli import (
+    _render_outcomes,
+    _write_execution_outcomes,
+    parse_args,
+    review_outcomes,
+)
 from gum.executor import (
     STATUS_FAILED,
     STATUS_PENDING_APPROVAL,
@@ -188,6 +196,40 @@ class ReviewOutcomesTests(unittest.IsolatedAsyncioTestCase):
             gum, [_pending("Email", output="Dear team, ...")], ["s"]
         )
         self.assertTrue(any("Dear team, ..." in line for line in out))
+
+
+class ExecutionOutputTests(unittest.TestCase):
+    def test_execute_accepts_output_option(self):
+        with patch("sys.argv", ["gum", "execute", "topic", "-o", "drafts.txt"]):
+            _parser, args = parse_args()
+
+        self.assertEqual(args.command, "execute")
+        self.assertEqual(args.focus, "topic")
+        self.assertEqual(args.output, "drafts.txt")
+
+    def test_render_outcomes_builds_one_complete_report(self):
+        report = _render_outcomes(
+            [_pending("First", "draft one"), _pending("Second", "draft two")]
+        )
+
+        self.assertIn("[1/2] First", report)
+        self.assertIn("draft one", report)
+        self.assertIn("[2/2] Second", report)
+        self.assertIn("draft two", report)
+
+    def test_write_execution_outcomes_writes_report(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "missing" / "nested" / "outcomes.txt"
+
+            destination = _write_execution_outcomes(
+                str(path), [_pending("Email", "Dear team")]
+            )
+
+            self.assertEqual(destination, str(path))
+            text = path.read_text()
+            self.assertIn("[1/1] Email", text)
+            self.assertIn("Dear team", text)
+            self.assertTrue(text.endswith("\n"))
 
 
 if __name__ == "__main__":

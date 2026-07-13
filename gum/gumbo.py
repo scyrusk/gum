@@ -423,6 +423,27 @@ class Gumbo:
             outcomes.append(await executor.dispatch(suggestion))
         return outcomes
 
+    async def execute_suggestion(
+        self,
+        suggestion: Suggestion,
+        *,
+        user_instructions: str | None = None,
+        explicit: bool = False,
+    ) -> "ExecutionOutcome | None":
+        """Execute one already-presented suggestion without regenerating it.
+
+        This is the card-level companion to :meth:`execute`. An explicit user
+        click bypasses proactive relevance/confidence throttles, but the Executor
+        still requires the edited action to be reversible and low-risk.
+        """
+        if not self.execution_enabled:
+            return None
+        return await self._get_executor().dispatch(
+            suggestion,
+            user_instructions=user_instructions,
+            explicit=explicit,
+        )
+
     # ── conversation ─────────────────────────────────────────────────────────
     async def chat(
         self,

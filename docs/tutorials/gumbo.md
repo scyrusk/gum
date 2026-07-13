@@ -43,11 +43,15 @@ behalf. Four independent guardrails enforce this:
    suggestion fails *closed* to proposal-only rather than dispatching — and one
    un-assessable suggestion never aborts the rest of an `execute()` batch.
 3. **A sandboxed agent.** The dispatched agent (the shipped backend shells out to
-   the local `claude` CLI) runs in a **restricted scratch workspace** under the
-   GUM data directory — never your real project tree. Each dispatch gets its own
-   fresh, ephemeral subdirectory that is deleted when the run finishes, so no run's
-   scratch files or state leak into the next. It runs with a hard wall-clock
-   **timeout** that tears down its whole process tree on overrun. The CLI runs in
+   the local `claude` CLI) runs under a deny-by-default macOS **Seatbelt** profile.
+   Its fresh scratch workspace under the GUM data directory is the only user-data
+   path the process may read or write; standard OS/runtime paths remain read-only.
+   Changing the process's working directory is not treated as isolation. CLI config,
+   caches, and temporary files are redirected into the same disposable workspace,
+   which is deleted when the run finishes. If Seatbelt is unavailable or the
+   profile cannot be applied, execution fails closed without an agent result. It
+   runs with a hard wall-clock **timeout** that tears down and reaps its whole
+   process tree on overrun or caller cancellation. The CLI runs in
    a read/research-only **permission mode** (`plan` by default), so the tool layer
    *itself* refuses file edits, `Bash`, and outward-facing actions — the
    "produce a draft, never act" contract is enforced by the CLI, not merely
@@ -90,7 +94,7 @@ behalf. Four independent guardrails enforce this:
 ## Turning it on
 
 ```bash
-pip install 'gum-ai[sanitize]'   # egress sanitization is fail-closed by default
+uv sync --extra sanitize         # egress sanitization is fail-closed by default
 ```
 
 The CLI review path is the simplest way to try it:
@@ -98,6 +102,8 @@ The CLI review path is the simplest way to try it:
 ```bash
 gum execute --review              # generate → gate → dispatch → approve/reject
 gum execute --review "grant writing"   # steer generation with a project focus
+gum execute --output drafts.txt   # write the complete outcome report to a file
+gum execute --review -o drafts.txt # save the report and review it interactively
 ```
 
 `gum execute` runs the same rate-limited surfacing pipeline as the assistant (the
@@ -128,7 +134,11 @@ that failed the risk gate is shown as *proposal only* and is never prompted for
 approval, because no agent ran.
 
 Without `--review`, `gum execute` just lists the outcomes (useful for a dry run
-to see what *would* be dispatched).
+to see what *would* be dispatched). Pass `-o/--output FILE` to write that complete
+report, including agent drafts, to a file instead of stdout. When combined with
+`--review`, the report is saved and also remains visible in the terminal so each
+approval prompt has its draft for context. Missing parent directories in the
+output path are created automatically.
 
 ### From the local REST API
 
@@ -138,10 +148,37 @@ existing thumbs up/down. It is the **same** default-OFF opt-in: the route only
 runs when the server is built with `execute=True` (or `GUMBO_EXECUTION_ENABLED=1`);
 otherwise it returns `{"ok": false, "enabled": false}` and touches no agent.
 
+In the GUMBO assistant, each card has an inline editor for its title and
+description plus optional execution instructions. Clicking **Execute** runs that
+exact edited card rather than generating a replacement. Because this is an
+explicit user request, it bypasses the proactive relevance/confidence and
+token-bucket checks, but it never bypasses the reversibility and risk gate.
+Instructions are included in both the local safety assessment and the sandboxed
+agent task. They apply only to that run and are not written to GUM memory.
+
 ```bash
 # enabled server:
 curl -s -X POST localhost:8422/suggestions/execute \
      -H 'content-type: application/json' -d '{"focus": "grant writing"}'
+```
+
+To execute a specific card, send its editable text, original scores, and optional
+comments. The server recomputes the derived expected-utility fields instead of
+trusting client-supplied values:
+
+```bash
+curl -s -X POST localhost:8422/suggestions/execute \
+  -H 'content-type: application/json' \
+  -d '{
+    "suggestion": {
+      "title": "Draft the reviewer response",
+      "description": "Prepare a concise point-by-point response for review.",
+      "rationale": "The review thread has unresolved comments.",
+      "probability_useful": 9, "benefit": 9,
+      "cost_if_wrong": 2, "cost_if_missed": 7
+    },
+    "comments": "Keep it under 500 words and use a collegial tone."
+  }'
 ```
 
 ```json
@@ -169,6 +206,10 @@ its entities stay rehydrated so the user can review the usable deliverable. The
 feedback route receives suggestion metadata and the vote, never that restored
 draft text.
 
+The web assistant renders the draft and its safety assessment directly in the
+card. **Approve** and **Reject** record that feedback; they do not commit an
+external or irreversible action.
+
 ## Configuration
 
 | Knob | Default | What it does |
@@ -178,7 +219,7 @@ draft text.
 | `GUM_EXECUTOR_MAX_RISK` | `3` | Maximum assessed risk (1–10) allowed to auto-dispatch |
 | `GUM_EXECUTOR_CONTEXT_LIMIT` | `10` | How many propositions ground the dispatched task |
 | `GUM_EXECUTOR_TIMEOUT` | `120` | Hard wall-clock cap (seconds) on an agent run |
-| `GUM_EXECUTOR_WORKSPACE` | scratch dir under the GUM data dir | Root for the agent's sandbox; each dispatch gets a fresh, auto-deleted subdirectory here |
+| `GUM_EXECUTOR_WORKSPACE` | scratch dir under the GUM data dir | Root for each Seatbelt-confined, fresh, auto-deleted dispatch workspace |
 | `GUM_EXECUTOR_CLAUDE_ARGS` | — | Extra args appended to the `claude` CLI invocation |
 | `GUM_EXECUTOR_PERMISSION_MODE` | `plan` | The CLI permission mode the agent runs in; set empty to disable (only for a fully-trusted backend) |
 
