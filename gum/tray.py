@@ -93,6 +93,7 @@ class GumTray:
             self._recent_menu,
             None,
             rumps.MenuItem("Open GUMBO Assistant", callback=self._on_gumbo),
+            rumps.MenuItem("Open Agenda", callback=self._on_agenda),
             rumps.MenuItem("Open Review UI", callback=self._on_review),
             rumps.MenuItem("Open Logs", callback=self._on_logs),
         ]
@@ -259,6 +260,14 @@ class GumTray:
             return
         # The daemon's API serves the GUMBO assistant page at "/gumbo".
         webbrowser.open(_api_base() + "/gumbo")
+
+    def _on_agenda(self, _sender=None) -> None:
+        if not daemon.is_running():
+            self._rumps.alert("GUM is not running", "Start GUM first to open your agenda.")
+            return
+        # Same GUMBO page, deep-linked to the Agenda view via the URL hash (the
+        # page reads location.hash on load — see gumbo.html startup).
+        webbrowser.open(_api_base() + "/gumbo#agenda")
 
     def _on_review(self, _sender=None) -> None:
         if not daemon.is_running():

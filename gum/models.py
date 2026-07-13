@@ -6,6 +6,7 @@ import pathlib
 from typing import Optional
 
 from sqlalchemy import (
+    Boolean,
     Column,
     DateTime,
     ForeignKey,
@@ -211,6 +212,137 @@ class PropositionFeedback(Base):
 
     def __repr__(self) -> str:
         return f"<PropositionFeedback(id={self.id}, rating={self.rating})>"
+
+
+class AgendaOverride(Base):
+    """A user's manual correction to a generated agenda item (GUMBO Agenda page).
+
+    The agenda is *regenerated* by the local model on every request
+    (:func:`gum.agenda.build_agenda`), so it has no row of its own to edit. This
+    table persists the user's direct edits — a corrected title / due date /
+    status, or a dismissal — keyed by the source proposition, and the REST
+    ``/agenda`` route overlays them on top of each freshly-extracted radar so an
+    edit sticks visually even before the correction has propagated back into the
+    model through re-inference.
+
+    A ``None`` field means "not overridden" (fall through to the model's value);
+    ``due_date_cleared`` distinguishes an explicit "no fixed date" from "date not
+    overridden". The override provides *visual* persistence of an edit/dismissal
+    for as long as its source proposition lives: it is cascade-deleted with the
+    proposition, so a user "Forget" removes it, and the GUM's SIMILAR→revise path
+    (which deletes-and-replaces a proposition) removes it too. Durability across
+    that proposition churn does **not** come from this row — it comes from the
+    natural-language correction observation the edit/dismiss pushes into the
+    inference pipeline, which teaches re-inference to reflect the change in the
+    revised proposition (and, for a clean single-date edit, from the direct
+    rewrite of the proposition text). The override is only the short-lived
+    overlay that keeps the edit visible until that propagation catches up.
+
+    Auto-created by :func:`init_db` via ``Base.metadata.create_all`` (same as
+    :class:`PropositionFeedback`); no FTS index is needed.
+
+    Attributes:
+        id (int): Primary key.
+        proposition_id (int): Source proposition — unique, one override per
+            proposition (repeated edits merge onto the same row). Cascade-deleted
+            with the proposition.
+        title (Optional[str]): Overridden title, or None.
+        status (Optional[str]): Overridden status guess, or None.
+        due_date (Optional[str]): Overridden ISO ``YYYY-MM-DD`` due date, or None.
+        due_date_cleared (bool): True if the user explicitly set "no fixed date".
+        dismissed (bool): True if the user removed the item from the radar.
+        created_at / updated_at (datetime): Bookkeeping timestamps.
+    """
+    __tablename__ = "agenda_overrides"
+
+    id:               Mapped[int]           = mapped_column(primary_key=True)
+    proposition_id:   Mapped[int]           = mapped_column(
+        ForeignKey("propositions.id", ondelete="CASCADE"),
+        unique=True, index=True, nullable=False,
+    )
+    title:            Mapped[Optional[str]] = mapped_column(Text)
+    status:           Mapped[Optional[str]] = mapped_column(String(40))
+    due_date:         Mapped[Optional[str]] = mapped_column(String(10))
+    due_date_cleared: Mapped[bool]          = mapped_column(
+        Boolean, server_default="0", nullable=False
+    )
+    dismissed:        Mapped[bool]          = mapped_column(
+        Boolean, server_default="0", nullable=False
+    )
+
+    created_at:       Mapped[str]           = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    updated_at:       Mapped[str]           = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+        nullable=False,
+    )
+
+    def __repr__(self) -> str:
+        return (
+            f"<AgendaOverride(id={self.id}, proposition_id={self.proposition_id}, "
+            f"dismissed={self.dismissed})>"
+        )
+
+
+class AgendaItem(Base):
+    """An agenda entry the user or an assistant added explicitly (not inferred).
+
+    The rest of the agenda is *extracted* from the GUM's inferred propositions;
+    this table holds items someone put on the agenda directly — most importantly
+    ones a frontier agent adds through the MCP ``add_agenda_item`` tool. Those are
+    kept in their own table, deliberately NOT as :class:`Proposition` rows, so an
+    assistant's todo never masquerades as an inferred belief about the user (which
+    would pollute confidence, feedback calibration, and future inference).
+
+    Because an MCP agent only ever sees pseudonymized context, the ``title`` /
+    ``note`` it sends back may carry pseudo-IDs (``[PERSON_1]``); they are
+    **rehydrated to the real values on-device** (see ``Sanitizer.rehydrate``)
+    before being stored here, so the local agenda shows real names. The rehydrated
+    text is never returned to the agent.
+
+    The REST ``/agenda`` route merges these in as first-class commitments (with an
+    ``item_id`` instead of a ``proposition_id``); ``dismissed`` mirrors the
+    override soft-hide so the UI's dismiss/undo works uniformly. Auto-created by
+    :func:`init_db`.
+
+    Attributes:
+        id (int): Primary key (the agenda item's ``item_id``).
+        title (str): The commitment text, stored rehydrated (real values).
+        due_date (Optional[str]): ISO ``YYYY-MM-DD`` deadline, or None if undated.
+        status (Optional[str]): Status guess ('not started'/'in progress'/…).
+        source (Optional[str]): Provenance label shown in the UI (e.g. the agent).
+        note (Optional[str]): Optional extra context, stored rehydrated.
+        created_by (str): 'mcp' (an assistant) or 'user'.
+        dismissed (bool): True if the user removed it from the radar.
+        created_at / updated_at (datetime): Bookkeeping timestamps.
+    """
+    __tablename__ = "agenda_items"
+
+    id:         Mapped[int]           = mapped_column(primary_key=True)
+    title:      Mapped[str]           = mapped_column(Text, nullable=False)
+    due_date:   Mapped[Optional[str]] = mapped_column(String(10))
+    status:     Mapped[Optional[str]] = mapped_column(String(40))
+    source:     Mapped[Optional[str]] = mapped_column(Text)
+    note:       Mapped[Optional[str]] = mapped_column(Text)
+    created_by: Mapped[str]           = mapped_column(String(20), server_default="user", nullable=False)
+    dismissed:  Mapped[bool]          = mapped_column(Boolean, server_default="0", nullable=False)
+
+    created_at: Mapped[str]           = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[str]           = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+        nullable=False,
+    )
+
+    def __repr__(self) -> str:
+        preview = (self.title[:27] + "…") if len(self.title) > 30 else self.title
+        return f"<AgendaItem(id={self.id}, title={preview}, by={self.created_by})>"
 
 
 FTS_TOKENIZER = "porter ascii"

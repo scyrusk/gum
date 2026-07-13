@@ -39,11 +39,12 @@ PROPOSE_PROMPT = """You are a helpful assistant tasked with analyzing user behav
 
 Using a transcription of {user_name}'s activity, analyze {user_name}'s current activities, behavior, and preferences. Draw insightful, concrete conclusions.
 
-To support effective information retrieval (e.g., using BM25), your analysis must **explicitly identify and refer to specific named entities** mentioned in the transcript. This includes applications, websites, documents, people, organizations, tools, and any other proper nouns. Avoid general summaries—**use exact names** wherever possible, even if only briefly referenced.
+To support effective information retrieval (e.g., using BM25), your analysis must **explicitly identify and refer to specific named entities** mentioned in the transcript. This includes applications, websites, documents, people, organizations, tools, and any other proper nouns. It **also includes dates, times, and deadlines** — e.g. "July 20, 2026", "3pm on Friday", "due next week", "by end of day" — which are named entities you must never drop. Avoid general summaries—**use exact names** wherever possible, even if only briefly referenced.
 
 Consider these points in your analysis:
 
 - What specific tasks or goals is {user_name} actively working towards, as evidenced by named files, apps, platforms, or individuals?
+- **Does {user_name} face any deadline, scheduled event, or time-bound commitment** — a due date, a meeting or appointment, a submission, a bill, a reply or review they owe by a certain time? Identify *what* is due and its *exact date/time*.
 - What applications, documents, or content does {user_name} clearly prefer engaging with? Identify them by name.
 - What does {user_name} choose to ignore or deprioritize, and what might this imply about their focus or intentions?
 - What are the strengths or weaknesses in {user_name}’s behavior or tools? Cite relevant named entities or resources.
@@ -73,8 +74,12 @@ Rate how long the proposition is likely to stay relevant. Consider:
 
 Score: **1 (short-lived)** to **10 (long-lasting insight or pattern)**.
 
+A proposition tied to a concrete upcoming deadline or event is time-sensitive: give it a **low decay** (it stops mattering once the date passes), and make sure its date is stated explicitly (see the temporal-grounding rule below) so a downstream deadline radar can rank it while it is still relevant.
+
 {feedback_examples}
 # Input
+
+Today's date is {today}.
 
 Below is a set of transcribed actions and interactions that {user_name} has performed:
 
@@ -84,7 +89,9 @@ Below is a set of transcribed actions and interactions that {user_name} has perf
 
 # Task
 
-Generate **at least 5 distinct, well-supported propositions** about {user_name}, each grounded in the transcript. 
+Generate **at least 5 distinct, well-supported propositions** about {user_name}, each grounded in the transcript.
+
+**Temporal grounding.** Whenever a proposition concerns something time-bound — a deadline, a meeting, an appointment, a submission, a bill, or a promised reply/review — **state the specific date (and time, if known) explicitly inside the proposition text**. Resolve relative references ("tomorrow", "next Friday", "by end of week", "in two days", "this afternoon") against today's date ({today}) into an absolute calendar date in `YYYY-MM-DD` form, so the deadline stays meaningful even after today passes. If the transcript mentions a date, never drop it. If no date is present, do not invent one.
 
 Be conservative in your confidence estimates. Just because an application appears on {user_name}'s screen does not mean they have deeply engaged with it. They may have only glanced at it for a second, making it difficult to draw strong conclusions. 
 
@@ -110,7 +117,7 @@ REVISE_PROMPT = """You are an expert analyst. A cluster of similar propositions 
 
 Your job is to produce a **final set** of propositions that is clear, non-redundant, and captures everything about the user, {user_name}.
 
-To support information retrieval (e.g., with BM25), you must **explicitly identify and preserve all named entities** from the input wherever possible. These may include applications, websites, documents, people, organizations, tools, or any other specific proper nouns mentioned in the original propositions or their evidence.
+To support information retrieval (e.g., with BM25), you must **explicitly identify and preserve all named entities** from the input wherever possible. These may include applications, websites, documents, people, organizations, tools, or any other specific proper nouns mentioned in the original propositions or their evidence. This **includes any dates, times, and deadlines** ("July 20, 2026", "3pm Friday", a `YYYY-MM-DD` due date): carry them through edits, merges, and splits verbatim — never drop or blur a deadline. Today's date is {today}; if a proposition still carries a relative reference ("next Friday"), resolve it to an absolute `YYYY-MM-DD` date.
 
 You MAY:
 
@@ -211,4 +218,74 @@ Return **only** JSON in the following format:
     }
     // one object per judgement, go through ALL propositions in the input.
   ]
+}"""
+
+# Commitment & deadline extraction (spec #1, `gum agenda`). The GUM already
+# infers things like "has a major impending deadline"; this prompt turns that
+# latent signal into a structured, dated commitment the radar can rank. Applied
+# with str.replace() (not str.format()) — like the other prompts in this file —
+# because the JSON template below contains literal braces.
+AGENDA_PROMPT = """You are an assistant that maintains a commitment and deadline radar for {user_name}.
+
+Below is a numbered list of propositions a General User Model (GUM) has inferred about {user_name} from observing their computer use. Each proposition shows a confidence score (1 low – 10 high) and the date it was recorded. Today's date is {today}.
+
+## Propositions
+
+{propositions}
+
+# Task
+
+Identify only the propositions that imply an **open, not-yet-completed commitment or deadline** for {user_name} — something they still have to do, deliver, attend, submit, review, respond to, pay, or decide. Examples: an impending grant or paper deadline, a promised reply, a meeting to prepare for, a review they owe, a bill to pay.
+
+**Litmus test:** a real commitment has a *discrete completion point* — a specific deliverable or action {user_name} could tick off a to-do list and be done with. If the proposition instead describes an ongoing activity, a role, a habit, or a general way {user_name} works ("uses X", "maintains Y", "is involved in Z", "actively works on W"), it is NOT a commitment, no matter how confident the GUM is about it. High confidence means the GUM is sure {user_name} *does* this — not that anything is *due*.
+
+Do NOT include propositions that are:
+- ongoing activities, roles, habits, tools, preferences, or interests with no discrete deliverable — e.g. "maintains a professional presence on LinkedIn", "works with pandas", "researches privacy mechanisms", "collaborates on a project". These describe what {user_name} does, not something owed or due;
+- **negated, hedged, or hypothetical** — the proposition says {user_name} is NOT doing, is *unlikely to*, *no longer*, or is *probably not* involved in something. Do not invert these into a positive commitment. E.g. "is likely not actively involved in organizing dance classes" or "no longer maintains the old repo" imply NO commitment — {user_name} owes nothing. (This is different from "has not yet submitted the grant", which *is* an open commitment: something still to be done.);
+- already completed, or in the past with nothing left to do;
+- vague observations that do not commit {user_name} to anything.
+
+When in doubt, leave it out: a shorter, sharper radar of things genuinely *due* is far more useful than a long list padded with routine activity.
+
+For each real commitment, extract:
+- `source_index`: the number of the proposition it was drawn from.
+- `title`: a short imperative title (e.g. "Submit the NSF grant proposal").
+- `due_date`: the deadline as an absolute ISO date "YYYY-MM-DD". Resolve relative wording ("tomorrow", "next Friday", "by end of week") against the proposition's recorded date and today's date. Use null when no specific date is implied.
+- `source`: who the commitment is owed to or where it came from (a person, organization, or app named in the proposition), or "unknown".
+- `status_guess`: one of "not started", "in progress", "blocked", or "unknown".
+
+Be conservative: include a commitment only when the proposition genuinely implies {user_name} owes or must do something. Returning an empty list is correct when nothing qualifies.
+
+Return **only** JSON in this exact format:
+
+{
+  "commitments": [
+    {
+      "source_index": <integer>,
+      "title": "<short imperative title>",
+      "due_date": "YYYY-MM-DD" or null,
+      "source": "<who or where, or 'unknown'>",
+      "status_guess": "not started" | "in progress" | "blocked" | "unknown"
+    }
+    // one object per open commitment; empty list if none
+  ]
+}"""
+
+
+AGENDA_VERIFY_PROMPT = """You are auditing one candidate commitment for {user_name}'s deadline radar. A first pass — which scanned a large pool of propositions at once — guessed the proposition below implies an open commitment. That pass tends to over-reach when the pool is full of routine activity, promoting habits into commitments to pad the list. Your job is to confirm or reject this one candidate, judged **in isolation**.
+
+Proposition: "{proposition}"
+Guessed commitment title: "{title}"
+
+A GENUINE commitment has a single discrete completion point — one specific deliverable, reply, submission, decision, or event {user_name} can finish and then tick off, after which the task is DONE. A specific scheduled meeting or event ALWAYS counts as discrete (attending it is the completion point), no matter what it is about — do not reject it just because its topic ("review the budget", "discuss the plan") sounds ongoing. Submitting a specific document counts. Sending a specific reply counts. Paying a specific bill counts.
+
+It is NOT a genuine commitment if the proposition describes an ONGOING or RECURRING activity, role, habit, or way of working — managing, coordinating, collaborating, communicating with someone, regularly checking, reviewing, accessing, or maintaining something. Those never reach a "done" state; they are how {user_name} works, not a task owed. When the proposition leans on habitual/durative language ("regularly", "manages", "coordinates", "collaborates", "communicates with", "schedules meetings with", "is involved in", "works on") and names no single finished artifact or one-time event, reject it.
+
+Judge strictly about THIS proposition in isolation. When unsure, reject: a radar padded with routine activity is worse than a short, sharp one.
+
+Return only JSON in this exact format:
+
+{
+  "is_commitment": true or false,
+  "reason": "<one short phrase>"
 }"""

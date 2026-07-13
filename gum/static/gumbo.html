@@ -174,6 +174,50 @@
   .mem-save { font: inherit; font-size: 13px; cursor: pointer; color: #fff; background: var(--accent);
               border: 1px solid var(--accent); border-radius: 8px; padding: 5px 12px; white-space: nowrap; }
   .mem-save:disabled { opacity: .5; cursor: default; }
+
+  /* Agenda page — the commitment/deadline radar, editable (spec #1) */
+  .agenda-section { margin-bottom: 22px; }
+  .agenda-section > h3 { font-size: 12px; text-transform: uppercase; letter-spacing: .06em;
+              color: var(--muted); font-weight: 700; margin: 0 0 10px; }
+  .agenda-section.overdue > h3 { color: #c0392b; }
+  .day-nav { display: flex; align-items: center; gap: 12px; margin-bottom: 20px; }
+  .day-nav button { border: 1px solid var(--border); background: var(--card); color: var(--text);
+              border-radius: 9px; width: 34px; height: 34px; font-size: 17px; line-height: 1; cursor: pointer; }
+  .day-nav button:hover { border-color: var(--accent); }
+  .day-nav .day-label { font-size: 16px; font-weight: 650; }
+  .ag-item { background: var(--card); border: 1px solid var(--border); border-radius: 14px;
+              box-shadow: var(--shadow); padding: 14px 16px; margin-bottom: 10px; animation: pop .18s ease; }
+  .ag-item.overdue { border-color: #c0392b55; }
+  .ag-row { display: flex; align-items: flex-start; gap: 12px; }
+  .ag-main { flex: 1; min-width: 0; }
+  .ag-title { font-size: 15px; font-weight: 600; line-height: 1.35; }
+  .ag-meta { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 8px; align-items: center; }
+  .ag-chip { font-size: 12px; background: var(--chip); color: var(--chip-text);
+              padding: 3px 10px; border-radius: 999px; font-weight: 600; }
+  .ag-chip.due { background: var(--surface-bg); color: var(--surface); }
+  .ag-chip.overdue { background: #fde8e6; color: #c0392b; }
+  @media (prefers-color-scheme: dark) { .ag-chip.overdue { background: #3a1512; color: #f2a49b; } }
+  .ag-chip.added { background: transparent; color: var(--accent); border: 1px solid var(--accent); }
+  .ag-src { color: var(--muted); font-size: 12px; }
+  .ag-actions { display: flex; gap: 6px; flex-shrink: 0; }
+  .ag-btn { font: inherit; font-size: 13px; cursor: pointer; color: var(--muted);
+              background: transparent; border: 1px solid var(--border); border-radius: 8px;
+              padding: 5px 11px; white-space: nowrap; transition: color .12s, border-color .12s; }
+  .ag-btn:hover { color: var(--accent); border-color: var(--accent); }
+  .ag-btn.danger:hover { color: #c0392b; border-color: #c0392b; }
+  .ag-btn:disabled { opacity: .5; cursor: default; }
+  .ag-note { color: var(--muted); font-size: 12px; font-style: italic; align-self: center; }
+  .ag-editor { display: grid; gap: 10px; }
+  .ag-editor label { display: block; font-size: 12px; color: var(--muted); margin-bottom: 3px; }
+  .ag-editor input[type=text], .ag-editor input[type=date], .ag-editor select {
+              font: inherit; width: 100%; box-sizing: border-box; background: var(--card); color: var(--text);
+              border: 1px solid var(--border); border-radius: 8px; padding: 7px 10px; }
+  .ag-editor input:focus, .ag-editor select:focus { outline: none; border-color: var(--accent); }
+  .ag-field-row { display: flex; gap: 10px; flex-wrap: wrap; }
+  .ag-field-row > div { flex: 1; min-width: 140px; }
+  .ag-clear { display: inline-flex; align-items: center; gap: 7px; font-size: 13px; color: var(--muted); cursor: pointer; }
+  .ag-clear input { accent-color: var(--accent); width: 15px; height: 15px; }
+  .ag-undo { display: flex; align-items: center; gap: 12px; color: var(--muted); font-size: 14px; }
 </style>
 </head>
 <body>
@@ -182,6 +226,7 @@
     <div class="logo">GUMBO<span>·</span>Assistant</div>
     <nav class="nav" id="nav">
       <button class="navbtn active" data-view="suggestions">Suggestions</button>
+      <button class="navbtn" data-view="agenda">Agenda</button>
       <button class="navbtn" data-view="memory">Memory</button>
     </nav>
     <div class="grow"></div>
@@ -191,6 +236,11 @@
     <button class="toolbtn view-suggestions" id="refreshBtn" onclick="load(true)">↻ Refresh</button>
     <input class="search view-memory" id="memSearch" type="search"
            placeholder="Search your propositions…" hidden />
+    <nav class="nav view-agenda" id="agendaGran" hidden>
+      <button class="navbtn active" data-gran="week">Week</button>
+      <button class="navbtn" data-gran="day">Day</button>
+    </nav>
+    <button class="toolbtn view-agenda" id="agendaRefresh" hidden>↻ Refresh</button>
   </div>
   <div class="tabs view-suggestions" id="tabs"></div>
 </header>
@@ -200,6 +250,7 @@
     <div class="center"><div class="spinner"></div>Thinking…</div>
   </div>
   <div id="memory" hidden></div>
+  <div id="agenda" hidden></div>
 </main>
 
 <script>
@@ -218,6 +269,9 @@
   const nav = document.getElementById('nav');
   const memoryEl = document.getElementById('memory');
   const memSearch = document.getElementById('memSearch');
+  const agendaEl = document.getElementById('agenda');
+  const agendaGranEl = document.getElementById('agendaGran');
+  const agendaRefresh = document.getElementById('agendaRefresh');
 
   let projects = loadProjects();
   let active = localStorage.getItem(ACTIVE_KEY) || ALL;
@@ -361,22 +415,28 @@
   // Memory page — a browsable view of the raw propositions in the GUM. Switching
   // is client-side; the Memory list is fetched lazily the first time it's shown.
   const VIEW_KEY = 'gumbo.view.v1';
-  let view = localStorage.getItem(VIEW_KEY) === 'memory' ? 'memory' : 'suggestions';
+  const VIEWS = ['suggestions', 'memory', 'agenda'];
+  const viewEls = { suggestions: main, memory: memoryEl, agenda: agendaEl };
+  let view = VIEWS.includes(localStorage.getItem(VIEW_KEY)) ? localStorage.getItem(VIEW_KEY) : 'suggestions';
   let memoryLoaded = false;
 
   function setView(next) {
+    if (!VIEWS.includes(next)) next = 'suggestions';
     view = next;
     localStorage.setItem(VIEW_KEY, view);
     for (const b of nav.querySelectorAll('.navbtn')) {
       b.classList.toggle('active', b.dataset.view === view);
     }
-    const memoryView = view === 'memory';
-    document.querySelectorAll('.view-suggestions').forEach(el => { el.hidden = memoryView; });
-    document.querySelectorAll('.view-memory').forEach(el => { el.hidden = !memoryView; });
-    main.hidden = memoryView;
-    memoryEl.hidden = !memoryView;
-    if (memoryView && !memoryLoaded) loadMemory();
-    else if (!memoryView && !document.querySelector('.card') && !busy) load();
+    // Per-view toolbar controls (.view-<name>) and content containers show only
+    // for the active view. The generic loop keeps all three views in sync.
+    for (const v of VIEWS) {
+      const on = (v === view);
+      document.querySelectorAll('.view-' + v).forEach(el => { el.hidden = !on; });
+      if (viewEls[v]) viewEls[v].hidden = !on;
+    }
+    if (view === 'memory' && !memoryLoaded) loadMemory();
+    else if (view === 'agenda' && !agendaLoaded) loadAgenda();
+    else if (view === 'suggestions' && !document.querySelector('.card') && !busy) load();
   }
 
   // ── Memory page (raw propositions) ────────────────────────────────────────
@@ -540,6 +600,303 @@
     if (btn) forgetProposition(btn.closest('tr'));
   });
 
+  // ── Agenda page (commitment & deadline radar, editable) ───────────────────
+  // The same ranked radar the CLI `gum agenda` / MCP surface build, but here the
+  // user can correct or dismiss items. The agenda is re-extracted by the model on
+  // every load, so a single wide fetch is bucketed client-side (Week/Day) against
+  // the server's `today` (never the browser clock), and edits are persisted as
+  // overrides that the /agenda merge overlays. See gum.agenda.apply_overrides.
+  const AG_GRAN_KEY = 'gumbo.agenda.gran.v1';
+  let agendaGran = localStorage.getItem(AG_GRAN_KEY) === 'day' ? 'day' : 'week';
+  let agendaLoaded = false, agBusy = false;
+  let agItems = [];    // commitments from the last fetch
+  let agToday = null;  // ISO 'YYYY-MM-DD' server-local "today"
+  let agDay = null;    // ISO selected day (Day view)
+
+  // String-based date math so bucketing matches the server's calendar day
+  // regardless of the browser's timezone (UTC noon avoids DST edge shifts).
+  function addDaysIso(iso, n) {
+    const [y, m, d] = iso.split('-').map(Number);
+    const dt = new Date(Date.UTC(y, m - 1, d, 12));
+    dt.setUTCDate(dt.getUTCDate() + n);
+    return dt.toISOString().slice(0, 10);
+  }
+  function fmtDayLabel(iso) {
+    const [y, m, d] = iso.split('-').map(Number);
+    return new Date(Date.UTC(y, m - 1, d, 12))
+      .toLocaleDateString(undefined, { weekday: 'long', month: 'short', day: 'numeric', timeZone: 'UTC' });
+  }
+  function relDay(iso, today) {
+    if (!today) return '';
+    if (iso === today) return 'Today';
+    if (iso === addDaysIso(today, 1)) return 'Tomorrow';
+    if (iso === addDaysIso(today, -1)) return 'Yesterday';
+    return '';
+  }
+  function dayLabel(iso) {
+    const rel = relDay(iso, agToday);
+    return (rel ? rel + ' · ' : '') + fmtDayLabel(iso);
+  }
+  function isOverdue(c) { return typeof c.days_until_due === 'number' && c.days_until_due < 0; }
+  function isUndated(c) { return c.due_date === null || c.due_date === undefined; }
+
+  function setGran(next) {
+    agendaGran = next === 'day' ? 'day' : 'week';
+    localStorage.setItem(AG_GRAN_KEY, agendaGran);
+    for (const b of agendaGranEl.querySelectorAll('.navbtn'))
+      b.classList.toggle('active', b.dataset.gran === agendaGran);
+    renderAgenda();
+  }
+
+  async function loadAgenda() {
+    if (agBusy) return;
+    agBusy = true; agendaLoaded = true;
+    agendaEl.innerHTML = '<div class="center"><div class="spinner"></div>Building your agenda…</div>';
+    try {
+      // Omit window_days so overdue + undated + a wide future set all arrive once;
+      // Week/Day is a client-side view over this single fetch.
+      const r = await fetch('/agenda?limit=50');
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      const data = await r.json();
+      agItems = data.commitments || [];
+      agToday = (data.today && data.today.date) || null;
+      if (!agDay) agDay = agToday;
+      renderAgenda();
+    } catch (e) {
+      agendaEl.innerHTML = '<div class="center"><h2>Couldn\'t build agenda</h2><p>'
+        + esc(String(e && e.message || e)) + '</p><p>Is GUM running?</p></div>';
+    }
+    agBusy = false;
+  }
+
+  function renderAgenda() {
+    if (!agItems.length) {
+      agendaEl.innerHTML = `
+        <div class="center"><div class="big">🗓️</div>
+        <h2>Nothing on the radar</h2>
+        <p>GUMBO surfaces commitments and deadlines as it learns them. Let it keep watching.</p></div>`;
+      return;
+    }
+    agendaEl.innerHTML = agendaGran === 'day' ? renderDay() : renderWeek();
+  }
+
+  function section(label, items, cls) {
+    if (!items.length) return '';
+    return `<div class="agenda-section ${cls || ''}"><h3>${esc(label)}</h3>`
+      + items.map(agItemHtml).join('') + `</div>`;
+  }
+
+  function renderWeek() {
+    const today = agToday;
+    let html = section('Overdue', agItems.filter(isOverdue), 'overdue');
+    const weekEnd = today ? addDaysIso(today, 6) : null;
+    for (let i = 0; i < 7 && today; i++) {
+      const iso = addDaysIso(today, i);
+      const items = agItems.filter(c => c.due_date === iso && !isOverdue(c));
+      html += section(dayLabel(iso), items);
+    }
+    const later = agItems.filter(c => !isUndated(c) && !isOverdue(c) && (!weekEnd || c.due_date > weekEnd));
+    html += section('Later', later);
+    html += section('No date', agItems.filter(isUndated));
+    return html;
+  }
+
+  function renderDay() {
+    const day = agDay || agToday;
+    const isToday = day === agToday;
+    let html = `
+      <div class="day-nav">
+        <button data-nav="-1" title="Previous day">‹</button>
+        <div class="day-label">${esc(day ? dayLabel(day) : '—')}</div>
+        <button data-nav="1" title="Next day">›</button>
+      </div>`;
+    const overdue = isToday ? agItems.filter(isOverdue) : [];
+    const due = agItems.filter(c => c.due_date === day && !isOverdue(c));
+    html += section('Overdue', overdue, 'overdue');
+    html += section(isToday ? 'Due today' : 'Due this day', due);
+    if (!overdue.length && !due.length) {
+      html += `<div class="center" style="padding:44px 20px"><p>Nothing due ${esc(isToday ? 'today' : 'this day')}.</p></div>`;
+    }
+    if (isToday) html += section('No fixed date', agItems.filter(isUndated));
+    return html;
+  }
+
+  function dueChipText(c) {
+    const d = c.days_until_due;
+    if (typeof d !== 'number') return 'Due ' + c.due_date;
+    if (d === 0) return 'Due today';
+    if (d < 0) return `${-d} day${d === -1 ? '' : 's'} overdue`;
+    if (d === 1) return 'Due tomorrow';
+    return `Due in ${d} days`;
+  }
+
+  function agItemHtml(c) {
+    const overdue = isOverdue(c);
+    const dueChip = isUndated(c)
+      ? `<span class="ag-chip">No date</span>`
+      : `<span class="ag-chip due ${overdue ? 'overdue' : ''}">${esc(dueChipText(c))}</span>`;
+    // Explicitly-added items (via the MCP tool or the user) carry an item_id and
+    // get a small badge so the origin is clear.
+    const addedChip = c.item_id ? `<span class="ag-chip added">added</span>` : '';
+    const statusChip = (c.status_guess && c.status_guess !== 'unknown')
+      ? `<span class="ag-chip">${esc(c.status_guess)}</span>` : '';
+    const confChip = (typeof c.confidence === 'number')
+      ? `<span class="ag-src">confidence ${c.confidence}/10</span>` : '';
+    const src = (c.source && c.source !== 'unknown' && c.source !== 'you')
+      ? `<span class="ag-src">· ${esc(c.source)}</span>` : '';
+    const actions = c.editable
+      ? `<div class="ag-actions">
+           <button class="ag-btn ag-edit">Edit</button>
+           <button class="ag-btn danger ag-dismiss">Dismiss</button>
+         </div>`
+      : `<div class="ag-actions"><span class="ag-note"
+             title="GUMBO couldn't link this to a source proposition, so it can't be edited">not editable</span></div>`;
+    return `
+      <div class="ag-item ${overdue ? 'overdue' : ''}" data-id="${c.proposition_id ?? ''}"
+           data-item-id="${c.item_id ?? ''}"
+           data-title="${escAttr(c.title)}" data-due="${escAttr(c.due_date || '')}"
+           data-status="${escAttr(c.status_guess || '')}">
+        <div class="ag-row">
+          <div class="ag-main">
+            <div class="ag-title">${esc(c.title)}</div>
+            <div class="ag-meta">${addedChip}${dueChip}${statusChip}${confChip}${src}</div>
+          </div>
+          ${actions}
+        </div>
+      </div>`;
+  }
+
+  // Route edit/dismiss/undo to the right endpoint family: added items
+  // (item_id) hit /agenda/item/{id}; model-extracted commitments hit
+  // /agenda/{proposition_id}.
+  function agBase(item) {
+    const iid = item.dataset.itemId;
+    if (iid) return '/agenda/item/' + encodeURIComponent(iid);
+    const pid = item.dataset.id;
+    if (pid) return '/agenda/' + encodeURIComponent(pid);
+    return null;
+  }
+
+  // Inline edit: swap the item's row into a small editor, then PATCH /agenda/{id}.
+  function startAgEdit(item) {
+    if (item.classList.contains('editing')) return;
+    item.classList.add('editing');
+    const title = item.dataset.title || '';
+    const due = item.dataset.due || '';
+    const status = item.dataset.status || '';
+    const statuses = ['not started', 'in progress', 'blocked', 'done', 'unknown'];
+    const opts = statuses.map(s =>
+      `<option value="${escAttr(s)}" ${s === status ? 'selected' : ''}>${esc(s)}</option>`).join('');
+    const row = item.querySelector('.ag-row');
+    row.dataset.orig = row.innerHTML;
+    row.innerHTML = `
+      <div class="ag-main">
+        <div class="ag-editor">
+          <div>
+            <label>Title</label>
+            <input class="ag-e-title" type="text" value="${escAttr(title)}">
+          </div>
+          <div class="ag-field-row">
+            <div><label>Due date</label><input class="ag-e-due" type="date" value="${escAttr(due)}"></div>
+            <div><label>Status</label><select class="ag-e-status">${opts}</select></div>
+          </div>
+          <label class="ag-clear"><input type="checkbox" class="ag-e-clear"> No fixed date</label>
+          <div class="ag-actions">
+            <button class="ag-btn ag-save" style="color:#fff;background:var(--accent);border-color:var(--accent)">Save</button>
+            <button class="ag-btn ag-cancel">Cancel</button>
+          </div>
+        </div>
+      </div>`;
+    item.querySelector('.ag-e-title').focus();
+  }
+
+  function cancelAgEdit(item) {
+    item.classList.remove('editing');
+    const row = item.querySelector('.ag-row');
+    if (row && row.dataset.orig !== undefined) { row.innerHTML = row.dataset.orig; delete row.dataset.orig; }
+  }
+
+  async function saveAgEdit(item) {
+    const base = agBase(item);
+    if (!base) return;
+    const title = item.querySelector('.ag-e-title').value.trim();
+    const due = item.querySelector('.ag-e-due').value.trim();
+    const status = item.querySelector('.ag-e-status').value;
+    const clear = item.querySelector('.ag-e-clear').checked;
+    // Only send fields the user actually changed, so an edit doesn't push a
+    // spurious "status" correction observation on every save.
+    const body = {};
+    if (title && title !== (item.dataset.title || '')) body.title = title;
+    if (clear) body.clear_due_date = true;
+    else if (due && due !== (item.dataset.due || '')) body.due_date = due;
+    if (status && status !== (item.dataset.status || '')) body.status = status;
+    if (!Object.keys(body).length) { cancelAgEdit(item); return; }
+    const btn = item.querySelector('.ag-save');
+    btn.disabled = true;
+    try {
+      const r = await fetch(base, {
+        method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+      });
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      const data = await r.json();
+      if (!data.ok) throw new Error(data.error || 'failed');
+      loadAgenda();
+    } catch (e) {
+      btn.disabled = false; btn.textContent = "Couldn't — retry";
+    }
+  }
+
+  async function dismissAgItem(item) {
+    const base = agBase(item);
+    if (!base) return;
+    const btn = item.querySelector('.ag-dismiss');
+    if (btn) btn.disabled = true;
+    try {
+      const r = await fetch(base + '/dismiss', { method: 'POST' });
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      const data = await r.json();
+      if (!data.ok) throw new Error('failed');
+      // Replace the item body with an inline Undo affordance (no full reload, so
+      // the user can reverse a mis-click before it scrolls away). The undo URL is
+      // carried on the button so it works for both endpoint families.
+      const title = item.dataset.title || 'Item';
+      const undoUrl = base + '/undo';
+      item.classList.remove('overdue');
+      item.innerHTML = `<div class="ag-undo"><span>Dismissed “${esc(title)}”.</span>
+        <button class="ag-btn ag-undo-btn" data-endpoint="${escAttr(undoUrl)}">Undo</button></div>`;
+    } catch (e) {
+      if (btn) { btn.disabled = false; btn.textContent = "Couldn't — retry"; }
+    }
+  }
+
+  async function undoAgItem(endpoint, item) {
+    try {
+      const r = await fetch(endpoint, { method: 'POST' });
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      loadAgenda();
+    } catch (e) {
+      const b = item && item.querySelector('.ag-undo-btn');
+      if (b) b.textContent = "Couldn't — retry";
+    }
+  }
+
+  agendaEl.addEventListener('click', (e) => {
+    if (e.target.closest('.ag-cancel')) { cancelAgEdit(e.target.closest('.ag-item')); return; }
+    if (e.target.closest('.ag-save')) { saveAgEdit(e.target.closest('.ag-item')); return; }
+    if (e.target.closest('.ag-edit')) { startAgEdit(e.target.closest('.ag-item')); return; }
+    if (e.target.closest('.ag-dismiss')) { dismissAgItem(e.target.closest('.ag-item')); return; }
+    const undoBtn = e.target.closest('.ag-undo-btn');
+    if (undoBtn) { undoAgItem(undoBtn.dataset.endpoint, undoBtn.closest('.ag-item')); return; }
+    const navBtn = e.target.closest('.day-nav button');
+    if (navBtn) { agDay = addDaysIso(agDay || agToday, parseInt(navBtn.dataset.nav, 10)); renderAgenda(); return; }
+  });
+
+  agendaGranEl.addEventListener('click', (e) => {
+    const b = e.target.closest('.navbtn');
+    if (b && b.dataset.gran !== agendaGran) setGran(b.dataset.gran);
+  });
+  agendaRefresh.addEventListener('click', () => loadAgenda());
+
   // ── Feedback (thumbs) ─────────────────────────────────────────────────────
   // A reaction is itself an observation about the user (paper §4.3): POST it so
   // the GUM learns which proactive suggestions land and future ones improve.
@@ -672,8 +1029,13 @@
   });
 
   renderTabs();
-  if (view === 'memory') setView('memory');
-  else load();
+  // Reflect the persisted Week/Day choice on the toggle before first paint.
+  for (const b of agendaGranEl.querySelectorAll('.navbtn'))
+    b.classList.toggle('active', b.dataset.gran === agendaGran);
+  // Deep-link: the tray's "Open Agenda" opens /gumbo#agenda, so honor the hash
+  // over the last-active view; otherwise restore whatever view was last shown.
+  setView(location.hash === '#agenda' ? 'agenda' : view);
+  window.addEventListener('hashchange', () => { if (location.hash === '#agenda') setView('agenda'); });
 </script>
 </body>
 </html>

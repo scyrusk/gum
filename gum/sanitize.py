@@ -24,6 +24,20 @@ DEFAULT_DB_PATH = "~/.cache/gum/entities.db"
 DEFAULT_MODEL = "openai/privacy-filter"
 DEFAULT_MIN_SCORE = 0.5
 
+# Calendar dates are PRESERVED, not pseudonymized, by default. privacy-filter
+# tags dates ("2026-07-20", "next Friday", "April 2024") with a `date` label, and
+# pseudonymizing them to [DATE_n] destroys the one piece of signal the whole
+# deadline pipeline exists to surface: the propositions carry absolute YYYY-MM-DD
+# deadlines (see PROPOSE_PROMPT's temporal grounding), and an off-device agent
+# building the user's daily agenda from the *sanitized* output would see "[DATE_5]"
+# instead of "2026-07-20" and be unable to reason about what is due when. A bare
+# calendar date is not a re-identifier on its own — the same stance the MCP
+# `today` anchor takes — so keeping it leaks nothing an agent needs protection
+# from while making the pseudonymized output actually usable for scheduling.
+# A privacy-maximizing deployment can restore date-pseudonymization by setting
+# GUM_SANITIZE_REDACT_DATES=1.
+DEFAULT_REDACT_DATES = False
+
 # A token-classification forward pass costs O(seq_len^2) in activation memory, and
 # the privacy-filter pipeline does NOT truncate on its own (and truncation would be
 # unacceptable here — it silently drops, and thus leaks, any PII past the cutoff).
@@ -38,6 +52,14 @@ MAX_PIPE_CHARS = 1200
 # size (rather than "all windows at once") keeps peak memory bounded regardless of
 # how large the input is.
 PIPE_BATCH_SIZE = 16
+
+# Carrier sentence for Sanitizer.sanitize_fragment. The NER model has poor recall
+# on a bare, context-free name (a lone "Jacob Willie Agnew" is not tagged, while
+# the same name inside a sentence is), so a short field is ALSO run through the
+# detector inside this carrier and any entity found is redacted from the original.
+# The tokens are PII-free (they never become spans themselves); keep them so.
+_FRAGMENT_CARRIER_PREFIX = "Regarding "
+_FRAGMENT_CARRIER_SUFFIX = ", please follow up."
 
 # privacy-filter emits labels for person, email, phone, address, account number,
 # url, date, and secret. `aggregation_strategy="simple"` strips the BIOES prefixes,
@@ -203,12 +225,23 @@ class Sanitizer:
         model: str | None = None,
         min_score: float | None = None,
         entity_map: EntityMap | None = None,
+        redact_dates: bool | None = None,
     ):
         self._model_name = model or os.getenv("GUM_SANITIZE_MODEL") or DEFAULT_MODEL
         self._min_score = (
             min_score
             if min_score is not None
             else float(os.getenv("GUM_SANITIZE_MIN_SCORE", str(DEFAULT_MIN_SCORE)))
+        )
+        # Whether to pseudonymize detected calendar dates. Off by default so
+        # deadlines survive to a downstream agenda-building agent (see
+        # DEFAULT_REDACT_DATES); a privacy-maximizing deployment opts in via
+        # GUM_SANITIZE_REDACT_DATES=1.
+        self._redact_dates = (
+            redact_dates
+            if redact_dates is not None
+            else os.getenv("GUM_SANITIZE_REDACT_DATES", "0").strip().lower()
+            in ("1", "true", "yes", "on")
         )
         self._entities = entity_map or EntityMap()
         self._pipeline = None
@@ -244,6 +277,47 @@ class Sanitizer:
         """Return *text* with every detected PII span replaced by a pseudo-ID."""
         return self.sanitize_map(text)[0]
 
+    def sanitize_fragment(self, text: str) -> str:
+        """Sanitize a short, context-free value (a bare name, a terse title/field).
+
+        The privacy-filter model's recall on a name depends on the surrounding
+        context, and *neither* the bare value nor a carriered one dominates:
+
+        * A lone ``"Jacob Willie Agnew"`` (a commitment's owner/source) passes
+          straight through un-pseudonymized on its own, but the same name inside
+          a sentence is tagged — so a carrier sentence catches it.
+        * A value that already has a leading verb (``"Meet Jacob Willie Agnew"``,
+          a typical title) is caught bare, but wrapping it in a carrier can
+          *under*-detect it (dropping a trailing token) — so the bare pass is
+          better there.
+
+        Short model-written fields arrive as both shapes, so scrubbing them one
+        way leaks PII on a surface that reports itself ``sanitized``. This runs
+        the detector on BOTH the bare value and the value inside a fixed,
+        PII-free carrier sentence, then redacts the union of every raw span
+        either pass found — defense in depth, strictly at least as redacted as a
+        plain :meth:`sanitize`. Pseudo-IDs stay consistent with sentence-context
+        scrubbing because the entity map keys on the entity text, not the carrier.
+        """
+        if not text or not text.strip():
+            return text
+        _, bare = self.sanitize_map(text)
+        _, carried = self.sanitize_map(
+            _FRAGMENT_CARRIER_PREFIX + text + _FRAGMENT_CARRIER_SUFFIX
+        )
+        spans = {**carried, **bare}  # raw span -> pseudo-id, from either pass
+        if not spans:
+            return text
+        out = text
+        # Longest span first so a superstring ("Jacob Willie Agnew") is consumed
+        # before a substring ("Jacob Willie") one pass may have found instead. The
+        # `raw in out` guard skips any span that came back fused with carrier text
+        # (e.g. ", please") and so isn't present in the original.
+        for raw in sorted(spans, key=len, reverse=True):
+            if raw and raw in out:
+                out = out.replace(raw, spans[raw])
+        return out
+
     def sanitize_map(self, text: str) -> tuple[str, dict[str, str]]:
         """Sanitize *text* and also return the ``{raw_span: pseudo_id}`` map of what
         was replaced.
@@ -270,11 +344,20 @@ class Sanitizer:
         spans: list[tuple] = []
         for (base, _window), window_spans in zip(windows, results):
             for sp in window_spans:
+                category = _category_for(sp.get("entity_group", ""))
+                # Preserve calendar dates unless date-redaction is explicitly on:
+                # dropping the span here means it is never merged or replaced, so
+                # the literal date survives as the deadline signal downstream needs
+                # (see DEFAULT_REDACT_DATES). DATE spans never coalesce with an
+                # adjacent PERSON/EMAIL/etc. run (the merge is same-category only),
+                # so skipping them cannot leave a real entity partially exposed.
+                if category == "DATE" and not self._redact_dates:
+                    continue
                 spans.append(
                     (
                         sp["start"] + base,
                         sp["end"] + base,
-                        _category_for(sp.get("entity_group", "")),
+                        category,
                         float(sp.get("score", 0.0)),
                     )
                 )

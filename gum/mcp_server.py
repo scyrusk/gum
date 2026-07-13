@@ -25,13 +25,19 @@ from __future__ import annotations
 import asyncio
 import re
 from contextlib import asynccontextmanager
+from datetime import date, datetime
 from typing import Any
 
 from mcp.server.fastmcp import FastMCP
 
 # Reuse the exact serialization + egress-sanitization the REST API uses so the
 # two machine-facing surfaces expose propositions identically.
-from .api import _serialize_observation, _serialize_proposition
+from .agenda import _extract_dates, _today_anchor
+from .api import (
+    _serialize_commitment,
+    _serialize_observation,
+    _serialize_proposition,
+)
 from .gum import gum
 
 # An agent calls gather_context with a *task instruction* ("draft a grant
@@ -90,7 +96,12 @@ _INSTRUCTIONS = (
     "collaborators, deadlines, or preferences — call `gather_context` with a "
     "short description of the task to retrieve the relevant propositions, then "
     "ground your work in them. Use `recent_context` to see what the user has "
-    "been doing lately. Higher `confidence` (1-10) means the model is more "
+    "been doing lately. Use `agenda` to see the user's ranked open commitments "
+    "and deadlines before scheduling, drafting, or planning on their behalf. "
+    "Use `upcoming_deadlines` to get the raw, complete set of propositions that "
+    "carry an absolute calendar deadline (a deterministic date scan that "
+    "complements `agenda`'s local-model extraction). "
+    "Higher `confidence` (1-10) means the model is more "
     "certain. Each proposition carries an `id`; call `inspect_proposition` with "
     "it to see the raw observations the model inferred it from when you need the "
     "underlying evidence to ground your work. Content may be pseudonymized "
@@ -103,9 +114,21 @@ _INSTRUCTIONS = (
     "it still carries those placeholders and is not usable until the user restores "
     "the real names on-device with `gum rehydrate <file>`; save your output to a "
     "file and point the user at that command.\n\n"
+    "Use `add_agenda_item` to put a commitment on the user's agenda on their "
+    "behalf (after helping them plan or commit to something). Keep any pseudo-IDs "
+    "in the title/note verbatim — the GUM rehydrates them to the real values "
+    "locally before saving, so the item lands in the user's agenda in their real "
+    "terms without the names ever coming back to you. This is the one write tool; "
+    "everything else here is read-only.\n\n"
     "The `with_user_context` prompt packages this whole workflow — gather "
     "context, optionally inspect evidence, then execute — for a given task; "
-    "clients can offer it to the user as a one-shot action."
+    "clients can offer it to the user as a one-shot action. The `daily_agenda` "
+    "prompt packages a related workflow — pull the deadline radar and recent "
+    "context, then synthesize the user's prioritized agenda for the day — for a "
+    "morning briefing or 'what should I focus on today?'.\n\n"
+    "The `agenda` tool's response includes a `today` field (the user's real "
+    "local date); when reasoning about any commitment's `due_date` or "
+    "`days_until_due`, anchor on that rather than your own sense of the date."
 )
 
 
@@ -279,6 +302,231 @@ def build_mcp(gum_instance: gum, *, sanitize: bool = True) -> FastMCP:
             ],
             "sanitized": sanitizer is not None,
         }
+
+    @mcp.tool(
+        description=(
+            "Return the user's commitment & deadline radar: a ranked list of the "
+            "open commitments and deadlines the General User Model has inferred "
+            "(papers, grants, reviews, meetings, payments, promises), most urgent "
+            "first. Use this to see what is time-critical for the user before "
+            "scheduling, drafting, or planning on their behalf. Each item carries "
+            "a `due_date` (or null if undated), `days_until_due` (negative = "
+            "overdue), a `status_guess`, the model's `confidence` (1-10), and an "
+            "`urgency` rank. Pass `window_days` to only include commitments due "
+            "within that horizon (overdue and undated items are always kept)."
+        )
+    )
+    async def agenda(
+        limit: int = 10, window_days: int | None = None
+    ) -> dict[str, Any]:
+        # Import lazily so the (heavy) agenda engine and its LLM/schema deps only
+        # load when this tool is actually called, mirroring cmd_agenda.
+        from .agenda import build_agenda
+
+        limit = max(1, min(int(limit), 50))
+        window = None if window_days is None else max(0, int(window_days))
+        commitments = await build_agenda(
+            gum_instance,
+            limit=limit,
+            window_days=window,
+            now=datetime.now().astimezone(),
+        )
+        items = [
+            await _serialize_commitment(c, sanitizer) for c in commitments
+        ]
+        return {
+            # The temporal anchor an off-device agent needs to turn each
+            # commitment's absolute `due_date` / `days_until_due` into "what is
+            # due today / this week" — it cannot reliably know the user's local
+            # date itself. See `_today_anchor`.
+            "today": _today_anchor(),
+            "count": len(items),
+            "window_days": window,
+            "commitments": items,
+            "sanitized": sanitizer is not None,
+        }
+
+    @mcp.tool(
+        description=(
+            "Add an item to the user's agenda on their behalf (e.g. after helping "
+            "them plan, commit to a task, or schedule something). Provide a short "
+            "`title`, an optional `due_date` as an absolute `YYYY-MM-DD` (resolve "
+            "relative dates like 'next Friday' against the `today` anchor the "
+            "`agenda` tool returns — do NOT guess), an optional `status` ('not "
+            "started' | 'in progress' | 'blocked' | 'done'), and an optional "
+            "`note`. IMPORTANT: the context you were given is pseudonymized, so if "
+            "the title/note refer to an entity you only know as a pseudo-ID (e.g. "
+            "[PERSON_1], [ORG_1]), KEEP that pseudo-ID verbatim — do NOT invent a "
+            "real name. The GUM restores the real value locally, on the user's "
+            "device, before saving; the real names are never sent back to you. The "
+            "item then appears in the user's local agenda UI. Returns the new "
+            "`item_id` and how many placeholders were restored (a count only)."
+        )
+    )
+    async def add_agenda_item(
+        title: str,
+        due_date: str | None = None,
+        status: str | None = None,
+        note: str | None = None,
+    ) -> dict[str, Any]:
+        from .agenda import _parse_due
+
+        title = (title or "").strip()
+        if not title:
+            return {"ok": False, "error": "title is required"}
+        due = (due_date or "").strip() or None
+        if due is not None and _parse_due(due) is None:
+            return {"ok": False, "error": "due_date must be an absolute YYYY-MM-DD"}
+        note = (note or "").strip() or None
+
+        # Re-identify on-device: the agent only ever saw pseudonymized context, so
+        # its title/note may carry pseudo-IDs. Rehydrate them here — a pure local
+        # entity-map lookup, no model — so the stored agenda item is in the user's
+        # real terms. The rehydrated text is NEVER returned to the agent (that
+        # would defeat the pseudonymization); we return only a substitution count.
+        restored = 0
+        r_title, r_note = title, note
+        if sanitizer is not None:
+            r_title, n1 = await asyncio.to_thread(sanitizer.rehydrate, title)
+            restored += n1
+            if note is not None:
+                r_note, n2 = await asyncio.to_thread(sanitizer.rehydrate, note)
+                restored += n2
+
+        item_id = await gum_instance.add_agenda_item(
+            title=r_title,
+            due_date=due,
+            status=(status or None),
+            note=r_note,
+            source="added by an assistant",
+            created_by="mcp",
+        )
+        return {
+            "ok": item_id is not None,
+            "item_id": item_id,
+            # A count of placeholders from the agent's OWN input — reveals no new
+            # PII, and lets the agent confirm its pseudo-IDs were understood.
+            "rehydrated_placeholders": restored,
+            "sanitized": sanitizer is not None,
+            "note": (
+                "Saved to the user's local agenda and de-pseudonymized on-device; "
+                "the real values are intentionally not returned here."
+            ),
+        }
+
+    @mcp.tool(
+        description=(
+            "Return the propositions whose text carries an absolute calendar "
+            "deadline (a `YYYY-MM-DD` date), scanned deterministically from the "
+            "user's General User Model — no model extraction, so it surfaces the "
+            "complete, unfiltered set of dated commitments the GUM has recorded. "
+            "Each item is a proposition (with its `id`, `text`, `confidence`, and "
+            "`created_at`) plus the parsed `deadline` and `days_until_due` "
+            "(negative = overdue). Overdue items are always included; upcoming "
+            "ones are kept only if within `window_days` (default 30). Sorted "
+            "soonest-first. Use this ALONGSIDE `agenda` when building a daily "
+            "plan: `agenda` gives the local model's ranked, deduplicated "
+            "interpretation (and includes undated commitments), while this gives "
+            "you the raw dated signal to reason over yourself and to catch dated "
+            "items the extractor may have dropped. Read the returned `today` as "
+            "\"now\"."
+        )
+    )
+    async def upcoming_deadlines(
+        window_days: int = 30, limit: int = 20
+    ) -> dict[str, Any]:
+        window = max(0, int(window_days))
+        limit = max(1, min(int(limit), 50))
+        today = datetime.now().astimezone().date()
+        # Scan a generous pool of recent propositions (not just the newest few)
+        # so a deadline recorded a while back but due soon isn't missed for
+        # falling out of a short recency window. Bounded so a huge GUM can't make
+        # this unboundedly expensive.
+        scan = min(500, max(200, limit * 20))
+        props = await gum_instance.recent(limit=scan)
+        matches: list[tuple[int, int, Any, date]] = []
+        for p in props:
+            dates = _extract_dates(p.text or "")
+            if not dates:
+                continue
+            # Represent each proposition by its most actionable date: the soonest
+            # one that is today-or-later, else (all past) the most recent overdue
+            # date. A proposition can name several dates ("meet 2026-07-15,
+            # deliverable due 2026-07-20"); the nearest upcoming one is what a
+            # daily plan turns on.
+            future = sorted(d for d in dates if d >= today)
+            chosen = future[0] if future else max(dates)
+            days = (chosen - today).days
+            # Overdue (days < 0) is always kept; upcoming only within the window.
+            if days > window:
+                continue
+            matches.append((days, p.id, p, chosen))
+        # Soonest-first (most-overdue first), deterministic id tiebreak. Serialize
+        # only the top `limit` so the (per-text) sanitizer runs a bounded number
+        # of times regardless of how many propositions carry dates.
+        matches.sort(key=lambda t: (t[0], t[1]))
+        items: list[dict[str, Any]] = []
+        for days, _pid, p, chosen in matches[:limit]:
+            item = await _serialize_proposition(p, sanitizer)
+            item["deadline"] = chosen.isoformat()
+            item["days_until_due"] = days
+            items.append(item)
+        return {
+            "today": _today_anchor(),
+            "window_days": window,
+            "count": len(items),
+            "deadlines": items,
+            "sanitized": sanitizer is not None,
+        }
+
+    @mcp.prompt(
+        name="daily_agenda",
+        title="Build the user's daily agenda from their GUM",
+        description=(
+            "Have a capable agent assemble the user's daily agenda — what is due, "
+            "overdue, or worth doing today — grounded in the commitments and "
+            "deadlines the user's General User Model has inferred. Use this for "
+            "'what should I focus on today?', a morning briefing, or planning the "
+            "day. Expands into an instruction to pull the deadline radar and "
+            "recent context, then synthesize a prioritized, date-grounded agenda."
+        ),
+    )
+    def daily_agenda(horizon: str = "today") -> str:
+        # A discoverable entry point that lets a frontier agent (which extracts
+        # and prioritizes far better than the local model) build the agenda
+        # itself from the pseudonymized radar + raw dated propositions, rather
+        # than just reformatting the local model's `agenda` output. It leans on
+        # the `today` anchor the agenda tool returns so temporal reasoning is
+        # grounded on-device, not on the agent's stale cutoff.
+        return (
+            f"Build the user's agenda for: {horizon}.\n\n"
+            "Ground it entirely in what the user's General User Model (GUM) "
+            "knows — do not invent commitments:\n"
+            "1. Call `agenda` to get the ranked commitment & deadline radar. Read "
+            "its `today` field (the user's real local date) and use THAT as "
+            "\"now\" — not your own sense of the date — to judge each item's "
+            "`due_date` / `days_until_due` (negative = overdue).\n"
+            "2. Call `upcoming_deadlines` to get the raw, complete set of "
+            "propositions carrying an absolute YYYY-MM-DD deadline (the radar in "
+            "step 1 runs a lossy local extractor, so this catches dated "
+            "commitments it dropped or merged). Reconcile the two by proposition "
+            "`id`; each item carries a `deadline`, `days_until_due`, and a "
+            "`confidence` (1-10) — weight higher-confidence items more. Optionally "
+            "also call `recent_context` for undated but active work worth "
+            "advancing.\n"
+            "3. For any item you are unsure about, call `inspect_proposition` "
+            "with its `id` to read the underlying observations before including "
+            "it.\n"
+            "4. Synthesize a prioritized agenda for the requested horizon: lead "
+            "with overdue and due-today items, then upcoming deadlines, then "
+            "high-confidence undated commitments worth advancing. For each, show "
+            "the deadline (or 'no date') relative to today and keep it concise.\n\n"
+            "GUM content may be pseudonymized (e.g. [PERSON_1], [ORG_1]); treat "
+            "each pseudo-ID as a stable stand-in for one real entity and keep it "
+            "verbatim — never guess the real value. If the radar was `sanitized` "
+            "and you save the agenda to a file, tell the user to restore the real "
+            "names on-device with `gum rehydrate <file>`."
+        )
 
     return mcp
 

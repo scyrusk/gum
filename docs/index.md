@@ -152,6 +152,7 @@ You can start a GUM server directly from the command line.
     > curl "http://127.0.0.1:8422/query?q=gum&limit=5"
     > curl "http://127.0.0.1:8422/recent?limit=5"
     > curl "http://127.0.0.1:8422/observations?limit=5"
+    > curl "http://127.0.0.1:8422/agenda?limit=5"   # ranked commitment & deadline radar
     ```
 
     Output:

@@ -53,6 +53,10 @@ gum observations                # list the most recent raw observations (--full 
 gum observations --date 7/7/2026  # all observations from a given Eastern-time day
 gum observations --date 7/7/2026 -o day.txt   # write results to a file (exports full content)
 
+gum agenda                      # ranked radar of your open commitments & deadlines
+gum agenda --window 7           # only commitments due within 7 days (overdue/undated always shown)
+gum agenda --json               # machine-readable JSON (add -s / --sanitize to pseudonymize PII)
+
 gum review                      # open a browser GUI to judge propositions True/False (see below)
 ```
 
@@ -98,7 +102,7 @@ pip install "gum-ai[tray]"      # one-time: adds rumps
 gum tray                        # 🧠 appears in the menu bar (💤 when stopped)
 ```
 
-From the menu you can **Start / Stop GUM**, **Search GUM…** (results in a pop-up), skim **Recent Propositions** (click one for its full reasoning and confidence), **Open Review UI**, or **Open Logs**. It drives the same daemon and localhost API as the CLI, so it works alongside everything above.
+From the menu you can **Start / Stop GUM**, **Search GUM…** (results in a pop-up), skim **Recent Propositions** (click one for its full reasoning and confidence), **Open GUMBO Assistant**, **Open Agenda** (your editable commitment & deadline radar), **Open Review UI**, or **Open Logs**. It drives the same daemon and localhost API as the CLI, so it works alongside everything above.
 
 #### Launch it at login
 
@@ -156,7 +160,19 @@ While the GUM is running it serves a **localhost-only REST API** (default `http:
 curl "http://127.0.0.1:8422/query?q=email&limit=5"
 curl "http://127.0.0.1:8422/recent?limit=5"
 curl "http://127.0.0.1:8422/observations?limit=5"
+curl "http://127.0.0.1:8422/agenda?limit=5&window_days=14"   # ranked commitment radar
 ```
+
+The `/agenda` endpoint returns the same ranked commitment/deadline radar as the
+`gum agenda` CLI and the MCP `agenda` tool, as JSON; like every response it is
+pseudonymized when the server runs with `--sanitize`.
+
+The radar builds in two passes: the local model first extracts candidate
+commitments from a pool of recent propositions, then re-judges each one *in
+isolation* ("is this a discrete, dischargeable task, or an ongoing activity?") to
+drop the habits and roles the first, pool-wide pass tends to over-promote. Both
+passes are greedy (deterministic) and stay on your local models. Set
+`GUM_AGENDA_VERIFY=0` to skip the second pass (faster, but noisier).
 
 Or use it from Python directly (`from gum import gum; await gum(...).query("email")`), or wire up an [MCP server](docs/tutorials/mcp.md) for Claude Desktop / Codex — including the built-in, PII-sanitized `gum mcp` (fail-closed and on by default) that lets a local agent pull your context on demand and hand the finished artifact back through `gum rehydrate`.
 

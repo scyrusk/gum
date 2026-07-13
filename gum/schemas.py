@@ -113,6 +113,62 @@ class SuggestionSchema(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
+class CommitmentItem(BaseModel):
+    """A single open commitment/deadline the agenda extractor pulled from one
+    proposition.
+
+    ``source_index`` ties the commitment back to the numbered proposition it was
+    extracted from, so the ranker can reuse that proposition's confidence, decay,
+    and age (see gum.agenda) instead of asking the model to re-derive them.
+    """
+    source_index: int = Field(
+        ..., description="1-based index of the proposition this commitment was extracted from"
+    )
+    title: str = Field(
+        ..., description="Short imperative title of the commitment, e.g. 'Submit the NSF grant proposal'"
+    )
+    due_date: Optional[str] = Field(
+        ...,
+        description="Absolute due date as an ISO 8601 'YYYY-MM-DD' string, or null if the proposition implies no specific date",
+    )
+    source: str = Field(
+        ...,
+        description="Who the commitment is owed to or where it came from (a named person, org, or app), or 'unknown'",
+    )
+    status_guess: str = Field(
+        ...,
+        description="Best guess at status: 'not started', 'in progress', 'blocked', or 'unknown'",
+    )
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class CommitmentSchema(BaseModel):
+    commitments: List[CommitmentItem] = Field(
+        ..., description="Open commitments/deadlines found in the propositions; empty if none qualify"
+    )
+    model_config = ConfigDict(extra="forbid")
+
+
+class CommitmentVerdictSchema(BaseModel):
+    """Verdict from the agenda's second-pass verification of one candidate.
+
+    The extraction pass classifies commitments while looking at the *whole*
+    candidate pool, which pressures the model to promote borderline ongoing
+    activities to fill the list. This verdict re-judges a single candidate in
+    isolation — a cleaner binary decision — so those false positives can be
+    dropped before ranking (see gum.agenda.CommitmentRadar).
+    """
+    is_commitment: bool = Field(
+        ..., description="True only if the proposition implies a genuine discrete, dischargeable commitment"
+    )
+    reason: str = Field(
+        ..., description="One short phrase justifying the verdict"
+    )
+
+    model_config = ConfigDict(extra="forbid")
+
+
 def get_schema(json_schema):
     return {
         "type": "json_schema",

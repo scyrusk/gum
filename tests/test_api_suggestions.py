@@ -9,6 +9,7 @@
 
 from __future__ import annotations
 
+import os
 import tempfile
 import unittest
 import uuid
@@ -19,7 +20,12 @@ from fastapi.testclient import TestClient
 from gum import gum as Gum
 from gum.api import create_app
 from gum.models import Observation, Proposition
-from gum.schemas import SuggestionItem, SuggestionSchema
+from gum.schemas import (
+    CommitmentItem,
+    CommitmentSchema,
+    SuggestionItem,
+    SuggestionSchema,
+)
 
 
 def _prop(text: str, confidence: int) -> Proposition:
@@ -421,6 +427,390 @@ class SuggestionsEndpointTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("Chicago", sugs[0]["description"])
         # Numeric scores are untouched by the scrubber.
         self.assertEqual(sugs[0]["probability_useful"], 9)
+
+
+class AgendaEndpointTests(unittest.IsolatedAsyncioTestCase):
+    """The Commitment & Deadline Radar exposed over HTTP as `GET /agenda`.
+
+    Same ranked list the CLI `gum agenda` and MCP `agenda` surfaces build. The
+    text model is stubbed (patched structured_completion) so these drive the
+    read-only FastAPI app end-to-end while staying offline and deterministic. A
+    far-future due date keeps `days_until_due` positive regardless of the real
+    "now" the endpoint computes.
+    """
+
+    async def asyncSetUp(self):
+        # Only the extraction call is stubbed; disable the second-pass
+        # verification so it doesn't hit the same stub (covered by
+        # tests.test_agenda.VerificationPassTests).
+        self.enterContext(mock.patch.dict(os.environ, {"GUM_AGENDA_VERIFY": "0"}))
+        self._tmp = tempfile.TemporaryDirectory()
+        self.gum = Gum("Omar", "dummy-model", data_directory=self._tmp.name, db_name="test.db")
+        await self.gum.connect_db()
+        async with self.gum._session() as s:
+            s.add_all([
+                _prop("Omar has a grant proposal deadline for the Schmidt Foundation", 9),
+                _prop("Omar promised to send reviewer comments back to a colleague", 7),
+            ])
+
+    async def asyncTearDown(self):
+        if self.gum.engine is not None:
+            await self.gum.engine.dispose()
+        self._tmp.cleanup()
+
+    def _fake_completion(self):
+        async def fake(client, model, messages, schema, **kwargs):
+            return CommitmentSchema(commitments=[
+                CommitmentItem(source_index=1,
+                               title="Submit the Schmidt grant proposal",
+                               due_date="2999-07-20", source="Schmidt",
+                               status_guess="in progress"),
+                CommitmentItem(source_index=2, title="Send reviewer comments",
+                               due_date=None, source="a colleague",
+                               status_guess="not started"),
+            ])
+        return fake
+
+    def test_agenda_ranked_and_shaped(self):
+        app = create_app(self.gum)
+        with mock.patch("gum.agenda.structured_completion", side_effect=self._fake_completion()):
+            with TestClient(app) as client:
+                resp = client.get("/agenda")
+        self.assertEqual(resp.status_code, 200)
+        body = resp.json()
+        self.assertEqual(body["count"], 2)
+        self.assertFalse(body["sanitized"])
+        self.assertIsNone(body["window_days"])
+        commitments = body["commitments"]
+        # A dated commitment always outranks an undated one.
+        self.assertEqual(commitments[0]["title"], "Submit the Schmidt grant proposal")
+        self.assertEqual(commitments[0]["due_date"], "2999-07-20")
+        self.assertIsNone(commitments[1]["due_date"])
+        # Provenance + ranking fields are present for a client to render.
+        for key in ("urgency", "days_until_due", "proposition_id", "status_guess"):
+            self.assertIn(key, commitments[0])
+
+    def test_window_excludes_far_future_commitments(self):
+        app = create_app(self.gum)
+        with mock.patch("gum.agenda.structured_completion", side_effect=self._fake_completion()):
+            with TestClient(app) as client:
+                resp = client.get("/agenda", params={"window_days": 30})
+        body = resp.json()
+        self.assertEqual(body["window_days"], 30)
+        # The year-2999 deadline is far outside a 30-day horizon; the undated
+        # commitment has no date and is always kept.
+        titles = [c["title"] for c in body["commitments"]]
+        self.assertEqual(titles, ["Send reviewer comments"])
+
+    def test_limit_caps_results(self):
+        app = create_app(self.gum)
+        with mock.patch("gum.agenda.structured_completion", side_effect=self._fake_completion()):
+            with TestClient(app) as client:
+                resp = client.get("/agenda", params={"limit": 1})
+        self.assertEqual(len(resp.json()["commitments"]), 1)
+
+    def test_sanitize_scrubs_commitment_text(self):
+        # Under --sanitize the model-written text fields are pseudonymized on the
+        # way out while numeric/date/ranking fields pass through unchanged.
+        fake_sanitizer = mock.Mock()
+        fake_sanitizer.load = mock.Mock()
+        fake_sanitizer.sanitize = mock.Mock(side_effect=lambda t: t.replace("Schmidt", "[ORG]"))
+        # title/source use the carrier-context fragment path; this fake is
+        # context-independent so it scrubs a fragment the same as a sentence.
+        fake_sanitizer.sanitize_fragment = mock.Mock(side_effect=lambda t: t.replace("Schmidt", "[ORG]"))
+        with mock.patch("gum.sanitize.get_sanitizer", return_value=fake_sanitizer):
+            app = create_app(self.gum, sanitize=True)
+            with mock.patch("gum.agenda.structured_completion", side_effect=self._fake_completion()):
+                with TestClient(app) as client:
+                    resp = client.get("/agenda")
+        body = resp.json()
+        self.assertTrue(body["sanitized"])
+        top = body["commitments"][0]
+        self.assertEqual(top["title"], "Submit the [ORG] grant proposal")
+        self.assertNotIn("Schmidt", top["source"])
+        # The date is untouched by the scrubber.
+        self.assertEqual(top["due_date"], "2999-07-20")
+
+
+class AgendaEditEndpointTests(unittest.IsolatedAsyncioTestCase):
+    """Editing/dismissing agenda items over REST (GUMBO Agenda page).
+
+    The extraction model is stubbed; each edit persists as an override that the
+    `GET /agenda` merge overlays, and propagates back into the GUM (proposition
+    rewrite + correction observation). The batcher's `push` is patched so the
+    correction observations don't kick off real inference during the test.
+    """
+
+    async def asyncSetUp(self):
+        self.enterContext(mock.patch.dict(os.environ, {"GUM_AGENDA_VERIFY": "0"}))
+        self._tmp = tempfile.TemporaryDirectory()
+        self.gum = Gum("Omar", "dummy-model", data_directory=self._tmp.name, db_name="test.db")
+        await self.gum.connect_db()
+        async with self.gum._session() as s:
+            s.add_all([
+                # One proposition carries exactly one absolute date (rewritable),
+                # the other is undated.
+                _prop("Omar must submit the Schmidt grant proposal by 2026-07-20.", 9),
+                _prop("Omar promised to send reviewer comments back to a colleague.", 7),
+            ])
+
+    async def asyncTearDown(self):
+        if self.gum.engine is not None:
+            await self.gum.engine.dispose()
+        self._tmp.cleanup()
+
+    def _fake(self):
+        async def fake(client, model, messages, schema, **kwargs):
+            return CommitmentSchema(commitments=[
+                CommitmentItem(source_index=1, title="Submit the Schmidt grant proposal",
+                               due_date="2026-07-20", source="Schmidt", status_guess="in progress"),
+                CommitmentItem(source_index=2, title="Send reviewer comments",
+                               due_date=None, source="a colleague", status_guess="not started"),
+            ])
+        return fake
+
+    def _get(self, client):
+        return client.get("/agenda?limit=50").json()
+
+    def test_today_anchor_and_editable(self):
+        app = create_app(self.gum)
+        with mock.patch("gum.agenda.structured_completion", side_effect=self._fake()):
+            with mock.patch.object(self.gum.batcher, "push"):
+                with TestClient(app) as client:
+                    body = self._get(client)
+        self.assertIn("today", body)
+        self.assertRegex(body["today"]["date"], r"^\d{4}-\d{2}-\d{2}$")
+        self.assertIn("weekday", body["today"])
+        self.assertTrue(all(c["editable"] for c in body["commitments"]))
+
+    def test_edit_overrides_due_date_and_persists(self):
+        app = create_app(self.gum)
+        with mock.patch("gum.agenda.structured_completion", side_effect=self._fake()):
+            with mock.patch.object(self.gum.batcher, "push"):
+                with TestClient(app) as client:
+                    before = self._get(client)
+                    # Target the dated item by its proposition text (robust to the
+                    # model's source-index ordering).
+                    target = [c for c in before["commitments"]
+                              if "2026-07-20" in c["proposition_text"]][0]
+                    pid = target["proposition_id"]
+                    r = client.patch(f"/agenda/{pid}", json={"due_date": "2026-08-15"}).json()
+                    self.assertTrue(r["ok"])
+                    after = self._get(client)
+        edited = [c for c in after["commitments"] if c["proposition_id"] == pid][0]
+        self.assertEqual(edited["due_date"], "2026-08-15")
+
+    def test_edit_rewrites_single_date_proposition_text(self):
+        app = create_app(self.gum)
+        with mock.patch("gum.agenda.structured_completion", side_effect=self._fake()):
+            with mock.patch.object(self.gum.batcher, "push"):
+                with TestClient(app) as client:
+                    before = self._get(client)
+                    target = [c for c in before["commitments"]
+                              if "2026-07-20" in c["proposition_text"]][0]
+                    pid = target["proposition_id"]
+                    client.patch(f"/agenda/{pid}", json={"due_date": "2026-08-15"})
+                    # The date inside the source proposition was rewritten in place
+                    # (so the deterministic MCP upcoming_deadlines scan sees the fix
+                    # too), visible through the Memory endpoint.
+                    mem = client.get("/memory").json()
+        text = [p["text"] for p in mem["propositions"] if p["id"] == pid][0]
+        self.assertIn("2026-08-15", text)
+        self.assertNotIn("2026-07-20", text)
+
+    def test_edit_normalizes_non_iso_due_date_to_iso(self):
+        # `_parse_due` accepts a few lenient formats (e.g. mm/dd/yyyy) so a local
+        # model's drift still lands on the radar. But a parseable-but-non-ISO value
+        # must be canonicalized to YYYY-MM-DD before it is stored or spliced into
+        # the proposition text — otherwise the `\d{4}-\d{2}-\d{2}` deadline scans
+        # (and a later rewrite) would no longer see the date.
+        app = create_app(self.gum)
+        with mock.patch("gum.agenda.structured_completion", side_effect=self._fake()):
+            with mock.patch.object(self.gum.batcher, "push"):
+                with TestClient(app) as client:
+                    before = self._get(client)
+                    target = [c for c in before["commitments"]
+                              if "2026-07-20" in c["proposition_text"]][0]
+                    pid = target["proposition_id"]
+                    r = client.patch(f"/agenda/{pid}", json={"due_date": "07/20/2026"}).json()
+                    self.assertTrue(r["ok"])
+                    after = self._get(client)
+                    mem = client.get("/memory").json()
+        edited = [c for c in after["commitments"] if c["proposition_id"] == pid][0]
+        self.assertEqual(edited["due_date"], "2026-07-20")
+        text = [p["text"] for p in mem["propositions"] if p["id"] == pid][0]
+        self.assertIn("2026-07-20", text)
+        self.assertNotIn("07/20/2026", text)
+
+    def test_edit_title_persists_over_model_output(self):
+        app = create_app(self.gum)
+        with mock.patch("gum.agenda.structured_completion", side_effect=self._fake()):
+            with mock.patch.object(self.gum.batcher, "push"):
+                with TestClient(app) as client:
+                    before = self._get(client)
+                    pid = before["commitments"][0]["proposition_id"]
+                    client.patch(f"/agenda/{pid}", json={"title": "Finish the proposal"})
+                    after = self._get(client)
+        edited = [c for c in after["commitments"] if c["proposition_id"] == pid][0]
+        self.assertEqual(edited["title"], "Finish the proposal")
+
+    def test_edit_pushes_correction_observation(self):
+        app = create_app(self.gum)
+        with mock.patch("gum.agenda.structured_completion", side_effect=self._fake()):
+            with mock.patch.object(self.gum.batcher, "push") as push:
+                with TestClient(app) as client:
+                    before = self._get(client)
+                    pid = before["commitments"][0]["proposition_id"]
+                    client.patch(f"/agenda/{pid}", json={"status": "blocked"})
+        self.assertTrue(push.called)
+        self.assertEqual(push.call_args.kwargs["observer_name"], "gumbo_agenda_edit")
+
+    def test_bad_date_rejected(self):
+        app = create_app(self.gum)
+        with mock.patch("gum.agenda.structured_completion", side_effect=self._fake()):
+            with mock.patch.object(self.gum.batcher, "push"):
+                with TestClient(app) as client:
+                    before = self._get(client)
+                    pid = before["commitments"][0]["proposition_id"]
+                    r = client.patch(f"/agenda/{pid}", json={"due_date": "next Friday"}).json()
+        self.assertFalse(r["ok"])
+
+    def test_edit_missing_proposition_returns_not_found(self):
+        app = create_app(self.gum)
+        with mock.patch("gum.agenda.structured_completion", side_effect=self._fake()):
+            with mock.patch.object(self.gum.batcher, "push"):
+                with TestClient(app) as client:
+                    r = client.patch("/agenda/99999", json={"title": "x"}).json()
+        self.assertFalse(r["ok"])
+
+    def test_dismiss_hides_item_but_keeps_proposition(self):
+        app = create_app(self.gum)
+        with mock.patch("gum.agenda.structured_completion", side_effect=self._fake()):
+            with mock.patch.object(self.gum.batcher, "push") as push:
+                with TestClient(app) as client:
+                    before = self._get(client)
+                    pid = [c for c in before["commitments"]
+                           if "reviewer comments" in c["proposition_text"]][0]["proposition_id"]
+                    r = client.post(f"/agenda/{pid}/dismiss").json()
+                    self.assertTrue(r["ok"])
+                    after = self._get(client)
+                    # Dismissed item is gone from the radar…
+                    self.assertNotIn(pid, [c["proposition_id"] for c in after["commitments"]])
+                    # …but the proposition is NOT deleted (dismiss != forget).
+                    mem = client.get("/memory").json()
+        self.assertIn(pid, [p["id"] for p in mem["propositions"]])
+        self.assertEqual(push.call_args.kwargs["observer_name"], "gumbo_agenda_dismiss")
+
+    def test_undo_restores_dismissed_item(self):
+        app = create_app(self.gum)
+        with mock.patch("gum.agenda.structured_completion", side_effect=self._fake()):
+            with mock.patch.object(self.gum.batcher, "push"):
+                with TestClient(app) as client:
+                    before = self._get(client)
+                    pid = before["commitments"][0]["proposition_id"]
+                    client.post(f"/agenda/{pid}/dismiss")
+                    self.assertNotIn(pid, [c["proposition_id"] for c in self._get(client)["commitments"]])
+                    client.post(f"/agenda/{pid}/undo")
+                    restored = self._get(client)
+        self.assertIn(pid, [c["proposition_id"] for c in restored["commitments"]])
+
+    def test_override_persists_when_model_drops_item(self):
+        app = create_app(self.gum)
+        with mock.patch.object(self.gum.batcher, "push"):
+            with mock.patch("gum.agenda.structured_completion", side_effect=self._fake()):
+                with TestClient(app) as client:
+                    before = self._get(client)
+                    pid = before["commitments"][0]["proposition_id"]
+                    client.patch(f"/agenda/{pid}", json={"title": "Sticky edit"})
+                # Next load: the model now extracts nothing, but the edit must stick.
+                async def empty(client_, model, messages, schema, **kwargs):
+                    return CommitmentSchema(commitments=[])
+                with mock.patch("gum.agenda.structured_completion", side_effect=empty):
+                    with TestClient(app) as client:
+                        after = self._get(client)
+        titles = {c["proposition_id"]: c["title"] for c in after["commitments"]}
+        self.assertEqual(titles.get(pid), "Sticky edit")
+
+
+class AgendaAddedItemEndpointTests(unittest.IsolatedAsyncioTestCase):
+    """Explicitly-added agenda items (e.g. from the MCP add tool) show up in
+    `GET /agenda` as first-class, editable commitments keyed by item_id, and edit
+    directly (no proposition, no correction observation)."""
+
+    async def asyncSetUp(self):
+        self.enterContext(mock.patch.dict(os.environ, {"GUM_AGENDA_VERIFY": "0"}))
+        self._tmp = tempfile.TemporaryDirectory()
+        self.gum = Gum("Omar", "dummy-model", data_directory=self._tmp.name, db_name="test.db")
+        await self.gum.connect_db()
+        self.iid = await self.gum.add_agenda_item(
+            title="Submit the Q3 report", due_date="2999-07-20",
+            status="in progress", source="added by an assistant", created_by="mcp",
+        )
+
+    async def asyncTearDown(self):
+        if self.gum.engine is not None:
+            await self.gum.engine.dispose()
+        self._tmp.cleanup()
+
+    def _empty_model(self):
+        async def fake(client, model, messages, schema, **kwargs):
+            return CommitmentSchema(commitments=[])
+        return fake
+
+    def _client(self):
+        return TestClient(create_app(self.gum))
+
+    def test_added_item_appears_editable_with_item_id(self):
+        with mock.patch("gum.agenda.structured_completion", side_effect=self._empty_model()):
+            with self._client() as client:
+                body = client.get("/agenda").json()
+        items = [c for c in body["commitments"] if c.get("item_id") == self.iid]
+        self.assertEqual(len(items), 1)
+        c = items[0]
+        self.assertTrue(c["editable"])
+        self.assertIsNone(c["proposition_id"])
+        self.assertEqual(c["title"], "Submit the Q3 report")
+        self.assertEqual(c["due_date"], "2999-07-20")
+
+    def test_edit_item_endpoint(self):
+        with mock.patch("gum.agenda.structured_completion", side_effect=self._empty_model()):
+            with self._client() as client:
+                r = client.patch(f"/agenda/item/{self.iid}",
+                                 json={"status": "blocked", "due_date": "2999-08-01"}).json()
+                self.assertTrue(r["ok"])
+                c = [x for x in client.get("/agenda").json()["commitments"]
+                     if x.get("item_id") == self.iid][0]
+        self.assertEqual(c["status_guess"], "blocked")
+        self.assertEqual(c["due_date"], "2999-08-01")
+
+    def test_edit_item_bad_date_and_missing(self):
+        with mock.patch("gum.agenda.structured_completion", side_effect=self._empty_model()):
+            with self._client() as client:
+                self.assertFalse(client.patch(f"/agenda/item/{self.iid}",
+                                              json={"due_date": "soon"}).json()["ok"])
+                self.assertFalse(client.patch("/agenda/item/999999",
+                                              json={"title": "x"}).json()["ok"])
+
+    def test_dismiss_and_undo_item(self):
+        with mock.patch("gum.agenda.structured_completion", side_effect=self._empty_model()):
+            with self._client() as client:
+                self.assertTrue(client.post(f"/agenda/item/{self.iid}/dismiss").json()["ok"])
+                gone = client.get("/agenda").json()["commitments"]
+                self.assertNotIn(self.iid, [c.get("item_id") for c in gone])
+                self.assertTrue(client.post(f"/agenda/item/{self.iid}/undo").json()["ok"])
+                back = client.get("/agenda").json()["commitments"]
+        self.assertIn(self.iid, [c.get("item_id") for c in back])
+
+
+class AgendaPageTests(unittest.TestCase):
+    def test_gumbo_page_has_agenda_view(self):
+        # The static page must expose the Agenda nav + container the tray deep-links
+        # to (/gumbo#agenda). Assert directly against the shipped file.
+        from gum.api import _STATIC_DIR
+        html = (_STATIC_DIR / "gumbo.html").read_text()
+        self.assertIn('data-view="agenda"', html)
+        self.assertIn('id="agenda"', html)
+        self.assertIn("#agenda", html)  # deep-link handling
 
 
 if __name__ == "__main__":
