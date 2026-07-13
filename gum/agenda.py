@@ -664,41 +664,25 @@ def apply_overrides(
     ``prop`` snapshot (``id``/``text``/``confidence``/``decay``/``created_at``, or
     None if the proposition was since deleted).
 
-    For each surfaced commitment we look for a matching override, first by
-    ``proposition_id`` and then — because the SIMILAR→revise path can replace a
-    proposition with a new id — by normalized-title ``dedupe_key``. A matched
-    override either drops the item (``dismissed``) or overlays its fields.
-    Overrides that matched nothing this run are reconstructed from their
+    Each surfaced commitment is matched to an override by ``proposition_id``. A
+    matched override either drops the item (``dismissed``) or overlays its fields.
+    Overrides the model didn't surface this run are reconstructed from their
     proposition snapshot so the edit still shows. Items with no ``proposition_id``
     can't be keyed and pass through untouched. The result is re-sorted and
     re-limited so overlays and reconstructions land in the right place.
     """
     by_id: dict[int, dict[str, Any]] = {}
-    by_key: dict[str, dict[str, Any]] = {}
     for ov in overrides:
         pid = ov.get("proposition_id")
         if pid is not None:
             by_id[pid] = ov
-        key = ov.get("dedupe_key")
-        if key:
-            by_key.setdefault(key, ov)
 
     used: set[int] = set()
     out: list[Commitment] = []
     for c in commitments:
         ov = None
         if c.proposition_id is not None:
-            # Match by id first; fall back to the normalized-title key so an
-            # override re-binds after re-inference replaces the proposition with a
-            # new id. An item with no proposition_id can't be keyed at all — leave
-            # it untouched (it's non-editable) rather than let a title collision
-            # hijack it.
-            if c.proposition_id in by_id:
-                ov = by_id[c.proposition_id]
-            else:
-                key = _dedupe_key(c.title)
-                if key and key in by_key:
-                    ov = by_key[key]
+            ov = by_id.get(c.proposition_id)
         if ov is None:
             out.append(c)
             continue

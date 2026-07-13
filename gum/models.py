@@ -227,39 +227,25 @@ class AgendaOverride(Base):
 
     A ``None`` field means "not overridden" (fall through to the model's value);
     ``due_date_cleared`` distinguishes an explicit "no fixed date" from "date not
-    overridden". ``dedupe_key`` is a normalized-title snapshot
-    (:func:`gum.agenda._dedupe_key`) used as a *fallback* match: the GUM's
-    SIMILAR→revise path deletes-and-replaces a proposition with a **new** id.
-    Rather than cascade this row away with the old proposition, the foreign key
-    is ``ON DELETE SET NULL`` so the override **survives** — ``proposition_id``
-    goes to NULL while ``dedupe_key`` is retained — letting
-    :func:`gum.agenda.apply_overrides` re-bind the edit by normalized title to
-    the replacement commitment the next time the radar surfaces it. A correctly
-    re-bound row would be pointless if it had been deleted first; surviving as an
-    orphan is what makes the title fallback able to fire at all.
-
-    A re-bound override surfaces in the UI under the replacement proposition's
-    id, so the next edit/dismiss/undo arrives keyed by that new id. The override
-    mutators (:meth:`gum.gum.gum._get_or_make_override` /
-    :meth:`clear_agenda_override`) therefore fall back to ``dedupe_key`` when the
-    id lookup misses and **re-anchor** the surviving orphan to the new id — so an
-    orphan is reaped onto its replacement on first mutation rather than leaking a
-    duplicate row or a dismissal that can't be undone.
-
-    Tradeoff: a user "Forget" also leaves an orphan (``proposition_id`` NULL)
-    that matches nothing unless a future commitment's title happens to collide —
-    accepted as a small, rare cost. SQLite treats NULLs as distinct under the
-    ``unique`` constraint, so multiple orphaned rows coexist fine.
+    overridden". The override provides *visual* persistence of an edit/dismissal
+    for as long as its source proposition lives: it is cascade-deleted with the
+    proposition, so a user "Forget" removes it, and the GUM's SIMILAR→revise path
+    (which deletes-and-replaces a proposition) removes it too. Durability across
+    that proposition churn does **not** come from this row — it comes from the
+    natural-language correction observation the edit/dismiss pushes into the
+    inference pipeline, which teaches re-inference to reflect the change in the
+    revised proposition (and, for a clean single-date edit, from the direct
+    rewrite of the proposition text). The override is only the short-lived
+    overlay that keeps the edit visible until that propagation catches up.
 
     Auto-created by :func:`init_db` via ``Base.metadata.create_all`` (same as
     :class:`PropositionFeedback`); no FTS index is needed.
 
     Attributes:
         id (int): Primary key.
-        proposition_id (Optional[int]): Source proposition — unique, one override
-            per proposition (repeated edits merge onto the same row). Set to NULL
-            (orphaned, kept alive) when the proposition is deleted/revised.
-        dedupe_key (Optional[str]): Normalized-title snapshot for fallback match.
+        proposition_id (int): Source proposition — unique, one override per
+            proposition (repeated edits merge onto the same row). Cascade-deleted
+            with the proposition.
         title (Optional[str]): Overridden title, or None.
         status (Optional[str]): Overridden status guess, or None.
         due_date (Optional[str]): Overridden ISO ``YYYY-MM-DD`` due date, or None.
@@ -270,11 +256,10 @@ class AgendaOverride(Base):
     __tablename__ = "agenda_overrides"
 
     id:               Mapped[int]           = mapped_column(primary_key=True)
-    proposition_id:   Mapped[Optional[int]] = mapped_column(
-        ForeignKey("propositions.id", ondelete="SET NULL"),
-        unique=True, index=True,
+    proposition_id:   Mapped[int]           = mapped_column(
+        ForeignKey("propositions.id", ondelete="CASCADE"),
+        unique=True, index=True, nullable=False,
     )
-    dedupe_key:       Mapped[Optional[str]] = mapped_column(String(200), index=True)
     title:            Mapped[Optional[str]] = mapped_column(Text)
     status:           Mapped[Optional[str]] = mapped_column(String(40))
     due_date:         Mapped[Optional[str]] = mapped_column(String(10))

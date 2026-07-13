@@ -1260,19 +1260,8 @@ rule. Do not rewrite candidates and do not include their text in your response.
         self,
         session: AsyncSession,
         proposition_id: int,
-        dedupe_key: str | None = None,
     ) -> AgendaOverride:
-        """Fetch the override row for a proposition, creating it if absent.
-
-        When no row is bound to ``proposition_id`` yet but ``dedupe_key`` is given,
-        first look for a survived orphan (``proposition_id IS NULL`` left behind by
-        a SIMILAR→revise churn under ``ondelete=SET NULL``) with the same key and
-        *re-anchor* it to the replacement proposition. This keeps a re-bound edit or
-        dismissal on the same row instead of leaking a duplicate, and lets an
-        id-keyed mutation reach a row that only surfaces in the UI via the title
-        fallback. Re-anchoring is safe against the ``UNIQUE(proposition_id)``
-        constraint because we only reach here when no row already owns it.
-        """
+        """Fetch the override row for a proposition, creating it if absent."""
         ov = (
             await session.execute(
                 select(AgendaOverride).where(
@@ -1280,16 +1269,6 @@ rule. Do not rewrite candidates and do not include their text in your response.
                 )
             )
         ).scalar_one_or_none()
-        if ov is None and dedupe_key:
-            ov = (
-                await session.execute(
-                    select(AgendaOverride)
-                    .where(AgendaOverride.proposition_id.is_(None))
-                    .where(AgendaOverride.dedupe_key == dedupe_key)
-                )
-            ).scalars().first()
-            if ov is not None:
-                ov.proposition_id = proposition_id
         if ov is None:
             ov = AgendaOverride(proposition_id=proposition_id)
             session.add(ov)
@@ -1303,7 +1282,6 @@ rule. Do not rewrite candidates and do not include their text in your response.
         due_date: str | None = None,
         status: str | None = None,
         clear_due_date: bool = False,
-        dedupe_title: str | None = None,
     ) -> bool:
         """Persist a user's edit to a generated agenda item and propagate it.
 
@@ -1316,12 +1294,11 @@ rule. Do not rewrite candidates and do not include their text in your response.
         proposition. Only fields the caller passes are changed. Returns False if
         the proposition no longer exists.
         """
-        from .agenda import _dedupe_key, _extract_dates, rewrite_due_date
+        from .agenda import _extract_dates, rewrite_due_date
 
         title = title.strip() if title else None
         status = status.strip() if status else None
         due_date = due_date.strip() if due_date else None
-        dedupe_title = dedupe_title.strip() if dedupe_title else None
 
         old_date: str | None = None
         old_text: str = ""
@@ -1331,14 +1308,7 @@ rule. Do not rewrite candidates and do not include their text in your response.
                 return False
             old_text = prop.text
 
-            # Snapshot a normalized-title key so the override can re-bind if
-            # re-inference later replaces the proposition with a new id. Prefer the
-            # client-supplied displayed title (which apply_overrides matches via
-            # _dedupe_key(c.title)) over the full proposition sentence, so due-date-
-            # or status-only edits can still re-bind after the id churns. Computing
-            # it up front also lets _get_or_make_override re-anchor a survived orphan.
-            key = _dedupe_key(dedupe_title or title or old_text)
-            ov = await self._get_or_make_override(session, proposition_id, key)
+            ov = await self._get_or_make_override(session, proposition_id)
             if title is not None:
                 ov.title = title
             if status is not None:
@@ -1349,7 +1319,6 @@ rule. Do not rewrite candidates and do not include their text in your response.
             elif due_date is not None:
                 ov.due_date = due_date
                 ov.due_date_cleared = False
-            ov.dedupe_key = _dedupe_key(dedupe_title or title or ov.title or old_text)
 
             # Direct proposition rewrite, only when the date maps unambiguously.
             if due_date is not None and not clear_due_date:
@@ -1391,7 +1360,6 @@ rule. Do not rewrite candidates and do not include their text in your response.
         proposition_id: int,
         *,
         note: str | None = None,
-        dedupe_title: str | None = None,
     ) -> bool:
         """Remove an item from the agenda without deleting its proposition.
 
@@ -1402,28 +1370,14 @@ rule. Do not rewrite candidates and do not include their text in your response.
         observation stating it's not a commitment, letting re-inference gradually
         stop classifying it as one. Returns False if the proposition is gone.
         """
-        from .agenda import _dedupe_key
-
-        dedupe_title = dedupe_title.strip() if dedupe_title else None
-
         old_text = ""
         async with self._session() as session:
             prop = await session.get(Proposition, proposition_id)
             if prop is None:
                 return False
             old_text = prop.text
-            # Key off the client-supplied displayed title (matched by
-            # apply_overrides via _dedupe_key(c.title)) so a dismissal re-binds
-            # after re-inference gives the proposition a new id; computed up front
-            # so _get_or_make_override can re-anchor a survived orphan instead of
-            # leaking a duplicate row.
-            key = _dedupe_key(dedupe_title) if dedupe_title else None
-            ov = await self._get_or_make_override(session, proposition_id, key)
+            ov = await self._get_or_make_override(session, proposition_id)
             ov.dismissed = True
-            if dedupe_title:
-                ov.dedupe_key = _dedupe_key(dedupe_title)
-            elif not ov.dedupe_key:
-                ov.dedupe_key = _dedupe_key(ov.title or old_text)
 
         parts = [
             f'{self.user_name} indicated that the note "{old_text.strip()}" is not '
@@ -1439,24 +1393,14 @@ rule. Do not rewrite candidates and do not include their text in your response.
         )
         return True
 
-    async def clear_agenda_override(
-        self, proposition_id: int, dedupe_title: str | None = None
-    ) -> bool:
+    async def clear_agenda_override(self, proposition_id: int) -> bool:
         """Undo a persisted agenda edit/dismissal (delete the override row).
 
         This reverts the *visual* overlay so the agenda shows the model's raw
         output again. It cannot retract a correction observation already pushed by
         a prior edit/dismiss — that evidence has entered the pipeline. Returns
         False if there was no override to clear.
-
-        A re-bound override that survived a proposition churn surfaces in the UI
-        under the *replacement* proposition's id but is stored as an orphan
-        (``proposition_id IS NULL``). When the id lookup misses, fall back to the
-        client-supplied displayed title so such a dismissal can still be undone.
         """
-        from .agenda import _dedupe_key
-
-        dedupe_title = dedupe_title.strip() if dedupe_title else None
         async with self._session() as session:
             ov = (
                 await session.execute(
@@ -1465,14 +1409,6 @@ rule. Do not rewrite candidates and do not include their text in your response.
                     )
                 )
             ).scalar_one_or_none()
-            if ov is None and dedupe_title:
-                ov = (
-                    await session.execute(
-                        select(AgendaOverride)
-                        .where(AgendaOverride.proposition_id.is_(None))
-                        .where(AgendaOverride.dedupe_key == _dedupe_key(dedupe_title))
-                    )
-                ).scalars().first()
             if ov is None:
                 return False
             await session.delete(ov)
@@ -1493,11 +1429,7 @@ rule. Do not rewrite candidates and do not include their text in your response.
             rows = (await session.execute(select(AgendaOverride))).scalars().all()
             out: List[dict] = []
             for ov in rows:
-                prop = (
-                    await session.get(Proposition, ov.proposition_id)
-                    if ov.proposition_id is not None
-                    else None
-                )
+                prop = await session.get(Proposition, ov.proposition_id)
                 snap = None
                 if prop is not None:
                     snap = {
@@ -1510,7 +1442,6 @@ rule. Do not rewrite candidates and do not include their text in your response.
                 out.append(
                     {
                         "proposition_id": ov.proposition_id,
-                        "dedupe_key": ov.dedupe_key,
                         "title": ov.title,
                         "status": ov.status,
                         "due_date": ov.due_date,

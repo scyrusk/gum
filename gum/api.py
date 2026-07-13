@@ -57,11 +57,6 @@ class AgendaEditIn(BaseModel):
     due_date: str | None = None  # ISO YYYY-MM-DD
     status: str | None = None
     clear_due_date: bool = False
-    # The currently-displayed (model-extracted) title, sent unchanged even when
-    # the user renames the item. The server keys the override's normalized-title
-    # dedupe_key off this so the override can re-bind after re-inference replaces
-    # the source proposition with a new id. Absent for added items (item_id).
-    dedupe_title: str | None = None
 
 
 class ChatMessage(BaseModel):
@@ -416,37 +411,24 @@ def create_app(gum_instance: gum, *, sanitize: bool = False) -> FastAPI:
             due_date=due,
             status=body.status,
             clear_due_date=body.clear_due_date,
-            dedupe_title=body.dedupe_title,
         )
         if not ok:
             return {"ok": False, "error": "not found"}
         return {"ok": True}
 
     @app.post("/agenda/{proposition_id}/dismiss")
-    async def agenda_dismiss(
-        proposition_id: int, dedupe_title: str | None = None
-    ) -> dict[str, Any]:
+    async def agenda_dismiss(proposition_id: int) -> dict[str, Any]:
         # Remove an item from the radar. Deliberately not a DELETE on the
         # proposition — dismissing "this isn't a commitment" must not erase a fact
-        # that may still be true (see gum.dismiss_agenda_item). dedupe_title is the
-        # displayed title, keyed so the dismissal re-binds after re-inference gives
-        # the proposition a new id.
-        ok = await gum_instance.dismiss_agenda_item(
-            proposition_id, dedupe_title=dedupe_title
-        )
+        # that may still be true (see gum.dismiss_agenda_item).
+        ok = await gum_instance.dismiss_agenda_item(proposition_id)
         return {"ok": ok}
 
     @app.post("/agenda/{proposition_id}/undo")
-    async def agenda_undo(
-        proposition_id: int, dedupe_title: str | None = None
-    ) -> dict[str, Any]:
+    async def agenda_undo(proposition_id: int) -> dict[str, Any]:
         # Revert a persisted edit/dismissal so the item shows the model's raw
         # output again. Cannot retract an already-pushed correction observation.
-        # dedupe_title lets undo resolve a re-bound override that survived a
-        # proposition churn as an orphan (proposition_id IS NULL).
-        ok = await gum_instance.clear_agenda_override(
-            proposition_id, dedupe_title=dedupe_title
-        )
+        ok = await gum_instance.clear_agenda_override(proposition_id)
         return {"ok": ok}
 
     # ── explicitly-added agenda items (assistant/user) ────────────────────────

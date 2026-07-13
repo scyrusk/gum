@@ -493,7 +493,6 @@ def _commitment(**kw) -> Commitment:
 def _override(pid: int, **kw) -> dict:
     base = dict(
         proposition_id=pid,
-        dedupe_key=None,
         title=None,
         status=None,
         due_date=None,
@@ -575,22 +574,12 @@ class ApplyOverridesTests(unittest.TestCase):
 
     def test_item_without_proposition_id_passes_through(self):
         c = _commitment(proposition_id=None, title="Submit the grant")
-        # An override that would match by title can't bind — no proposition_id key.
-        ov = _override(99, dedupe_key=_dedupe_key("Submit the grant"), title="Hijacked")
+        # An item with no proposition_id can't be keyed to any override.
+        ov = _override(99, title="Hijacked")
         out = apply_overrides([c], [ov], now=NOW)
         # The un-keyable item is untouched; the override reconstructs separately only
         # if it has a prop snapshot (it doesn't here), so it's dropped silently.
         self.assertEqual(out[0].title, "Submit the grant")
-
-    def test_dedupe_key_fallback_rebinds_after_id_churn(self):
-        # Re-inference replaced the proposition, so the surfaced id (5) differs from
-        # the override's id (99); the normalized-title key still binds them.
-        c = _commitment(proposition_id=5, title="Submit the NSF grant")
-        ov = _override(
-            99, dedupe_key=_dedupe_key("Submit the NSF grant"), title="Submit the NSF grant (final)"
-        )
-        out = apply_overrides([c], [ov], now=NOW)
-        self.assertEqual(out[0].title, "Submit the NSF grant (final)")
 
     def test_synthesizes_item_the_model_dropped(self):
         # No surfaced commitment for pid 7, but the override has a live snapshot, so

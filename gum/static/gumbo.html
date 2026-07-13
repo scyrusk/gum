@@ -831,11 +831,6 @@
     else if (due && due !== (item.dataset.due || '')) body.due_date = due;
     if (status && status !== (item.dataset.status || '')) body.status = status;
     if (!Object.keys(body).length) { cancelAgEdit(item); return; }
-    // For proposition-backed items, send the currently-displayed model title
-    // (unchanged even when the user renames) so the server keys the override's
-    // dedupe_key off it and can re-bind after re-inference churns the id. Added
-    // items (item_id) are keyed by row id and must not send it.
-    if (!item.dataset.itemId) body.dedupe_title = item.dataset.title || '';
     const btn = item.querySelector('.ag-save');
     btn.disabled = true;
     try {
@@ -857,12 +852,7 @@
     const btn = item.querySelector('.ag-dismiss');
     if (btn) btn.disabled = true;
     try {
-      // Proposition-backed dismissals carry the displayed title so the override
-      // re-binds after the proposition id churns; added items (item_id) don't.
-      const dismissUrl = item.dataset.itemId
-        ? base + '/dismiss'
-        : base + '/dismiss?dedupe_title=' + encodeURIComponent(item.dataset.title || '');
-      const r = await fetch(dismissUrl, { method: 'POST' });
+      const r = await fetch(base + '/dismiss', { method: 'POST' });
       if (!r.ok) throw new Error('HTTP ' + r.status);
       const data = await r.json();
       if (!data.ok) throw new Error('failed');
@@ -870,11 +860,7 @@
       // the user can reverse a mis-click before it scrolls away). The undo URL is
       // carried on the button so it works for both endpoint families.
       const title = item.dataset.title || 'Item';
-      // Proposition-backed undo carries the displayed title so it can resolve a
-      // re-bound override that survived a churn as an orphan; added items don't.
-      const undoUrl = item.dataset.itemId
-        ? base + '/undo'
-        : base + '/undo?dedupe_title=' + encodeURIComponent(item.dataset.title || '');
+      const undoUrl = base + '/undo';
       item.classList.remove('overdue');
       item.innerHTML = `<div class="ag-undo"><span>Dismissed “${esc(title)}”.</span>
         <button class="ag-btn ag-undo-btn" data-endpoint="${escAttr(undoUrl)}">Undo</button></div>`;

@@ -244,22 +244,17 @@ class AgendaOverrideMethodTests(_Base):
             self.assertIsNotNone(await s.get(Proposition, pid))  # NOT deleted
         self.assertEqual(push.call_args.kwargs["observer_name"], "gumbo_agenda_dismiss")
 
-    async def test_override_survives_proposition_delete_as_orphan(self):
-        from gum.agenda import _dedupe_key
-
+    async def test_override_cascades_when_proposition_deleted(self):
         pid = await self._seed_prop_with_obs("Pay the invoice", 1)
         with mock.patch.object(self.gum.batcher, "push"):
-            await self.gum.apply_agenda_override(
-                pid, title="Pay the Q3 invoice", dedupe_title="Pay the invoice"
-            )
+            await self.gum.apply_agenda_override(pid, title="Pay the Q3 invoice")
         self.assertIsNotNone(await self._one_override())
+        # The override is a short-lived visual overlay bound to its proposition;
+        # deleting the proposition (a user "Forget" or a SIMILAR→revise churn)
+        # cascade-deletes the override. Durability comes from the correction
+        # observation the edit pushed, not from this row.
         await self.gum.delete_proposition(pid)
-        # SET NULL (not CASCADE): the override survives so its dedupe_key can
-        # re-bind to the SIMILAR→revise replacement proposition.
-        ov = await self._one_override()
-        self.assertIsNotNone(ov)
-        self.assertIsNone(ov.proposition_id)
-        self.assertEqual(ov.dedupe_key, _dedupe_key("Pay the invoice"))
+        self.assertIsNone(await self._one_override())
 
     async def test_clear_override_removes_row(self):
         pid = await self._seed_prop_with_obs("Book the venue", 1)
@@ -273,105 +268,6 @@ class AgendaOverrideMethodTests(_Base):
         with mock.patch.object(self.gum.batcher, "push"):
             self.assertFalse(await self.gum.apply_agenda_override(999_999, title="x"))
             self.assertFalse(await self.gum.dismiss_agenda_item(999_999))
-
-    async def test_due_only_edit_keys_dedupe_off_displayed_title(self):
-        # A due-date-only edit sends no title, but the client supplies the
-        # displayed model title so the override's dedupe_key can re-bind after
-        # re-inference churns the proposition id (matched by _dedupe_key(c.title)).
-        from gum.agenda import _dedupe_key
-
-        pid = await self._seed_prop_with_obs("Submit the grant by 2026-07-20", 1)
-        with mock.patch.object(self.gum.batcher, "push"):
-            await self.gum.apply_agenda_override(
-                pid, due_date="2026-08-15", dedupe_title="Submit the grant"
-            )
-        ov = await self._one_override()
-        self.assertEqual(ov.dedupe_key, _dedupe_key("Submit the grant"))
-
-    async def test_dismiss_keys_dedupe_off_displayed_title(self):
-        from gum.agenda import _dedupe_key
-
-        pid = await self._seed_prop_with_obs("Reorganize the desktop icons", 1)
-        with mock.patch.object(self.gum.batcher, "push"):
-            await self.gum.dismiss_agenda_item(pid, dedupe_title="Reorganize icons")
-        ov = await self._one_override()
-        self.assertEqual(ov.dedupe_key, _dedupe_key("Reorganize icons"))
-
-    async def test_override_rebinds_by_title_across_proposition_churn(self):
-        # End-to-end: an edit survives the SIMILAR→revise proposition delete
-        # (orphaned override) and re-binds by normalized title to the
-        # replacement commitment the next time the radar surfaces it.
-        from datetime import datetime, timezone
-
-        from gum.agenda import Commitment, apply_overrides
-
-        pid = await self._seed_prop_with_obs("Submit the grant by 2026-07-20", 1)
-        with mock.patch.object(self.gum.batcher, "push"):
-            await self.gum.apply_agenda_override(
-                pid, due_date="2026-08-15", dedupe_title="Submit the grant"
-            )
-        await self.gum.delete_proposition(pid)  # SIMILAR→revise churn
-
-        overrides = await self.gum.list_agenda_overrides()
-        self.assertEqual(len(overrides), 1)
-        self.assertIsNone(overrides[0]["proposition_id"])  # orphaned, not gone
-
-        new_pid = pid + 1000  # re-inference gave the replacement a new id
-        commitment = Commitment(
-            title="Submit the grant",
-            due_date="2026-07-20",
-            source="obs",
-            status_guess="open",
-            confidence=8,
-            decay=0,
-            days_until_due=8,
-            urgency=1.0,
-            proposition_id=new_pid,
-            proposition_text="Submit the grant by 2026-07-20",
-            created_at=None,
-        )
-        now = datetime(2026, 7, 12, tzinfo=timezone.utc)
-        out = apply_overrides([commitment], overrides, now=now)
-        self.assertEqual(len(out), 1)
-        self.assertEqual(out[0].due_date, "2026-08-15")  # re-bound edit applied
-
-    async def test_orphan_reanchors_on_mutation_no_duplicate(self):
-        # An override that survived a churn as an orphan (proposition_id=NULL) is
-        # re-anchored onto the replacement proposition when the next edit arrives
-        # keyed by the new id — one row, now owned by new_pid, not a duplicate.
-        pid = await self._seed_prop_with_obs("Finalize the report", 1)
-        with mock.patch.object(self.gum.batcher, "push"):
-            await self.gum.apply_agenda_override(
-                pid, title="Finalize the Q3 report", dedupe_title="Finalize the report"
-            )
-        await self.gum.delete_proposition(pid)  # SIMILAR→revise churn → orphan
-        new_pid = await self._seed_prop_with_obs("Finalize the report soon", 1)
-        with mock.patch.object(self.gum.batcher, "push"):
-            await self.gum.apply_agenda_override(
-                new_pid, due_date="2026-09-01", dedupe_title="Finalize the report"
-            )
-        async with self.gum._session() as s:
-            rows = (await s.execute(select(AgendaOverride))).scalars().all()
-        self.assertEqual(len(rows), 1)  # re-anchored, not duplicated
-        self.assertEqual(rows[0].proposition_id, new_pid)
-        self.assertEqual(rows[0].due_date, "2026-09-01")
-
-    async def test_orphan_dismissal_undoable_by_title(self):
-        # A dismissal that survived a churn as an orphan surfaces under the
-        # replacement's new id; undo must resolve it by displayed title.
-        pid = await self._seed_prop_with_obs("Renew the domain", 1)
-        with mock.patch.object(self.gum.batcher, "push"):
-            await self.gum.dismiss_agenda_item(pid, dedupe_title="Renew the domain")
-        await self.gum.delete_proposition(pid)  # orphan
-        new_pid = await self._seed_prop_with_obs("Renew the domain again", 1)
-        # Id lookup misses the orphan; dedupe_title resolves it.
-        self.assertFalse(await self.gum.clear_agenda_override(new_pid))
-        self.assertTrue(
-            await self.gum.clear_agenda_override(new_pid, dedupe_title="Renew the domain")
-        )
-        async with self.gum._session() as s:
-            rows = (await s.execute(select(AgendaOverride))).scalars().all()
-        self.assertEqual(len(rows), 0)
 
     async def test_edit_does_not_hold_batch_lock(self):
         pid = await self._seed_prop_with_obs("stays responsive", 1)
